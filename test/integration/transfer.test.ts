@@ -22,7 +22,7 @@ import { signTransferTicket } from '../../src/receipts.js';
 import { createActivationCode, createLicense, getDbNow } from '../fixtures.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
-import { terminatePostgresBackend, waitForLicenseRowWaiterPids, waitForNoLockWaiters } from '../support/pg-waits.js';
+import { terminatePostgresBackend, waitForLicenseRowWaiterPids, waitForLicenseRowWaiters, waitForNoLockWaiters } from '../support/pg-waits.js';
 import { startChildLicenseServer } from '../support/child-server.js';
 import {
   buildChallengeBoundBody, requestChallenge, signPost, startAppServer, type HttpResponse, type RunningTestServer,
@@ -554,6 +554,145 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       .toHaveLength(1);
     expect(await db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', request.operationId).execute())
       .toMatchObject([expect.objectContaining({ action: 'transfer_revoke', state: 'succeeded' })]);
+  });
+
+  it('recovers an approval revocation after COMMIT acknowledgement loss and retries a rolled-back revocation under the same operation id', async () => {
+    const active = await activate();
+    const target = await createIdentity();
+    const prepared = await prepare(active, target);
+    const before = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const proxy = new CommitAckDropProxy();
+    const parsed = new URL(runtime.config.databaseUrl);
+    await proxy.start(parsed.hostname, Number(parsed.port || '5432'));
+    const proxyUrl = new URL(runtime.config.databaseUrl);
+    proxyUrl.port = String(proxy.port);
+    proxyUrl.searchParams.set('sslmode', 'disable');
+    const proxyPolicy = await writeAdminPolicy(proxyUrl.toString());
+    const proxyAdmin = await createAdminService(proxyPolicy);
+    const request = { operationId: randomUUID(), licenseId: active.licenseId, approvalId: prepared.approvalId,
+      expectedRevision: before.revision, reason: 'COMMIT确认丢失后恢复原审批撤销' };
+    const digest = revokeTransferApprovalRequestDigest(request);
+    try {
+      const droppedAck = proxy.armNextCommitAckDrop();
+      const result = await proxyAdmin.revokeTransferApproval({ ...request, confirmedRequestDigest: digest });
+      await droppedAck;
+      expect(result).toMatchObject({ state: 'succeeded', replayed: true, requestDigest: digest });
+      expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', prepared.approvalId).execute()).toHaveLength(1);
+      expect(await db.selectFrom('license_admin_operations').selectAll().where('operation_id', '=', request.operationId).execute()).toHaveLength(1);
+      expect(await db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', request.operationId).execute()).toHaveLength(1);
+      await expect(proxyAdmin.revokeTransferApproval({ ...request, reason: '不同摘要重复撤销',
+        confirmedRequestDigest: revokeTransferApprovalRequestDigest({ ...request, reason: '不同摘要重复撤销' }) }))
+        .rejects.toMatchObject({ code: 'ADMIN_OPERATION_ID_CONFLICT' });
+      const staleCommit = await commit(prepared);
+      expect(staleCommit.response.status).toBe(409);
+      const after = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      expect([after.revision, after.entitlement_revision, after.current_generation])
+        .toEqual([before.revision, before.entitlement_revision, before.current_generation]);
+      expect((await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').executeTakeFirstOrThrow()).identity_jkt).toBe(active.source.jkt);
+      expect((await db.selectFrom('license_transfer_plans').selectAll().where('approval_id', '=', prepared.approvalId)
+        .executeTakeFirstOrThrow()).state).toBe('invalidated');
+    } finally {
+      await proxyAdmin.close();
+      await proxy.stop();
+    }
+
+    const nextTarget = await createIdentity();
+    const approval = await approve(active, nextTarget);
+    const retry = { operationId: randomUUID(), licenseId: active.licenseId, approvalId: approval.operationId,
+      expectedRevision: before.revision, reason: '回滚后使用原操作身份安全重试' };
+    await sql`CREATE OR REPLACE FUNCTION transfer_test_fail_revocation() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced revocation rollback' USING ERRCODE = 'P0001'; END $$`.execute(db);
+    await sql`CREATE TRIGGER transfer_test_fail_revocation BEFORE INSERT ON license_transfer_revocations
+      FOR EACH ROW EXECUTE FUNCTION transfer_test_fail_revocation()`.execute(db);
+    try {
+      await expect(admin.revokeTransferApproval({ ...retry, confirmedRequestDigest: revokeTransferApprovalRequestDigest(retry) }))
+        .rejects.toThrow();
+      expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', approval.operationId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_admin_operations').selectAll().where('operation_id', '=', retry.operationId).execute()).toHaveLength(0);
+    } finally {
+      await sql`DROP TRIGGER IF EXISTS transfer_test_fail_revocation ON license_transfer_revocations`.execute(db);
+      await sql`DROP FUNCTION IF EXISTS transfer_test_fail_revocation()`.execute(db);
+    }
+    const retried = await admin.revokeTransferApproval({ ...retry, confirmedRequestDigest: revokeTransferApprovalRequestDigest(retry) });
+    expect(retried.state).toBe('succeeded');
+    expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', approval.operationId).execute()).toHaveLength(1);
+  });
+
+  it('serializes approval revocation and commit in both forced PostgreSQL lock acquisition orders', async () => {
+    async function holdLicenseRow(licenseId: string) {
+      let ready!: () => void;
+      let release!: () => void;
+      const readySignal = new Promise<void>((resolve) => { ready = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('licenses').select('id').where('id', '=', licenseId).forUpdate().executeTakeFirstOrThrow();
+        ready();
+        await released;
+      });
+      await readySignal;
+      return { blocker, release };
+    }
+    async function ordered(active: ActiveSource, revokeFirst: boolean) {
+      const target = await createIdentity();
+      const prepared = await prepare(active, target);
+      const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const request = { operationId: randomUUID(), licenseId: active.licenseId, approvalId: prepared.approvalId,
+        expectedRevision: license.revision.toString(), reason: `锁顺序场景 ${revokeFirst ? 'revoke-first' : 'commit-first'}` };
+      const blocker = await holdLicenseRow(active.licenseId);
+      let revokePromise: ReturnType<typeof admin.revokeTransferApproval> | undefined;
+      let commitPromise: ReturnType<typeof commit> | undefined;
+      try {
+        if (revokeFirst) {
+          revokePromise = admin.revokeTransferApproval({ ...request, confirmedRequestDigest: revokeTransferApprovalRequestDigest(request) });
+          await waitForLicenseRowWaiters(db, 1);
+          commitPromise = commit(prepared);
+          await waitForLicenseRowWaiters(db, 2);
+        } else {
+          commitPromise = commit(prepared);
+          await waitForLicenseRowWaiters(db, 1);
+          revokePromise = admin.revokeTransferApproval({ ...request, confirmedRequestDigest: revokeTransferApprovalRequestDigest(request) });
+          await waitForLicenseRowWaiters(db, 2);
+        }
+      } finally {
+        blocker.release();
+      }
+      await blocker.blocker;
+      const [revoked, committed] = await Promise.all([revokePromise!, commitPromise!]);
+      const finalLicense = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const plans = await db.selectFrom('license_transfer_plans').selectAll().where('approval_id', '=', prepared.approvalId).execute();
+      const activeRows = await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId).where('state', '=', 'active').execute();
+      if (revokeFirst) {
+        expect(revoked.state).toBe('succeeded');
+        expect(committed.response.status).toBe(409);
+        expect(plans[0]!.state).toBe('invalidated');
+        expect(finalLicense.current_generation).toBe('1');
+        expect(activeRows).toMatchObject([expect.objectContaining({ identity_jkt: active.source.jkt })]);
+        expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', prepared.approvalId).execute()).toHaveLength(1);
+        expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', committed.operationId).executeTakeFirstOrThrow()).state).toBe('rejected');
+        expect(await db.selectFrom('license_transfer_events').selectAll().where('approval_id', '=', prepared.approvalId)
+          .where('kind', '=', 'approval_revoked').execute()).toHaveLength(1);
+      } else {
+        expect(committed.response.status).toBe(200);
+        expect(revoked.state).toBe('rejected');
+        expect(revoked.outcomeCode).toBe('EXPECTED_REVISION_MISMATCH');
+        expect(plans[0]!.state).toBe('committed');
+        expect(finalLicense.current_generation).toBe('2');
+        expect(activeRows).toMatchObject([expect.objectContaining({ identity_jkt: target.jkt, generation: '2' })]);
+        expect((await db.selectFrom('license_activations').selectAll().where('id', '=', plans[0]!.source_activation_id)
+          .executeTakeFirstOrThrow()).state).toBe('retired');
+        expect((await verifyCenterJwt(committed.response.json['transfer_receipt'] as string)).protectedHeader['typ'])
+          .toBe('aikayun-license-transfer+jwt');
+        expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', committed.operationId).execute()).toHaveLength(1);
+        expect(await db.selectFrom('license_transfer_events').selectAll().where('approval_id', '=', prepared.approvalId)
+          .where('kind', '=', 'committed').execute()).toHaveLength(1);
+        expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', prepared.approvalId).execute()).toHaveLength(0);
+        const replay = await commit(prepared, { operationId: committed.operationId, attemptNo: 2 });
+        expect(replay.response.json['transfer_receipt']).toBe(committed.response.json['transfer_receipt']);
+      }
+    }
+    await ordered(await activate(), true);
+    await ordered(await activate(), false);
   });
 
   it('a ticket that expires before commit leaves the source activation untouched', async () => {
