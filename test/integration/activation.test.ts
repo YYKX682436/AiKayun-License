@@ -508,6 +508,33 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).consumed_at).toBeInstanceOf(Date);
   });
 
+  it('does not restore authority to an old signed challenge after nonce cleanup', async () => {
+    const prepared = await prepareActivation();
+    const oldIssuer = startAppServer(createApp({
+      config: runtime.config,
+      db,
+      challengeNow: async () => new Date(Date.now() - 26 * 60 * 60 * 1000),
+    }));
+    const oldServer = await oldIssuer;
+    try {
+      const staleAttempt = await activationAttempt(prepared, 1, 'activation', oldServer);
+      const nonceHash = createHash('sha256').update(staleAttempt.serverNonce).digest('base64url');
+      expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', nonceHash).executeTakeFirst()).toBeDefined();
+      const cleanup = await sql<{ count: number }>`SELECT cleanup_expired_request_nonces(10) AS count`.execute(db);
+      expect(Number(cleanup.rows[0]!.count)).toBeGreaterThanOrEqual(1);
+      expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', nonceHash).executeTakeFirst()).toBeUndefined();
+
+      const late = await sendActivation(prepared, staleAttempt);
+      expect(late.status).toBe(409);
+      expect(late.json['error']).toEqual({ code: 'CHALLENGE_EXPIRED_OR_REPLAYED' });
+      expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).executeTakeFirst()).toBeUndefined();
+      expect((await db.selectFrom('licenses').selectAll().where('id', '=', prepared.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('0');
+      expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).consumed_at).toBeNull();
+    } finally {
+      await oldServer.stop();
+    }
+  });
+
   it('recovers an expired historical lease at the current revision without incrementing generation', async () => {
     const identity = await createIdentity();
     const fixture = await createExpiredActivationFixture(db, runtime.config, identity);
@@ -552,6 +579,28 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect(current.current_generation).toBe('1');
     expect(current.entitlement_revision).toBe('2');
     expect(activations).toHaveLength(1);
+  });
+
+  it('replays a prior renewal with its original revision after a later renewal', async () => {
+    const license = await createLicense(db);
+    const firstId = `event-first-${randomUUID()}`;
+    const secondId = `event-second-${randomUUID()}`;
+    const first = await applyConfirmedRenewal(db, { licenseId: license.id, externalEventId: firstId, actor: 'isolated-test-fixture' });
+    const second = await applyConfirmedRenewal(db, { licenseId: license.id, externalEventId: secondId, actor: 'isolated-test-fixture' });
+    const beforeReplay = await db.selectFrom('licenses').selectAll().where('id', '=', license.id).executeTakeFirstOrThrow();
+    const replay = await applyConfirmedRenewal(db, { licenseId: license.id, externalEventId: firstId, actor: 'isolated-test-fixture' });
+    const afterReplay = await db.selectFrom('licenses').selectAll().where('id', '=', license.id).executeTakeFirstOrThrow();
+    const events = await db.selectFrom('entitlement_events').selectAll().where('license_id', '=', license.id).execute();
+
+    expect(first.revision).toBe('2');
+    expect(second.revision).toBe('3');
+    expect(replay).toMatchObject({
+      eventId: first.eventId, licenseId: license.id, previousEnd: first.previousEnd,
+      newEnd: first.newEnd, revision: '2', replayed: true,
+    });
+    expect(afterReplay.confirmed_subscription_end).toEqual(beforeReplay.confirmed_subscription_end);
+    expect(afterReplay.entitlement_revision).toBe('3');
+    expect(events).toHaveLength(2);
   });
 
   it('returns signed revoked and superseded statuses without issuing recovery leases', async () => {
@@ -618,6 +667,49 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       .rejects.toMatchObject({ code: '55000' });
     expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', operation.operation_id).executeTakeFirstOrThrow()).outcome_code)
       .toBe('ACTIVATED');
+  });
+
+  it('allows only bounded cleanup of sufficiently old nonces and never changes attempt evidence', async () => {
+    const oldHash = `old-${randomUUID()}`;
+    const recentHash = `recent-${randomUUID()}`;
+    const liveHash = `live-${randomUUID()}`;
+    const now = await getDbNow(db);
+    const old = new Date(now.getTime() - 26 * 60 * 60 * 1000);
+    const recent = new Date(now.getTime() - 23 * 60 * 60 * 1000);
+    const operationId = randomUUID();
+    for (const [hash, createdAt, expiresAt] of [
+      [oldHash, old, new Date(old.getTime() + 5 * 60 * 1000)],
+      [recentHash, recent, new Date(recent.getTime() + 5 * 60 * 1000)],
+      [liveHash, now, new Date(now.getTime() + 5 * 60 * 1000)],
+    ] as const) {
+      await db.insertInto('request_nonces').values({
+        nonce_hash: hash, operation: 'activation', operation_id: operationId, intent_digest: 'test',
+        instance_id: randomUUID(), identity_jkt: 'test', client_nonce_hash: `client-${hash}`,
+        challenge_jws_digest: `challenge-${hash}`, created_at: createdAt, expires_at: expiresAt, consumed_at: null,
+      }).execute();
+    }
+    const beforeAttempts = await db.selectFrom('license_operation_attempts').selectAll().execute();
+    await expect(sql`SELECT cleanup_expired_request_nonces(501)`.execute(db)).rejects.toMatchObject({ code: '22023' });
+    const cleaned = await sql<{ count: number }>`SELECT cleanup_expired_request_nonces(1) AS count`.execute(db);
+    expect(Number(cleaned.rows[0]!.count)).toBe(1);
+    expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', oldHash).executeTakeFirst()).toBeUndefined();
+    expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', recentHash).executeTakeFirst()).toBeDefined();
+    expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', liveHash).executeTakeFirst()).toBeDefined();
+    expect(await db.selectFrom('license_operation_attempts').selectAll().execute()).toEqual(beforeAttempts);
+    await expect(db.deleteFrom('request_nonces').where('nonce_hash', '=', recentHash).execute()).rejects.toMatchObject({ code: '55000' });
+    await expect(db.deleteFrom('request_nonces').where('nonce_hash', '=', liveHash).execute()).rejects.toMatchObject({ code: '55000' });
+  });
+
+  it('rejects direct and CASCADE TRUNCATE across every core authorization table', async () => {
+    const protectedTables = [
+      'licenses', 'license_activations', 'activation_codes', 'request_nonces',
+      'license_operations', 'license_operation_attempts', 'entitlement_events', 'license_audit_events',
+    ];
+    for (const table of protectedTables) {
+      await expect(sql`TRUNCATE TABLE ${sql.table(table)} CASCADE`.execute(db)).rejects.toMatchObject({ code: '55000' });
+    }
+    await expect(sql`TRUNCATE TABLE request_nonces`.execute(db)).rejects.toMatchObject({ code: '55000' });
+    await expect(sql`TRUNCATE TABLE licenses CASCADE`.execute(db)).rejects.toMatchObject({ code: '55000' });
   });
 
   it('drops the PostgreSQL COMMIT acknowledgement and recovers the durable result by the same operation', async () => {

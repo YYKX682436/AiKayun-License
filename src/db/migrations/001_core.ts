@@ -68,6 +68,12 @@ export async function up(db: Kysely<Database>): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS request_nonces_expiry ON request_nonces(expires_at);
 
+    CREATE TABLE IF NOT EXISTS request_nonce_cleanup_authorizations (
+      backend_pid integer NOT NULL,
+      nonce_hash text NOT NULL,
+      PRIMARY KEY (backend_pid, nonce_hash)
+    );
+
     CREATE TABLE IF NOT EXISTS license_operations (
       operation_id uuid PRIMARY KEY,
       actor_jkt text NOT NULL,
@@ -119,6 +125,7 @@ export async function up(db: Kysely<Database>): Promise<void> {
       external_event_id text NOT NULL UNIQUE,
       previous_end timestamptz NOT NULL,
       new_end timestamptz NOT NULL,
+      result_revision bigint NOT NULL CHECK (result_revision > 0),
       kind text NOT NULL CHECK (kind IN ('monthly_renewal', 'yearly_renewal', 'restore', 'manual_adjustment')),
       actor text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -145,6 +152,50 @@ export async function up(db: Kysely<Database>): Promise<void> {
     END;
     $$;
 
+    CREATE OR REPLACE FUNCTION reject_core_table_truncate() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'protected table % rejects TRUNCATE', TG_TABLE_NAME
+        USING ERRCODE = '55000';
+    END;
+    $$;
+
+    CREATE OR REPLACE FUNCTION reject_cleanup_authorization_truncate() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'protected table % rejects TRUNCATE', TG_TABLE_NAME
+        USING ERRCODE = '55000';
+    END;
+    $$;
+
+    DROP TRIGGER IF EXISTS licenses_no_truncate ON licenses;
+    CREATE TRIGGER licenses_no_truncate BEFORE TRUNCATE ON licenses
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS license_activations_no_truncate ON license_activations;
+    CREATE TRIGGER license_activations_no_truncate BEFORE TRUNCATE ON license_activations
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS activation_codes_no_truncate ON activation_codes;
+    CREATE TRIGGER activation_codes_no_truncate BEFORE TRUNCATE ON activation_codes
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS request_nonces_no_truncate ON request_nonces;
+    CREATE TRIGGER request_nonces_no_truncate BEFORE TRUNCATE ON request_nonces
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS license_operations_no_truncate ON license_operations;
+    CREATE TRIGGER license_operations_no_truncate BEFORE TRUNCATE ON license_operations
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS license_operation_attempts_no_truncate ON license_operation_attempts;
+    CREATE TRIGGER license_operation_attempts_no_truncate BEFORE TRUNCATE ON license_operation_attempts
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS entitlement_events_no_truncate ON entitlement_events;
+    CREATE TRIGGER entitlement_events_no_truncate BEFORE TRUNCATE ON entitlement_events
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS license_audit_events_no_truncate ON license_audit_events;
+    CREATE TRIGGER license_audit_events_no_truncate BEFORE TRUNCATE ON license_audit_events
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_core_table_truncate();
+    DROP TRIGGER IF EXISTS request_nonce_cleanup_authorizations_no_truncate ON request_nonce_cleanup_authorizations;
+    CREATE TRIGGER request_nonce_cleanup_authorizations_no_truncate BEFORE TRUNCATE ON request_nonce_cleanup_authorizations
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_cleanup_authorization_truncate();
+
     DROP TRIGGER IF EXISTS license_operations_immutable ON license_operations;
     CREATE TRIGGER license_operations_immutable BEFORE UPDATE OR DELETE ON license_operations
       FOR EACH ROW EXECUTE FUNCTION reject_immutable_row_change();
@@ -159,9 +210,17 @@ export async function up(db: Kysely<Database>): Promise<void> {
       FOR EACH ROW EXECUTE FUNCTION reject_immutable_row_change();
 
     CREATE OR REPLACE FUNCTION protect_consumable_secret_row() RETURNS trigger
-    LANGUAGE plpgsql AS $$
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
     BEGIN
       IF TG_OP = 'DELETE' THEN
+        IF TG_TABLE_NAME = 'request_nonces' AND
+          EXISTS (
+            SELECT 1 FROM public.request_nonce_cleanup_authorizations cleanup_auth
+            WHERE cleanup_auth.backend_pid = pg_backend_pid() AND cleanup_auth.nonce_hash = OLD.nonce_hash
+          ) AND
+          OLD.expires_at <= clock_timestamp() - interval '24 hours' THEN
+          RETURN OLD;
+        END IF;
         RAISE EXCEPTION 'protected table % rejects DELETE', TG_TABLE_NAME USING ERRCODE = '55000';
       END IF;
       IF TG_TABLE_NAME = 'activation_codes' THEN
@@ -189,6 +248,35 @@ export async function up(db: Kysely<Database>): Promise<void> {
     DROP TRIGGER IF EXISTS request_nonces_protected ON request_nonces;
     CREATE TRIGGER request_nonces_protected BEFORE UPDATE OR DELETE ON request_nonces
       FOR EACH ROW EXECUTE FUNCTION protect_consumable_secret_row();
+
+    CREATE OR REPLACE FUNCTION cleanup_expired_request_nonces(p_batch_limit integer DEFAULT 100)
+    RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+    DECLARE
+      deleted_count integer;
+      current_backend integer := pg_backend_pid();
+    BEGIN
+      IF p_batch_limit IS NULL OR p_batch_limit < 1 OR p_batch_limit > 500 THEN
+        RAISE EXCEPTION 'nonce cleanup batch limit must be between 1 and 500'
+          USING ERRCODE = '22023';
+      END IF;
+      INSERT INTO public.request_nonce_cleanup_authorizations (backend_pid, nonce_hash)
+      SELECT current_backend, nonce_hash FROM public.request_nonces
+        WHERE expires_at <= clock_timestamp() - interval '24 hours'
+        ORDER BY expires_at, nonce_hash
+        FOR UPDATE SKIP LOCKED
+        LIMIT p_batch_limit;
+      DELETE FROM public.request_nonces AS nonce
+      USING public.request_nonce_cleanup_authorizations AS cleanup_auth
+      WHERE cleanup_auth.backend_pid = current_backend AND nonce.nonce_hash = cleanup_auth.nonce_hash;
+      GET DIAGNOSTICS deleted_count = ROW_COUNT;
+      DELETE FROM public.request_nonce_cleanup_authorizations WHERE backend_pid = current_backend;
+      RETURN deleted_count;
+    END;
+    $$;
+
+    REVOKE ALL ON request_nonce_cleanup_authorizations FROM PUBLIC;
+    REVOKE ALL ON FUNCTION cleanup_expired_request_nonces(integer) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION cleanup_expired_request_nonces(integer) TO CURRENT_USER;
   `.execute(db);
 }
 

@@ -34,7 +34,7 @@ export async function applyConfirmedRenewal(
         licenseId: existing.license_id,
         previousEnd: existing.previous_end,
         newEnd: existing.new_end,
-        revision: license.entitlement_revision.toString(),
+        revision: existing.result_revision.toString(),
         replayed: true,
       };
     }
@@ -60,6 +60,7 @@ export async function applyConfirmedRenewal(
       external_event_id: input.externalEventId,
       previous_end: license.confirmed_subscription_end,
       new_end: newEnd,
+      result_revision: updatedRevision,
       kind: eventKind,
       actor: input.actor,
       created_at: now,

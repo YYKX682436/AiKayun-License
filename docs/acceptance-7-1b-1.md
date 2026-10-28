@@ -6,6 +6,8 @@
 
 AiKayun ⑦-1A 审定基线：`225600b55bbd91bcb7393097b7b5fd44a3465816`。
 
+本次 R1 修复基于授权中心基线：`c8b70fc5ef5e97cbd30f590ad6ba4fdc788232ba`。初始迁移尚未用于生产，因此直接修正 `001_core.ts`，未添加兼容迁移。
+
 ## 本地结果
 
 验收环境：Node.js 24.22.0；Docker PostgreSQL 18 镜像按 digest 固定；测试数据库与 API 请求均为本地隔离数据。测试私钥、TLS 证书、license、激活码与权益事件均临时生成。没有使用真实商业授权、商户凭据或线上数据库。
@@ -15,8 +17,8 @@ AiKayun ⑦-1A 审定基线：`225600b55bbd91bcb7393097b7b5fd44a3465816`。
 | `npm run typecheck` | 通过 |
 | `npm run build` | 通过 |
 | `npm test` | 12 项通过：RFC/HTTP 签名互操作 7 项、UTC 账期 3 项、安全启动配置 2 项 |
-| `npm run test:integration` | 14 项通过：真实 PostgreSQL 迁移、HTTPS/RFC 9421 请求、签名 JWT 回执和数据库状态断言 |
-| 总数 | 26 项测试通过；没有依赖固定 sleep 推测锁顺序 |
+| `npm run test:integration` | 18 项通过：真实 PostgreSQL 迁移、HTTPS/RFC 9421 请求、签名 JWT 回执和数据库状态断言 |
+| 总数 | 30 项测试通过；没有依赖固定 sleep 推测锁顺序 |
 | GitHub Actions | 提交 `cf7fc70f14cd253f20695117ae5e3759e3e266e2` 的第 2 次尝试通过；PostgreSQL 初始化、`npm ci`、类型检查、构建、单元与集成测试均通过。第 1 次尝试在 runner 启动前受账户付款/支出限额影响 |
 
 集成测试包括：
@@ -35,6 +37,10 @@ AiKayun ⑦-1A 审定基线：`225600b55bbd91bcb7393097b7b5fd44a3465816`。
 12. 通过 HTTPS 响应丢弃代理丢弃已提交激活的真实 HTTP 响应；原 operation continue 可取回原结果。
 13. 通过 PostgreSQL 协议代理丢弃 COMMIT 确认，产生未知提交结果；原 operation 可恢复已提交 lease。
 14. 强制终止服务进程，观察实际 PostgreSQL 行锁等待会话，再终止该会话以确定性完成回滚；重启服务后 continue 原 operation。
+15. 先复现续费事件重放返回当前 revision 的缺陷；修复后两次不同续费之间重放第一次事件，返回第一次保存的 revision/end 时间，许可证只保留两次续费后的状态。
+16. 先复现缺少 nonce 回收入口；修复后验证仅超过 24 小时安全保留期的 nonce 可通过 `cleanup_expired_request_nonces(batch_limit)` 回收，批量参数限于 1–500，未过期及保留期内 nonce 仍不可删除，attempt 证据不变。
+17. 回收一个过期超过保留期的 challenge nonce 后，再提交其旧签名请求；请求仍被拒绝，未创建操作、未消费激活码，也未增加 generation。
+18. 对全部八张核心授权表直接执行和带 `CASCADE` 执行 TRUNCATE；语句均被数据库触发器以 SQLSTATE `55000` 拒绝。
 
 TLS 集成测试使用短期自签名证书，客户端测试工具允许该临时证书。测试证明 API 的实际连接使用 TLS，不证明外部生产证书链、域名或反向代理部署配置。
 
@@ -51,6 +57,10 @@ TLS 集成测试使用短期自签名证书，客户端测试工具允许该临�
 ## 数据库与安全断言
 
 核心迁移创建 `licenses`、`license_activations`、`activation_codes`、`request_nonces`、`license_operations`、`license_operation_attempts`、`entitlement_events` 和 `license_audit_events`。数据库用部分唯一索引约束 active license/instance；操作只能插入完整终态；operation、attempt、权益事件与审计事件使用不可变/只追加触发器；激活码与 nonce 只能一次转为 consumed。业务更改通过事务 advisory lock 和 license 行锁串行化。
+
+八张核心表各有 `BEFORE TRUNCATE FOR EACH STATEMENT` 拒绝触发器，`TRUNCATE ... CASCADE` 同样拒绝。受限 nonce 回收入口是 `SELECT cleanup_expired_request_nonces(100);`，其每次上限为 500 条，仅删除 `expires_at` 早于数据库当前时间 24 小时以上的 nonce；并发回收使用 `FOR UPDATE SKIP LOCKED`。回收只触及 nonce 和内部临时授权记录，不修改操作墓碑、attempt 或审计事件。回收任务由后续运维定期调用，本阶段没有常驻清理服务。数据库超级用户/可修改 DDL 的角色仍可移除触发器或任意改表；触发器不构成对此类角色的防护，生产最小权限配置留在后续发行运维阶段。
+
+`entitlement_events.result_revision` 保存每次权益事件提交时的 revision。`external_event_id` 重放使用该不可变值，不读取后续可能已增长的许可证 revision，也不再次延长订阅。
 
 HTTP 日志关闭，异常回执只返回稳定错误码；签名私钥、TLS 私钥必须来自独立文件且权限不宽于 0600。生产缺少任一密钥、TLS key 或证书会拒绝启动。非隔离环境只允许 loopback 监听；本地 Compose API 端口仍映射到宿主机 loopback。
 

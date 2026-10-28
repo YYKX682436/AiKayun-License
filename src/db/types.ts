@@ -96,6 +96,7 @@ export interface EntitlementEventsTable {
   external_event_id: string;
   previous_end: Timestamp;
   new_end: Timestamp;
+  result_revision: Bigint;
   kind: 'monthly_renewal' | 'yearly_renewal' | 'restore' | 'manual_adjustment';
   actor: string;
   created_at: Timestamp;
