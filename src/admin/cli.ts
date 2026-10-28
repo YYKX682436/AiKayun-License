@@ -1,5 +1,6 @@
 import { AdminOperationError, createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest,
   renewLicenseRequestDigest, changeLicenseStatusRequestDigest, approveTransferRequestDigest,
+  revokeTransferApprovalRequestDigest,
   type AdminOperationResult } from './service.js';
 import { AdminAccessError } from './policy.js';
 import { resolve } from 'node:path';
@@ -19,6 +20,7 @@ const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控
   license revoke --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license restore --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license approve-transfer --operation-id UUID --license-id UUID --expected-revision N --database-id UUID --source-instance-id UUID --source-identity-jkt JKT --target-instance-id UUID --target-identity-jkt JKT --source-generation N --expected-binding-revision N --reason TEXT [--confirm-digest DIGEST]
+  license revoke-transfer-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license get --license-id UUID
   operation get --operation-id UUID
   audit list --license-id UUID [--limit 50]
@@ -171,6 +173,14 @@ async function runMutation(argv: string[], stdout: OutputStream): Promise<number
     digest = approveTransferRequestDigest(request);
     fields = request;
     invoke = (service) => service.approveTransfer({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'revoke-transfer-approval') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'approval-id', 'expected-revision', 'reason', 'confirm-digest']);
+    const request = { operationId: option(options, 'operation-id'), licenseId: option(options, 'license-id'),
+      approvalId: option(options, 'approval-id'), expectedRevision: option(options, 'expected-revision'), reason: option(options, 'reason') };
+    action = 'transfer_revoke';
+    digest = revokeTransferApprovalRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.revokeTransferApproval({ ...request, confirmedRequestDigest: confirm ?? '' });
   } else {
     fail('ADMIN_COMMAND_INVALID');
   }
@@ -241,7 +251,7 @@ export async function runAdminCli(
     return 0;
   }
   try {
-    if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer'].includes(argv[1] ?? '') && argv[0] === 'license') {
+    if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer', 'revoke-transfer-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {
       return await runMutation(argv, stdout);
     }
     return await runRead(argv, stdout);

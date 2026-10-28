@@ -118,7 +118,7 @@ export interface LicenseAuditEventsTable {
 export interface LicenseAdminOperationsTable {
   operation_id: string;
   request_digest: string;
-  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve';
+  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve' | 'transfer_revoke';
   license_id: string;
   expected_revision: Bigint;
   actor_os_uid: number;
@@ -205,10 +205,23 @@ export interface LicenseTransferEventsTable {
   prepare_operation_id: string | null;
   commit_operation_id: string | null;
   plan_id: string | null;
-  kind: 'approved' | 'prepared' | 'expired' | 'invalidated' | 'committed' | 'rejected';
+  kind: 'approved' | 'approval_revoked' | 'prepared' | 'expired' | 'invalidated' | 'committed' | 'rejected';
   actor: string;
   safe_details: Json;
   created_at: Timestamp;
+}
+
+export interface LicenseTransferRevocationsTable {
+  revocation_operation_id: string;
+  approval_id: string;
+  license_id: string;
+  request_digest: string;
+  expected_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  revoked_at: Timestamp;
 }
 
 export interface Database {
@@ -225,6 +238,7 @@ export interface Database {
   license_transfer_approvals: LicenseTransferApprovalsTable;
   license_transfer_plans: LicenseTransferPlansTable;
   license_transfer_events: LicenseTransferEventsTable;
+  license_transfer_revocations: LicenseTransferRevocationsTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;

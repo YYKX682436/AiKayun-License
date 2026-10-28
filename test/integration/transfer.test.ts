@@ -10,6 +10,7 @@ import {
   approveTransferRequestDigest,
   changeLicenseStatusRequestDigest,
   createAdminService,
+  revokeTransferApprovalRequestDigest,
   renewLicenseRequestDigest,
   type ApproveTransferRequest,
   type AdminOperationResult,
@@ -511,6 +512,48 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     expect((await verifyCenterJwt(newResponse.json['license'] as string)).payload).toMatchObject({
       activation_generation: '2', identity_jkt: prepared.target.jkt, entitlement_revision: before.entitlement_revision,
     });
+  });
+
+  it('prevents A-to-B-to-A identity rollback while allowing a fresh C identity', async () => {
+    const activeA = await activate();
+    const identityB = await createIdentity();
+    const preparedB = await prepare(activeA, identityB);
+    expect((await commit(preparedB)).response.status).toBe(200);
+    const activeB = { ...activeA, source: identityB };
+    const identityA = activeA.source;
+    const rejected = await approve(activeB, identityA);
+    expect(rejected.state).toBe('rejected');
+    expect(rejected.outcomeCode).toBe('TRANSFER_TARGET_IDENTITY_WAS_USED');
+    const identityC = await createIdentity();
+    const preparedC = await prepare(activeB, identityC);
+    expect((await commit(preparedC)).response.status).toBe(200);
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', activeA.licenseId).executeTakeFirstOrThrow();
+    expect(license.current_generation).toBe('3');
+    expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', activeA.licenseId)
+      .where('state', '=', 'active').execute()).toMatchObject([expect.objectContaining({ identity_jkt: identityC.jkt, database_id: activeA.databaseId })]);
+  });
+
+  it('revokes a prepared approval immutably, invalidates its ticket, and permits a new target approval', async () => {
+    const active = await activate();
+    const targetB = await createIdentity();
+    const preparedB = await prepare(active, targetB);
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const request = { operationId: randomUUID(), licenseId: active.licenseId, approvalId: preparedB.approvalId,
+      expectedRevision: license.revision.toString(), reason: '取消尚未提交的迁移审批' };
+    const revoked = await admin.revokeTransferApproval({ ...request,
+      confirmedRequestDigest: revokeTransferApprovalRequestDigest(request) });
+    expect(revoked.state).toBe('succeeded');
+    const lateCommit = await commit(preparedB);
+    expect(lateCommit.response.status).toBe(409);
+    expect((await db.selectFrom('license_transfer_plans').selectAll().where('plan_id', '=', decodeJwt(preparedB.ticket)['plan_id'] as string)
+      .executeTakeFirstOrThrow()).state).toBe('invalidated');
+    const targetC = await createIdentity();
+    const preparedC = await prepare(active, targetC);
+    expect((await commit(preparedC)).response.status).toBe(200);
+    expect(await db.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', preparedB.approvalId).execute())
+      .toHaveLength(1);
+    expect(await db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', request.operationId).execute())
+      .toMatchObject([expect.objectContaining({ action: 'transfer_revoke', state: 'succeeded' })]);
   });
 
   it('a ticket that expires before commit leaves the source activation untouched', async () => {

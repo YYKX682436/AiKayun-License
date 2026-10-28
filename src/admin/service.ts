@@ -395,6 +395,67 @@ export function approveTransferRequestDigest(input: Omit<ApproveTransferRequest,
   });
 }
 
+export function revokeTransferApprovalRequestDigest(input: Omit<RevokeTransferApprovalRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.approvalId, 'ADMIN_TRANSFER_APPROVAL_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  const reason = ensureReason(input.reason);
+  return digestRequest('transfer_revoke', {
+    operation_id: input.operationId, license_id: input.licenseId,
+    expected_revision: input.expectedRevision, approval_id: input.approvalId, reason,
+  });
+}
+
+async function revokeTransferApproval(session: AdminSession, input: RevokeTransferApprovalRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const requestDigest = revokeTransferApprovalRequestDigest({ ...input, reason });
+  return executeMutation(session, {
+    operationId: input.operationId, requestDigest, action: 'transfer_revoke', licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now, result: { expected_revision: input.expectedRevision, observed_revision: revision } };
+    const approval = await trx.selectFrom('license_transfer_approvals').selectAll().where('approval_id', '=', input.approvalId).forUpdate().executeTakeFirst();
+    const adminApproval = await trx.selectFrom('license_admin_operations').selectAll().where('operation_id', '=', input.approvalId).executeTakeFirst();
+    if (!approval || !adminApproval || approval.license_id !== input.licenseId || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded') {
+      return { state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_NOT_FOUND', resultRevision: revision, now, result: { approval_id: input.approvalId } };
+    }
+    const existing = await trx.selectFrom('license_transfer_revocations').selectAll().where('approval_id', '=', input.approvalId).executeTakeFirst();
+    if (existing) return { state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_ALREADY_REVOKED', resultRevision: revision, now, result: { approval_id: input.approvalId, revocation_operation_id: existing.revocation_operation_id } };
+    const committed = await trx.selectFrom('license_transfer_plans').select('plan_id').where('approval_id', '=', input.approvalId).where('state', '=', 'committed').executeTakeFirst();
+    if (committed) return { state: 'rejected', outcomeCode: 'TRANSFER_ALREADY_COMMITTED', resultRevision: revision, now, result: { approval_id: input.approvalId, plan_id: committed.plan_id } };
+    const preparedPlan = await trx.selectFrom('license_transfer_plans').selectAll().where('approval_id', '=', input.approvalId)
+      .where('state', '=', 'prepared').forUpdate().executeTakeFirst();
+    if (preparedPlan) {
+      await trx.updateTable('license_transfer_plans').set({ state: 'invalidated' }).where('plan_id', '=', preparedPlan.plan_id).where('state', '=', 'prepared').execute();
+      await trx.insertInto('license_transfer_events').values({
+        event_id: randomUUID(), license_id: input.licenseId, approval_id: input.approvalId,
+        prepare_operation_id: preparedPlan.prepare_operation_id, commit_operation_id: null, plan_id: preparedPlan.plan_id,
+        kind: 'invalidated', actor: actorLabel(session.actor), safe_details: { reason: 'approval_revoked' }, created_at: now,
+      }).execute();
+    }
+    await trx.insertInto('license_transfer_revocations').values({
+      revocation_operation_id: input.operationId, approval_id: input.approvalId, license_id: input.licenseId,
+      request_digest: requestDigest, expected_revision: input.expectedRevision,
+      actor_os_uid: session.actor.osUid, actor_os_username: session.actor.osUsername,
+      actor_database_role: session.actor.databaseRole, reason, revoked_at: now,
+    }).execute();
+    await appendCoreAudit(trx, session.actor, { licenseId: input.licenseId, operationId: input.operationId,
+      kind: 'admin_transfer_approval_revoked', reason, details: { approval_id: input.approvalId }, now });
+    await trx.insertInto('license_transfer_events').values({
+      event_id: randomUUID(), license_id: input.licenseId, approval_id: input.approvalId,
+      prepare_operation_id: null, commit_operation_id: null, plan_id: null, kind: 'approval_revoked',
+      actor: actorLabel(session.actor), safe_details: { revocation_operation_id: input.operationId, reason }, created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'TRANSFER_APPROVAL_REVOKED', resultRevision: revision, now,
+      result: { approval_id: input.approvalId, license_id: input.licenseId, revoked_at: now.toISOString() } };
+  });
+}
+
 async function approveTransfer(session: AdminSession, input: ApproveTransferRequest): Promise<AdminOperationResult> {
   const reason = ensureReason(input.reason);
   const requestDigest = approveTransferRequestDigest({ ...input, reason });
@@ -437,12 +498,20 @@ async function approveTransfer(session: AdminSession, input: ApproveTransferRequ
       state: 'rejected', outcomeCode: 'TRANSFER_SOURCE_BINDING_MISMATCH', resultRevision: revision, now,
       result: { license_id: input.licenseId, active_generation: source?.generation.toString() ?? null },
     };
+    const targetWasUsed = await trx.selectFrom('license_activations').select('id')
+      .where('license_id', '=', input.licenseId).where('identity_jkt', '=', input.targetIdentityJkt).executeTakeFirst();
+    if (targetWasUsed) return {
+      state: 'rejected', outcomeCode: 'TRANSFER_TARGET_IDENTITY_WAS_USED', resultRevision: revision, now,
+      result: { license_id: input.licenseId, target_identity_jkt: input.targetIdentityJkt },
+    };
     const pendingApprovals = await trx.selectFrom('license_transfer_approvals').select('approval_id')
       .where('license_id', '=', input.licenseId).where('expires_at', '>', now)
       .where('expected_revision', '=', revision).where('source_generation', '=', license.current_generation.toString()).execute();
-    if (pendingApprovals.length > 0) return {
+    const validApprovals = await Promise.all(pendingApprovals.map(async ({ approval_id }) =>
+      (await trx.selectFrom('license_transfer_revocations').select('approval_id').where('approval_id', '=', approval_id).executeTakeFirst()) ? null : approval_id));
+    if (validApprovals.filter(Boolean).length > 0) return {
       state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_ALREADY_VALID', resultRevision: revision, now,
-      result: { license_id: input.licenseId, valid_approval_count: pendingApprovals.length },
+      result: { license_id: input.licenseId, valid_approval_count: validApprovals.filter(Boolean).length },
     };
     const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     await trx.insertInto('license_transfer_approvals').values({
@@ -493,6 +562,10 @@ async function approveTransfer(session: AdminSession, input: ApproveTransferRequ
     }).execute();
     return { state: 'succeeded', outcomeCode: 'TRANSFER_APPROVED', result, resultRevision: revision, now };
   });
+}
+
+export interface RevokeTransferApprovalRequest extends BaseRequest {
+  approvalId: string;
 }
 
 async function insertFinalLicenseOperation(
@@ -769,6 +842,7 @@ export interface AdminService {
   revokeLicense(input: BaseRequest): Promise<AdminOperationResult>;
   restoreLicense(input: BaseRequest): Promise<AdminOperationResult>;
   approveTransfer(input: ApproveTransferRequest): Promise<AdminOperationResult>;
+  revokeTransferApproval(input: RevokeTransferApprovalRequest): Promise<AdminOperationResult>;
   getLicense(licenseId: string): Promise<LicenseStatusView | undefined>;
   getOperation(operationId: string): Promise<Record<string, unknown> | undefined>;
   listAudit(licenseId: string, limit?: number): Promise<Array<Record<string, unknown>>>;
@@ -784,6 +858,7 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
     revokeLicense: (input) => changeStatus(session, 'license_revoke', input),
     restoreLicense: (input) => changeStatus(session, 'license_restore', input),
     approveTransfer: (input) => approveTransfer(session, input),
+    revokeTransferApproval: (input) => revokeTransferApproval(session, input),
     async getLicense(licenseId) {
       ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
       const license = await session.db.selectFrom('licenses').selectAll().where('id', '=', licenseId).executeTakeFirst();
@@ -836,7 +911,7 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
       const operation = await session.db.selectFrom('license_admin_operations').selectAll()
         .where('operation_id', '=', operationId).executeTakeFirst();
       if (!operation) return undefined;
-      const [adminAudits, licenseAudits, entitlementEvents, transferApproval, transferPlans, transferEvents] = await Promise.all([
+      const [adminAudits, licenseAudits, entitlementEvents, transferApproval, transferPlans, transferEvents, transferRevocation] = await Promise.all([
         session.db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('entitlement_events').selectAll()
@@ -851,6 +926,9 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         session.db.selectFrom('license_transfer_events').selectAll().where((eb) => eb.or([
           eb('approval_id', '=', operationId), eb('prepare_operation_id', '=', operationId), eb('commit_operation_id', '=', operationId),
         ])).orderBy('created_at', 'asc').execute(),
+        session.db.selectFrom('license_transfer_revocations').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('revocation_operation_id', '=', operationId),
+        ])).execute(),
       ]);
       return {
         operation: mapOperation(operation, false),
@@ -864,6 +942,7 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         transfer_approval: transferApproval ?? null,
         transfer_plans: transferPlans,
         transfer_events: transferEvents,
+        transfer_revocations: transferRevocation,
       };
     },
     async listAudit(licenseId, limit = 50) {

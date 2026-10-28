@@ -108,6 +108,8 @@ npm run admin -- license approve-transfer --operation-id <UUID> --license-id <UU
 
 `approve-transfer` 使用同一受控 actor、operation ID、expected revision、理由和请求摘要两步确认。请求绑定当前 active activation 的 license/database/instance/identity/generation，并登记目标新 JKT 与商城声明的 `expected_binding_revision`。目标 `instance_id` 必须等于来源逻辑 instance ID，目标 JKT 必须与来源不同。成功审批固定有效 24 小时，只追加审批/管理审计，不退役 activation、不改变 generation 或任何 license revision。撤销、恢复、续费、其他管理修改或 activation generation 替换一旦推进当前 revision/代次，旧审批和票据就不能再提交。
 
+`revoke-transfer-approval` 按审批 ID追加不可逆撤销事实，operation ID独立，摘要绑定license、审批、expected revision和原因。撤销不变更许可证revision或权益；未提交的prepared ticket在同一license行锁下失效，撤销后可审批新的目标。目标JKT必须未出现在该license的任何activation历史中，避免正常迁移重新启用旧私钥。003保持不变，此撤销机制通过追加迁移004部署。
+
 该命令仍严格限定于 `isolated-development`、loopback PostgreSQL 和 allowlisted OS UID；生产环境启动限制没有移除。当前没有管理员 MFA，也没有公网后台。后端迁移协议虽已实现，本 CLI 的审批只能用于隔离测试/受控开发，不能作为生产审批流程。
 
 ## 一次性激活码

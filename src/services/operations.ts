@@ -846,8 +846,12 @@ export async function processTransferPrepare(
       .where('approval_id', '=', input.approval_id).executeTakeFirst();
     const adminApproval = await trx.selectFrom('license_admin_operations').select(['operation_id', 'action', 'state', 'request_digest'])
       .where('operation_id', '=', input.approval_id).executeTakeFirst();
+    const approvalRevoked = await trx.selectFrom('license_transfer_revocations').select('approval_id')
+      .where('approval_id', '=', input.approval_id).executeTakeFirst();
+    const targetWasUsed = await trx.selectFrom('license_activations').select('id')
+      .where('license_id', '=', input.license_id).where('identity_jkt', '=', targetIdentity.jkt).executeTakeFirst();
     const source = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
-    if (!approval || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
+    if (!approval || approvalRevoked || targetWasUsed || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
       adminApproval.request_digest !== approval.request_digest || !approvalMatchesPrepare(approval, input, auth.signature.identityJkt, targetIdentity.jkt, license, now) ||
       !source || source.state !== 'active' || source.database_id !== input.database_id ||
       source.generation.toString() !== input.source_generation || source.identity_jkt !== auth.signature.identityJkt ||
@@ -866,7 +870,13 @@ export async function processTransferPrepare(
     const matchingApprovals = await trx.selectFrom('license_transfer_approvals').select('approval_id')
       .where('license_id', '=', input.license_id).where('expires_at', '>', now)
       .where('expected_revision', '=', license.revision).where('source_generation', '=', license.current_generation).execute();
-    if (matchingApprovals.length !== 1 || matchingApprovals[0]!.approval_id !== input.approval_id) {
+    const activeApprovals = await Promise.all(matchingApprovals.map(async ({ approval_id }) => {
+      const revocation = await trx.selectFrom('license_transfer_revocations').select('approval_id')
+        .where('approval_id', '=', approval_id).executeTakeFirst();
+      return revocation ? null : approval_id;
+    }));
+    const unrevokedApprovals = activeApprovals.filter((id): id is string => id !== null);
+    if (unrevokedApprovals.length !== 1 || unrevokedApprovals[0] !== input.approval_id) {
       const token = await terminalOperationReceipt(trx, config, auth, {
         kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'TRANSFER_APPROVAL_AMBIGUOUS', responseType: 'operation',
@@ -882,7 +892,10 @@ export async function processTransferPrepare(
       } else {
         const currentApproval = await trx.selectFrom('license_transfer_approvals').selectAll()
           .where('approval_id', '=', currentPlan.approval_id).executeTakeFirst();
+        const currentRevocation = await trx.selectFrom('license_transfer_revocations').select('approval_id')
+          .where('approval_id', '=', currentPlan.approval_id).executeTakeFirst();
         const stillCurrent = currentApproval !== undefined && currentApproval.expires_at.getTime() > now.getTime() &&
+          currentRevocation === undefined &&
           currentPlan.expected_revision.toString() === license.revision.toString() &&
           currentPlan.source_generation.toString() === license.current_generation.toString() &&
           license.status === 'active' && license.confirmed_subscription_end.getTime() > now.getTime();
@@ -1034,10 +1047,13 @@ export async function processTransferCommit(
       return reject('TRANSFER_TICKET_EXPIRED');
     }
     const approval = await trx.selectFrom('license_transfer_approvals').selectAll().where('approval_id', '=', plan.approval_id).executeTakeFirst();
+    const approvalRevoked = await trx.selectFrom('license_transfer_revocations').select('approval_id').where('approval_id', '=', plan.approval_id).executeTakeFirst();
+    const targetWasUsed = await trx.selectFrom('license_activations').select('id')
+      .where('license_id', '=', plan.license_id).where('identity_jkt', '=', plan.target_identity_jkt).executeTakeFirst();
     const adminApproval = await trx.selectFrom('license_admin_operations').selectAll()
       .where('operation_id', '=', plan.approval_id).executeTakeFirst();
     const source = await trx.selectFrom('license_activations').selectAll().where('id', '=', plan.source_activation_id).forUpdate().executeTakeFirst();
-    if (!approval || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
+    if (!approval || approvalRevoked || targetWasUsed || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
       adminApproval.request_digest !== approval.request_digest || approval.expires_at.getTime() <= now.getTime() ||
       approval.expected_revision.toString() !== plan.expected_revision.toString() ||
       approval.source_generation.toString() !== plan.source_generation.toString() || approval.database_id !== plan.database_id ||

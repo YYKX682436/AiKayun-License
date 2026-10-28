@@ -14,6 +14,7 @@
 
 - `license_id`、商城逻辑 `instance_id` 和 `database_id` 保持不变。
 - 来源身份必须是当前 active activation；目标身份必须是管理员批准的不同 JKT。
+- 目标 JKT 在该 license 的 activation 历史中不得出现，防止 A→B→A；此规则只约束正常迁移，不建立阻断灾难迁移身份恢复的全局唯一约束。
 - 成功 commit 时 `activation_generation` 严格加 1，来源 activation 变为 `retired`，目标 activation 是唯一 `active`。
 - 中心管理 `revision` 加 1；`entitlement_revision`、套餐、订阅截止时间和 license 状态不变。迁移不续费、不消耗激活码。
 - 订单、资金、业务 UUID、历史解密密钥及业务数据库/文件不在授权中心；本轮不修改这些商城事实。
@@ -25,6 +26,8 @@
 `license approve-transfer` 复用⑦-1B-2A受控管理会话、OS UID/database role身份、operation ID、不可变请求摘要、双步确认、管理审计和 license 行锁。摘要绑定 license、原 database/instance/JKT/generation、目标 instance/JKT、当前 expected 管理 revision、expected binding revision、原因和操作身份。
 
 审批有效期为24小时，审批行和管理操作结果不可变。成功审批本身不改 license revision、entitlement revision、generation 或 activation。有效审批要求许可证 active 且未过期，来源仍为当前 active activation，revision/generation 与审批时一致。续费、撤销、恢复、其他管理revision变化或generation替换后，旧审批不能继续使用。一个 license 同一revision最多保留一个有效迁移审批。
+
+`license revoke-transfer-approval` 以独立 operation ID、审批 ID、原因、expected revision 和同一受控管理员两步确认来撤销。不可变撤销投影和审计记录保留原审批历史；撤销不改变 license revision、权益、订阅或 activation。Prepare 与 Commit 在 license 行锁内复查撤销投影，旧 prepared ticket 失效；撤销与 Commit 由同一行锁决定先后。已提交迁移不可被撤销回滚。撤销后允许对新目标密钥重新审批。
 
 现有管理 CLI 保持 `isolated-development` 和 loopback 数据库限制；`NODE_ENV=production` 继续拒绝启动。没有正式管理员 MFA、公网管理入口或生产部署，因此迁移审批与本轮端点只允许隔离测试/受控开发，不能宣称可直接用于生产。
 
@@ -79,6 +82,6 @@ prepare和commit使用现有 `operation_id`、`intent_digest`、request nonce及
 
 ## 数据迁移和验收边界
 
-`001_core` 与 `002_admin_operations` 未修改。本阶段使用追加迁移 `003_normal_transfers`，新增审批、迁移计划和生命周期审计表，并扩展operation/admin action允许值。迁移审批、ticket、正式回执和测试代码均不接入商城仓库。
+`001_core`、`002_admin_operations` 与 `003_normal_transfers` 未修改。本轮以追加迁移 `004_transfer_approval_revocations` 保存审批撤销投影并扩展管理员动作。迁移审批、ticket、正式回执和测试代码均不接入商城仓库。
 
 真实PostgreSQL/HTTPS集成测试使用临时许可证、临时Ed25519实例key、临时中心签名key和本地测试数据库；不使用真实生产许可证、真实业务私钥或商户数据。进程强杀、HTTP响应丢失和PostgreSQL COMMIT确认丢失均在隔离测试数据库演练。此中心端验收不等于商城本地文件/DB恢复、生产管理员认证或真实服务器切流验收。
