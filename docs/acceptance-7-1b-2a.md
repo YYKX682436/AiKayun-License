@@ -30,7 +30,9 @@
 
 管理集成测试实际执行迁移并核验 PostgreSQL 中的已提交状态、唯一约束、不可变触发器和操作/审计行；通过真实 TLS HTTP 服务核验签名的 revoked、restored、expired、superseded 响应与 lease。另覆盖月/年许可证、激活码哈希/一次显示/重放/过期/作废重发、revision 单调性、发码与许可证操作并发 CAS、renew/revoke 冲突、未知 COMMIT 确认后的原操作恢复、环境 actor 伪造、错误 UID/数据库角色、没有管理员 API、审计变更与清空拒绝，以及到期恢复、旧签名状态回执乱序不改变较新数据库状态。
 
-CI 工作流执行相同的类型检查、构建、单元及 PostgreSQL 集成套件；推送后将在此补记本阶段最终提交及对应 CI 结果。
+| GitHub Actions CI | `d3a8914ed4afcec4052c847e20a715910614301e` 的 run [`40700827363`](https://github.com/YYKX682436/AiKayun-License/actions/runs/40700827363) 通过；PostgreSQL 服务初始化、`npm ci`、类型检查、构建、17 项单测及 28 项真实 PostgreSQL 集成测试均通过 |
+
+CI 仅报告了 runner 对 `actions/checkout` / `actions/setup-node` 的 Node.js 20 弃用提示，以及 `ubuntu-latest` 将迁移到 Ubuntu 26 的提示；步骤均成功。这些提示不影响本次验证结果。
 
 ## 边界与未验证项
 
