@@ -1,0 +1,50 @@
+name: aikayun-license-local
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    environment:
+      POSTGRES_DB: license_center
+      POSTGRES_USER: license
+      POSTGRES_PASSWORD: license-dev-only
+    ports:
+      - "127.0.0.1:${LICENSE_DB_HOST_PORT:-55432}:5432"
+    volumes:
+      - license_data:/var/lib/postgresql
+      - ./docker/postgres/10-test-database.sql:/docker-entrypoint-initdb.d/10-test-database.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U license -d license_center"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      LICENSE_DATABASE_URL: postgres://license:license-dev-only@postgres:5432/license_center
+      LICENSE_ISSUER: ${LICENSE_ISSUER:-https://license.example.test}
+      LICENSE_PUBLIC_ORIGIN: ${LICENSE_PUBLIC_ORIGIN:-https://license.example.test}
+      LICENSE_SIGNING_KEY_FILE: /run/secrets/license-signing-key.pem
+      LICENSE_TLS_KEY_FILE: /run/secrets/license-tls-key.pem
+      LICENSE_TLS_CERT_FILE: /run/secrets/license-tls-cert.pem
+      LICENSE_HTTP_PORT: "4318"
+      LICENSE_LISTEN_HOST: 0.0.0.0
+      LICENSE_ISOLATED_CONTAINER: compose
+    user: "${LICENSE_CONTAINER_UID:-1000}:${LICENSE_CONTAINER_GID:-1000}"
+    volumes:
+      - ./secrets/license-signing-key.pem:/run/secrets/license-signing-key.pem:ro
+      - ./secrets/license-tls-key.pem:/run/secrets/license-tls-key.pem:ro
+      - ./secrets/license-tls-cert.pem:/run/secrets/license-tls-cert.pem:ro
+    ports:
+      - "127.0.0.1:${LICENSE_HTTP_PORT:-4318}:4318"
+    restart: unless-stopped
+
+volumes:
+  license_data:
