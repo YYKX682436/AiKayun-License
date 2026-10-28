@@ -6,15 +6,20 @@ import type {
   ActivationRow,
   Database,
   LicenseRow,
+  LicenseTransferApprovalRow,
+  LicenseTransferPlanRow,
   OperationRow,
   RequestNonceRow,
 } from '../db/types.js';
 import { LicenseApiError } from '../errors.js';
-import { sha256Base64url } from '../crypto/identity.js';
-import { databaseNow, challengeClaimsMatchRow, type AuthenticatedRequest } from './common.js';
-import { signLicenseLease, signOperationReceipt, signStatusReceipt, type OperationState } from '../receipts.js';
+import { sha256Base64url, validateIdentityJwk } from '../crypto/identity.js';
+import { databaseNow, challengeClaimsMatchRow, sha256, type AuthenticatedRequest } from './common.js';
+import {
+  signLicenseLease, signOperationReceipt, signStatusReceipt, signTransferReceipt, signTransferTicket, verifyTransferTicket,
+  type OperationState,
+} from '../receipts.js';
 
-export type MutationKind = 'activation' | 'renewal' | 'recovery';
+export type MutationKind = 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit';
 export interface ActivationInput {
   operation_id: string;
   intent_digest: string;
@@ -54,6 +59,40 @@ export interface OperationQueryInput {
   identity_jkt: string;
   public_jwk: unknown;
   challenge: string;
+}
+
+export interface TransferPrepareInput {
+  operation_id: string;
+  intent_digest: string;
+  attempt_no: number;
+  license_id: string;
+  database_id: string;
+  instance_id: string;
+  identity_jkt: string;
+  public_jwk: unknown;
+  challenge: string;
+  approval_id: string;
+  target_instance_id: string;
+  target_identity_jkt: string;
+  target_public_jwk: unknown;
+  source_generation: string;
+  expected_binding_revision: string;
+  expected_revision: string;
+}
+
+export interface TransferCommitInput {
+  operation_id: string;
+  intent_digest: string;
+  attempt_no: number;
+  license_id: string;
+  database_id: string;
+  instance_id: string;
+  identity_jkt: string;
+  public_jwk: unknown;
+  challenge: string;
+  approval_id: string;
+  prepare_operation_id: string;
+  transfer_ticket: string;
 }
 
 export type MutationResponseType = 'license' | 'status' | 'operation';
@@ -731,5 +770,373 @@ export async function continueOperation(
     committedRequestDigest: attempt?.body_digest ?? null,
     resultJws: source.response_jws,
     now,
+  });
+}
+
+const MAX_DATABASE_INTEGER = 9_223_372_036_854_775_807n;
+
+function transferEventActor(identityJkt: string): string {
+  return `instance_jkt:${identityJkt}`;
+}
+
+async function appendTransferEvent(trx: TransactionDatabase, input: {
+  licenseId: string;
+  approvalId: string;
+  prepareOperationId?: string | null;
+  commitOperationId?: string | null;
+  planId?: string | null;
+  kind: 'approved' | 'prepared' | 'expired' | 'invalidated' | 'committed' | 'rejected';
+  actor: string;
+  details: Record<string, unknown>;
+  now: Date;
+}): Promise<void> {
+  await trx.insertInto('license_transfer_events').values({
+    event_id: randomUUID(), license_id: input.licenseId, approval_id: input.approvalId,
+    prepare_operation_id: input.prepareOperationId ?? null, commit_operation_id: input.commitOperationId ?? null,
+    plan_id: input.planId ?? null, kind: input.kind, actor: input.actor, safe_details: input.details, created_at: input.now,
+  }).execute();
+}
+
+async function expireOrInvalidatePlan(trx: TransactionDatabase, plan: LicenseTransferPlanRow,
+  state: 'expired' | 'invalidated', actor: string, reason: string, now: Date): Promise<void> {
+  await trx.updateTable('license_transfer_plans').set({ state }).where('plan_id', '=', plan.plan_id).where('state', '=', 'prepared').execute();
+  await appendTransferEvent(trx, {
+    licenseId: plan.license_id, approvalId: plan.approval_id, prepareOperationId: plan.prepare_operation_id,
+    planId: plan.plan_id, kind: state, actor, details: { reason }, now,
+  });
+}
+
+function approvalMatchesPrepare(approval: LicenseTransferApprovalRow, input: TransferPrepareInput,
+  identityJkt: string, targetJkt: string, license: LicenseRow, now: Date): boolean {
+  return approval.license_id === input.license_id && approval.database_id === input.database_id &&
+    approval.source_instance_id === input.instance_id && approval.source_identity_jkt === identityJkt &&
+    approval.target_instance_id === input.target_instance_id && approval.target_identity_jkt === targetJkt &&
+    approval.source_generation.toString() === input.source_generation &&
+    approval.expected_binding_revision.toString() === input.expected_binding_revision &&
+    approval.expected_revision.toString() === input.expected_revision && license.revision.toString() === input.expected_revision &&
+    license.current_generation.toString() === input.source_generation && license.status === 'active' &&
+    license.confirmed_subscription_end.getTime() > now.getTime() && approval.expires_at.getTime() > now.getTime();
+}
+
+export async function processTransferPrepare(
+  db: Kysely<Database>, config: RuntimeConfig, auth: AuthenticatedRequest, input: TransferPrepareInput,
+): Promise<MutationResult> {
+  bindAttemptNumber(auth, input.attempt_no);
+  const targetIdentity = await validateIdentityJwk(input.target_public_jwk);
+  if (input.identity_jkt !== auth.signature.identityJkt || input.target_identity_jkt !== targetIdentity.jkt ||
+    input.target_instance_id !== input.instance_id || input.target_identity_jkt === auth.signature.identityJkt) {
+    throw new LicenseApiError(409, 'TRANSFER_TARGET_BINDING_INVALID');
+  }
+  if (input.operation_id === input.approval_id) throw new LicenseApiError(409, 'TRANSFER_OPERATION_ID_REUSE');
+  return db.transaction().execute(async (trx) => {
+    await acquireOperationLock(trx, input.operation_id);
+    const license = await lockLicense(trx, input.license_id);
+    const existing = await findOperation(trx, input.operation_id);
+    if (existing) {
+      assertSameOperation(existing, auth, 'transfer_prepare', input.license_id, input.database_id);
+      const now = await databaseNow(trx);
+      return replayExistingOperation(trx, config, auth, existing, now);
+    }
+    await acquireInstanceLock(trx, input.instance_id);
+    const now = await databaseNow(trx);
+    const nonce = await loadAndConsumeNonce(trx, auth, now);
+    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
+
+    const approval = await trx.selectFrom('license_transfer_approvals').selectAll()
+      .where('approval_id', '=', input.approval_id).executeTakeFirst();
+    const adminApproval = await trx.selectFrom('license_admin_operations').select(['operation_id', 'action', 'state', 'request_digest'])
+      .where('operation_id', '=', input.approval_id).executeTakeFirst();
+    const source = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
+    if (!approval || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
+      adminApproval.request_digest !== approval.request_digest || !approvalMatchesPrepare(approval, input, auth.signature.identityJkt, targetIdentity.jkt, license, now) ||
+      !source || source.state !== 'active' || source.database_id !== input.database_id ||
+      source.generation.toString() !== input.source_generation || source.identity_jkt !== auth.signature.identityJkt ||
+      source.identity_jwk_public['kty'] !== auth.signature.identityJwk.kty ||
+      source.identity_jwk_public['crv'] !== auth.signature.identityJwk.crv ||
+      source.identity_jwk_public['x'] !== auth.signature.identityJwk.x) {
+      const code = license.status !== 'active' ? 'LICENSE_REVOKED' :
+        license.confirmed_subscription_end.getTime() <= now.getTime() ? 'SUBSCRIPTION_EXPIRED' : 'TRANSFER_APPROVAL_INVALID';
+      const token = await terminalOperationReceipt(trx, config, auth, {
+        kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
+        outcomeCode: code, responseType: 'operation',
+      }, now);
+      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: code };
+    }
+
+    const matchingApprovals = await trx.selectFrom('license_transfer_approvals').select('approval_id')
+      .where('license_id', '=', input.license_id).where('expires_at', '>', now)
+      .where('expected_revision', '=', license.revision).where('source_generation', '=', license.current_generation).execute();
+    if (matchingApprovals.length !== 1 || matchingApprovals[0]!.approval_id !== input.approval_id) {
+      const token = await terminalOperationReceipt(trx, config, auth, {
+        kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
+        outcomeCode: 'TRANSFER_APPROVAL_AMBIGUOUS', responseType: 'operation',
+      }, now);
+      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_AMBIGUOUS' };
+    }
+
+    const currentPlan = await trx.selectFrom('license_transfer_plans').selectAll()
+      .where('license_id', '=', input.license_id).where('state', '=', 'prepared').forUpdate().executeTakeFirst();
+    if (currentPlan) {
+      if (currentPlan.expires_at.getTime() <= now.getTime()) {
+        await expireOrInvalidatePlan(trx, currentPlan, 'expired', transferEventActor(auth.signature.identityJkt), 'ticket_expired', now);
+      } else {
+        const currentApproval = await trx.selectFrom('license_transfer_approvals').selectAll()
+          .where('approval_id', '=', currentPlan.approval_id).executeTakeFirst();
+        const stillCurrent = currentApproval !== undefined && currentApproval.expires_at.getTime() > now.getTime() &&
+          currentPlan.expected_revision.toString() === license.revision.toString() &&
+          currentPlan.source_generation.toString() === license.current_generation.toString() &&
+          license.status === 'active' && license.confirmed_subscription_end.getTime() > now.getTime();
+        if (stillCurrent) {
+          const token = await terminalOperationReceipt(trx, config, auth, {
+            kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
+            outcomeCode: 'TRANSFER_PLAN_ALREADY_PREPARED', responseType: 'operation',
+          }, now);
+          return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'TRANSFER_PLAN_ALREADY_PREPARED' };
+        }
+        await expireOrInvalidatePlan(trx, currentPlan, 'invalidated', transferEventActor(auth.signature.identityJkt), 'approval_or_license_revision_changed', now);
+      }
+    }
+
+    const planId = randomUUID();
+    const expiresAt = new Date((Math.floor(now.getTime() / 1000) + 10 * 60) * 1000);
+    const ticket = await signTransferTicket(config, {
+      plan_id: planId,
+      approval_operation_id: approval.approval_id,
+      prepare_operation_id: input.operation_id,
+      prepare_intent_digest: input.intent_digest,
+      prepare_request_nonce: auth.challenge.serverNonce,
+      prepare_request_digest: auth.requestDigest,
+      license_id: input.license_id,
+      database_id: input.database_id,
+      source_instance_id: input.instance_id,
+      source_identity_jkt: auth.signature.identityJkt,
+      source_activation_generation: input.source_generation,
+      target_instance_id: input.target_instance_id,
+      target_identity_jkt: targetIdentity.jkt,
+      expected_binding_revision: input.expected_binding_revision,
+      expected_revision: input.expected_revision,
+      entitlement_revision: license.entitlement_revision.toString(),
+      now,
+    });
+    const ticketDigest = sha256Base64url(ticket);
+    await insertOperation(trx, {
+      operationId: input.operation_id, identityJkt: auth.signature.identityJkt, intentDigest: input.intent_digest,
+      kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id,
+      state: 'committed', outcomeCode: 'TRANSFER_PREPARED', responseType: 'operation',
+      resultGeneration: input.source_generation, resultRevision: license.entitlement_revision.toString(), responseJws: ticket, now,
+    });
+    await trx.insertInto('license_transfer_plans').values({
+      plan_id: planId, license_id: input.license_id, approval_id: approval.approval_id,
+      prepare_operation_id: input.operation_id, prepare_intent_digest: input.intent_digest,
+      source_activation_id: source.id, database_id: input.database_id, source_instance_id: input.instance_id,
+      source_identity_jkt: auth.signature.identityJkt, target_instance_id: input.target_instance_id,
+      target_identity_jkt: targetIdentity.jkt, target_identity_jwk_public: targetIdentity.jwk as unknown as Record<string, unknown>,
+      source_generation: input.source_generation, expected_binding_revision: input.expected_binding_revision,
+      expected_revision: input.expected_revision, entitlement_revision: license.entitlement_revision.toString(),
+      ticket_jws: ticket, ticket_digest: ticketDigest, state: 'prepared', expires_at: expiresAt, created_at: now,
+      committed_at: null, commit_operation_id: null, committed_generation: null, transfer_receipt_jws: null,
+    }).execute();
+    await appendAttempt(trx, auth, {
+      operationId: input.operation_id, attemptNo: input.attempt_no, intentDigest: input.intent_digest,
+      outcome: 'accepted', serverNonceHash: auth.challenge.nonceHash,
+    }, now);
+    await appendAudit(trx, input.license_id, input.operation_id, 'transfer_prepared', auth.signature.identityJkt,
+      { approval_id: input.approval_id, plan_id: planId, source_generation: input.source_generation, target_identity_jkt: targetIdentity.jkt }, now);
+    await appendTransferEvent(trx, {
+      licenseId: input.license_id, approvalId: input.approval_id, prepareOperationId: input.operation_id,
+      planId, kind: 'prepared', actor: transferEventActor(auth.signature.identityJkt),
+      details: { source_generation: input.source_generation, target_identity_jkt: targetIdentity.jkt, ticket_digest: ticketDigest }, now,
+    });
+    return { kind: 'response', responseType: 'operation', token: ticket, state: 'committed', outcomeCode: 'TRANSFER_PREPARED' };
+  });
+}
+
+function ticketString(claims: Record<string, unknown>, name: string): string {
+  const value = claims[name];
+  if (typeof value !== 'string') throw new LicenseApiError(401, 'TRANSFER_TICKET_INVALID');
+  return value;
+}
+
+export async function processTransferCommit(
+  db: Kysely<Database>, config: RuntimeConfig, auth: AuthenticatedRequest, input: TransferCommitInput,
+): Promise<MutationResult> {
+  bindAttemptNumber(auth, input.attempt_no);
+  let ticket: Awaited<ReturnType<typeof verifyTransferTicket>>;
+  try {
+    ticket = await verifyTransferTicket(input.transfer_ticket, config, auth.receivedAt);
+  } catch {
+    throw new LicenseApiError(401, 'TRANSFER_TICKET_INVALID');
+  }
+  const claims = ticket.claims;
+  const targetIdentity = await validateIdentityJwk(input.public_jwk);
+  if (input.operation_id === input.approval_id || input.operation_id === input.prepare_operation_id) {
+    throw new LicenseApiError(409, 'TRANSFER_OPERATION_ID_REUSE');
+  }
+  if (input.identity_jkt !== auth.signature.identityJkt || targetIdentity.jkt !== auth.signature.identityJkt ||
+    ticketString(claims, 'license_id') !== input.license_id || ticketString(claims, 'database_id') !== input.database_id ||
+    ticketString(claims, 'target_instance_id') !== input.instance_id || ticketString(claims, 'target_identity_jkt') !== auth.signature.identityJkt ||
+    ticketString(claims, 'approval_operation_id') !== input.approval_id ||
+    ticketString(claims, 'prepare_operation_id') !== input.prepare_operation_id) {
+    throw new LicenseApiError(401, 'TRANSFER_TICKET_BINDING_INVALID');
+  }
+  return db.transaction().execute(async (trx) => {
+    await acquireOperationLock(trx, input.operation_id);
+    const license = await lockLicense(trx, input.license_id);
+    const existing = await findOperation(trx, input.operation_id);
+    if (existing) {
+      assertSameOperation(existing, auth, 'transfer_commit', input.license_id, input.database_id);
+      const now = await databaseNow(trx);
+      return replayExistingOperation(trx, config, auth, existing, now);
+    }
+    await acquireInstanceLock(trx, input.instance_id);
+    const planId = ticketString(claims, 'plan_id');
+    const plan = await trx.selectFrom('license_transfer_plans').selectAll().where('plan_id', '=', planId).forUpdate().executeTakeFirst();
+    const now = await databaseNow(trx);
+    const nonce = await loadAndConsumeNonce(trx, auth, now);
+    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
+
+    const reject = async (code: string): Promise<MutationResult> => {
+      const token = await terminalOperationReceipt(trx, config, auth, {
+        kind: 'transfer_commit', licenseId: input.license_id, databaseId: input.database_id,
+        state: 'rejected', outcomeCode: code, responseType: 'operation',
+      }, now);
+      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: code };
+    };
+    if (!plan || plan.prepare_operation_id !== input.prepare_operation_id || plan.approval_id !== input.approval_id ||
+      plan.license_id !== input.license_id || plan.ticket_jws !== input.transfer_ticket ||
+      plan.ticket_digest !== sha256Base64url(input.transfer_ticket) || plan.database_id !== input.database_id ||
+      plan.source_instance_id !== ticketString(claims, 'source_instance_id') || plan.source_identity_jkt !== ticketString(claims, 'source_identity_jkt') ||
+      plan.source_generation.toString() !== ticketString(claims, 'source_activation_generation') ||
+      plan.target_instance_id !== input.instance_id || plan.target_identity_jkt !== auth.signature.identityJkt ||
+      plan.expected_binding_revision.toString() !== ticketString(claims, 'expected_binding_revision') ||
+      plan.expected_revision.toString() !== ticketString(claims, 'expected_revision') ||
+      plan.entitlement_revision.toString() !== ticketString(claims, 'entitlement_revision') ||
+      plan.prepare_intent_digest !== ticketString(claims, 'prepare_intent_digest') ||
+      Math.floor(plan.expires_at.getTime() / 1000) !== Number(claims['exp']) ||
+      Math.floor(plan.created_at.getTime() / 1000) !== Number(claims['iat']) ||
+      plan.target_identity_jwk_public['kty'] !== auth.signature.identityJwk.kty ||
+      plan.target_identity_jwk_public['crv'] !== auth.signature.identityJwk.crv ||
+      plan.target_identity_jwk_public['x'] !== auth.signature.identityJwk.x) return reject('TRANSFER_TICKET_INVALID');
+    const prepareOperation = await trx.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', plan.prepare_operation_id).executeTakeFirst();
+    const prepareAttempt = await trx.selectFrom('license_operation_attempts').selectAll()
+      .where('operation_id', '=', plan.prepare_operation_id)
+      .where('server_nonce_hash', '=', sha256(ticketString(claims, 'prepare_request_nonce')))
+      .executeTakeFirst();
+    if (!prepareOperation || prepareOperation.kind !== 'transfer_prepare' || prepareOperation.state !== 'committed' ||
+      prepareOperation.actor_jkt !== plan.source_identity_jkt || prepareOperation.intent_digest !== plan.prepare_intent_digest ||
+      prepareOperation.response_jws !== plan.ticket_jws || !prepareAttempt || prepareAttempt.outcome !== 'accepted' ||
+      prepareAttempt.identity_jkt !== plan.source_identity_jkt || prepareAttempt.body_digest !== ticketString(claims, 'prepare_request_digest') ||
+      prepareAttempt.intent_digest !== plan.prepare_intent_digest) return reject('TRANSFER_TICKET_INVALID');
+    if (plan.state !== 'prepared') return reject(plan.state === 'expired' ? 'TRANSFER_TICKET_EXPIRED' : 'TRANSFER_TICKET_CONSUMED');
+    if (ticket.expired || plan.expires_at.getTime() <= now.getTime()) {
+      await expireOrInvalidatePlan(trx, plan, 'expired', transferEventActor(auth.signature.identityJkt), 'ticket_expired', now);
+      return reject('TRANSFER_TICKET_EXPIRED');
+    }
+    const approval = await trx.selectFrom('license_transfer_approvals').selectAll().where('approval_id', '=', plan.approval_id).executeTakeFirst();
+    const adminApproval = await trx.selectFrom('license_admin_operations').selectAll()
+      .where('operation_id', '=', plan.approval_id).executeTakeFirst();
+    const source = await trx.selectFrom('license_activations').selectAll().where('id', '=', plan.source_activation_id).forUpdate().executeTakeFirst();
+    if (!approval || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
+      adminApproval.request_digest !== approval.request_digest || approval.expires_at.getTime() <= now.getTime() ||
+      approval.expected_revision.toString() !== plan.expected_revision.toString() ||
+      approval.source_generation.toString() !== plan.source_generation.toString() || approval.database_id !== plan.database_id ||
+      approval.source_instance_id !== plan.source_instance_id || approval.source_identity_jkt !== plan.source_identity_jkt ||
+      approval.target_instance_id !== plan.target_instance_id || approval.target_identity_jkt !== plan.target_identity_jkt ||
+      approval.expected_binding_revision.toString() !== plan.expected_binding_revision.toString() ||
+      license.status !== 'active' || license.confirmed_subscription_end.getTime() <= now.getTime() ||
+      license.revision.toString() !== plan.expected_revision.toString() ||
+      license.current_generation.toString() !== plan.source_generation.toString() ||
+      license.entitlement_revision.toString() !== plan.entitlement_revision.toString() ||
+      !source || source.id !== plan.source_activation_id || source.state !== 'active' ||
+      source.license_id !== plan.license_id || source.database_id !== plan.database_id ||
+      source.instance_id !== plan.source_instance_id || source.identity_jkt !== plan.source_identity_jkt ||
+      source.generation.toString() !== plan.source_generation.toString()) {
+      await expireOrInvalidatePlan(trx, plan, 'invalidated', transferEventActor(auth.signature.identityJkt), 'approval_or_source_no_longer_current', now);
+      const code = license.status !== 'active' ? 'LICENSE_REVOKED' : license.confirmed_subscription_end.getTime() <= now.getTime()
+        ? 'SUBSCRIPTION_EXPIRED' : license.revision.toString() !== plan.expected_revision.toString()
+          ? 'TRANSFER_REVISION_CONFLICT' : 'TRANSFER_SOURCE_SUPERSEDED';
+      return reject(code);
+    }
+    const databaseInteger = BigInt(license.current_generation) + 1n;
+    const nextRevision = BigInt(license.revision) + 1n;
+    if (databaseInteger > MAX_DATABASE_INTEGER || nextRevision > MAX_DATABASE_INTEGER) throw new LicenseApiError(409, 'TRANSFER_REVISION_EXHAUSTED');
+    const nextGeneration = databaseInteger.toString();
+    const nextManagementRevision = nextRevision.toString();
+    const retired = await trx.updateTable('license_activations').set({ state: 'retired', retired_at: now })
+      .where('id', '=', source.id).where('state', '=', 'active').where('generation', '=', plan.source_generation)
+      .returning('id').executeTakeFirst();
+    if (!retired) throw new LicenseApiError(409, 'TRANSFER_SOURCE_SUPERSEDED');
+    const lease = await signLicenseLease(config, {
+      licenseId: input.license_id,
+      instanceId: input.instance_id,
+      databaseId: input.database_id,
+      identityJkt: auth.signature.identityJkt,
+      generation: nextGeneration,
+      entitlementRevision: license.entitlement_revision.toString(),
+      plan: license.plan,
+      subscriptionEnd: license.confirmed_subscription_end,
+      requestNonce: auth.challenge.serverNonce,
+      requestDigest: auth.requestDigest,
+      now,
+    });
+    const transferReceipt = await signTransferReceipt(config, {
+      licenseId: input.license_id,
+      databaseId: input.database_id,
+      sourceInstanceId: plan.source_instance_id,
+      sourceIdentityJkt: plan.source_identity_jkt,
+      sourceGeneration: plan.source_generation.toString(),
+      targetInstanceId: input.instance_id,
+      targetIdentityJkt: auth.signature.identityJkt,
+      targetGeneration: nextGeneration,
+      expectedBindingRevision: plan.expected_binding_revision.toString(),
+      expectedRevision: plan.expected_revision.toString(),
+      resultRevision: nextManagementRevision,
+      entitlementRevision: license.entitlement_revision.toString(),
+      operationId: input.operation_id,
+      intentDigest: input.intent_digest,
+      requestNonce: auth.challenge.serverNonce,
+      requestDigest: auth.requestDigest,
+      newLease: lease.token,
+      subscriptionEnd: license.confirmed_subscription_end,
+      now,
+    });
+    await trx.insertInto('license_activations').values({
+      id: randomUUID(), license_id: input.license_id, generation: nextGeneration,
+      instance_id: input.instance_id, database_id: input.database_id,
+      identity_jwk_public: auth.signature.identityJwk as unknown as Record<string, unknown>,
+      identity_jkt: auth.signature.identityJkt, state: 'active', activated_at: now, retired_at: null,
+      last_seen_at: now, origin_display: source.origin_display,
+    }).execute();
+    const changedLicense = await trx.updateTable('licenses').set({ current_generation: nextGeneration, revision: nextManagementRevision, updated_at: now })
+      .where('id', '=', input.license_id).where('current_generation', '=', plan.source_generation)
+      .where('revision', '=', plan.expected_revision).executeTakeFirst();
+    if (BigInt(changedLicense.numUpdatedRows) !== 1n) throw new LicenseApiError(409, 'TRANSFER_REVISION_CONFLICT');
+    await insertOperation(trx, {
+      operationId: input.operation_id, identityJkt: auth.signature.identityJkt, intentDigest: input.intent_digest,
+      kind: 'transfer_commit', licenseId: input.license_id, databaseId: input.database_id,
+      state: 'committed', outcomeCode: 'TRANSFER_COMMITTED', responseType: 'operation',
+      resultGeneration: nextGeneration, resultRevision: license.entitlement_revision.toString(),
+      responseJws: transferReceipt, now,
+    });
+    await trx.updateTable('license_transfer_plans').set({
+      state: 'committed', committed_at: now, commit_operation_id: input.operation_id,
+      committed_generation: nextGeneration, transfer_receipt_jws: transferReceipt,
+    }).where('plan_id', '=', plan.plan_id).where('state', '=', 'prepared').execute();
+    await appendAttempt(trx, auth, {
+      operationId: input.operation_id, attemptNo: input.attempt_no, intentDigest: input.intent_digest,
+      outcome: 'accepted', serverNonceHash: auth.challenge.nonceHash,
+    }, now);
+    await appendAudit(trx, input.license_id, input.operation_id, 'transfer_committed', auth.signature.identityJkt,
+      { approval_id: input.approval_id, plan_id: plan.plan_id, old_generation: plan.source_generation.toString(),
+        new_generation: nextGeneration, entitlement_revision: license.entitlement_revision.toString(), revision: nextManagementRevision }, now);
+    await appendTransferEvent(trx, {
+      licenseId: input.license_id, approvalId: input.approval_id, prepareOperationId: plan.prepare_operation_id,
+      commitOperationId: input.operation_id, planId: plan.plan_id, kind: 'committed',
+      actor: transferEventActor(auth.signature.identityJkt),
+      details: { old_generation: plan.source_generation.toString(), new_generation: nextGeneration,
+        result_revision: nextManagementRevision, entitlement_revision: license.entitlement_revision.toString() }, now,
+    });
+    return { kind: 'response', responseType: 'operation', token: transferReceipt, state: 'committed', outcomeCode: 'TRANSFER_COMMITTED' };
   });
 }

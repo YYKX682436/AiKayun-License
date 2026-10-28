@@ -92,13 +92,23 @@ npm run admin -- license revoke --operation-id <UUID> --license-id <UUID> \
 
 npm run admin -- license restore --operation-id <UUID> --license-id <UUID> \
   --expected-revision <N> --reason '<原因>' [--confirm-digest <摘要>]
+
+npm run admin -- license approve-transfer --operation-id <UUID> --license-id <UUID> \
+  --expected-revision <N> --database-id <UUID> --source-instance-id <UUID> \
+  --source-identity-jkt <JKT> --target-instance-id <同一UUID> \
+  --target-identity-jkt <新JKT> --source-generation <N> \
+  --expected-binding-revision <N> --reason '<原因>' [--confirm-digest <摘要>]
 ```
 
 年付许可证由建档时的 `plan=yearly` 决定；续费沿用许可证原月/年计划。续费命令仅表示授权管理员已人工确认业务事实：它不接收付款凭据、不连接收款渠道，也不会独立证明收款。续费复用既有 `applyConfirmedRenewal` UTC 账期算法与 `entitlement_events`，普通续费不会清除 `revoked` 状态。
 
 签发、作废并重发激活码会递增管理 `revision`，但不递增权益 `entitlement_revision`。这让发码与同版本的续费、撤销或恢复共享 compare-and-swap 边界；并发操作中先提交的一方推进 revision，其他操作必须查询并按新版本重新确认。
 
-撤销和恢复只切换 `active ↔ revoked`，并在事务中递增 `entitlement_revision` 与管理 `revision`。它们不改订阅截止时间、activation 行、`database_id`、`identity_jkt` 或 generation，也不伪造权益续费事件。恢复后的续签仍受原订阅截止时间限制；到期恢复不会产生有效 lease。身份私钥泄露不能通过恢复解决，迁移/换钥不在本轮范围。
+撤销和恢复只切换 `active ↔ revoked`，并在事务中递增 `entitlement_revision` 与管理 `revision`。它们不改订阅截止时间、activation 行、`database_id`、`identity_jkt` 或 generation，也不伪造权益续费事件。恢复后的续签仍受原订阅截止时间限制；到期恢复不会产生有效 lease。身份私钥泄露不能通过恢复解决。
+
+`approve-transfer` 使用同一受控 actor、operation ID、expected revision、理由和请求摘要两步确认。请求绑定当前 active activation 的 license/database/instance/identity/generation，并登记目标新 JKT 与商城声明的 `expected_binding_revision`。目标 `instance_id` 必须等于来源逻辑 instance ID，目标 JKT 必须与来源不同。成功审批固定有效 24 小时，只追加审批/管理审计，不退役 activation、不改变 generation 或任何 license revision。撤销、恢复、续费、其他管理修改或 activation generation 替换一旦推进当前 revision/代次，旧审批和票据就不能再提交。
+
+该命令仍严格限定于 `isolated-development`、loopback PostgreSQL 和 allowlisted OS UID；生产环境启动限制没有移除。当前没有管理员 MFA，也没有公网后台。后端迁移协议虽已实现，本 CLI 的审批只能用于隔离测试/受控开发，不能作为生产审批流程。
 
 ## 一次性激活码
 
@@ -118,4 +128,4 @@ npm run admin -- audit list --license-id <UUID> --limit 50
 
 每个 operation ID 在 PostgreSQL advisory lock 下串行化。相同 ID + 相同摘要 + 同一 OS UID/数据库 role 会读取原终态；相同 ID 不同请求或不同执行身份会拒绝。COMMIT 确认丢失时，CLI 会用原 ID 查已提交结果；若无法确认，它报告未知状态。此时先查询原 operation ID，再决定是否以同一 ID、同一请求重试；不能生成新 ID 猜测结果。发码结果一旦进入重放路径，CLI 不会再次显示明文。
 
-所有管理员操作和审计状态在同一 PostgreSQL 事务中提交。`license_admin_operations` 和 `license_admin_audit_events` 只追加；状态变化也追加到现有 `license_audit_events`；确认续费继续写入 `entitlement_events`。迁移增加 TRUNCATE 拒绝触发器。数据库所有者/超级用户可以改 DDL，这仍是后续数据库权限与生产安全审查边界。
+所有管理员操作和审计状态在同一 PostgreSQL 事务中提交。`license_admin_operations` 和 `license_admin_audit_events` 只追加；状态变化也追加到现有 `license_audit_events`；确认续费继续写入 `entitlement_events`。正常迁移审批与票据/计划事件分别由 `license_transfer_approvals`、`license_transfer_plans` 和 `license_transfer_events` 保存，并限制不可变字段和单向状态转换。数据库所有者/超级用户可以改 DDL，这仍是后续数据库权限与生产安全审查边界。

@@ -64,7 +64,7 @@ export interface LicenseOperationsTable {
   operation_id: string;
   actor_jkt: string;
   intent_digest: string;
-  kind: 'activation' | 'renewal' | 'recovery';
+  kind: 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit';
   license_id: string;
   database_id: string;
   state: 'committed' | 'rejected' | 'cancelled';
@@ -118,7 +118,7 @@ export interface LicenseAuditEventsTable {
 export interface LicenseAdminOperationsTable {
   operation_id: string;
   request_digest: string;
-  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore';
+  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve';
   license_id: string;
   expected_revision: Bigint;
   actor_os_uid: number;
@@ -150,6 +150,67 @@ export interface LicenseAdminAuditEventsTable {
   created_at: Timestamp;
 }
 
+export interface LicenseTransferApprovalsTable {
+  approval_id: string;
+  request_digest: string;
+  license_id: string;
+  database_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  target_instance_id: string;
+  target_identity_jkt: string;
+  source_generation: Bigint;
+  expected_binding_revision: Bigint;
+  expected_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  approved_at: Timestamp;
+  expires_at: Timestamp;
+}
+
+export interface LicenseTransferPlansTable {
+  plan_id: string;
+  license_id: string;
+  approval_id: string;
+  prepare_operation_id: string;
+  prepare_intent_digest: string;
+  source_activation_id: string;
+  database_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  target_instance_id: string;
+  target_identity_jkt: string;
+  target_identity_jwk_public: Json;
+  source_generation: Bigint;
+  expected_binding_revision: Bigint;
+  expected_revision: Bigint;
+  entitlement_revision: Bigint;
+  ticket_jws: string;
+  ticket_digest: string;
+  state: 'prepared' | 'committed' | 'expired' | 'invalidated';
+  expires_at: Timestamp;
+  created_at: Timestamp;
+  committed_at: NullableTimestamp;
+  commit_operation_id: string | null;
+  committed_generation: Bigint | null;
+  transfer_receipt_jws: string | null;
+}
+
+export interface LicenseTransferEventsTable {
+  event_id: string;
+  license_id: string;
+  approval_id: string;
+  prepare_operation_id: string | null;
+  commit_operation_id: string | null;
+  plan_id: string | null;
+  kind: 'approved' | 'prepared' | 'expired' | 'invalidated' | 'committed' | 'rejected';
+  actor: string;
+  safe_details: Json;
+  created_at: Timestamp;
+}
+
 export interface Database {
   licenses: LicensesTable;
   license_activations: LicenseActivationsTable;
@@ -161,6 +222,9 @@ export interface Database {
   license_audit_events: LicenseAuditEventsTable;
   license_admin_operations: LicenseAdminOperationsTable;
   license_admin_audit_events: LicenseAdminAuditEventsTable;
+  license_transfer_approvals: LicenseTransferApprovalsTable;
+  license_transfer_plans: LicenseTransferPlansTable;
+  license_transfer_events: LicenseTransferEventsTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;
@@ -170,3 +234,5 @@ export type RequestNonceRow = Selectable<RequestNoncesTable>;
 export type OperationRow = Selectable<LicenseOperationsTable>;
 export type LicenseAdminOperationRow = Selectable<LicenseAdminOperationsTable>;
 export type LicenseAdminAuditEventRow = Selectable<LicenseAdminAuditEventsTable>;
+export type LicenseTransferApprovalRow = Selectable<LicenseTransferApprovalsTable>;
+export type LicenseTransferPlanRow = Selectable<LicenseTransferPlansTable>;

@@ -1,5 +1,6 @@
 import { AdminOperationError, createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest,
-  renewLicenseRequestDigest, changeLicenseStatusRequestDigest, type AdminOperationResult } from './service.js';
+  renewLicenseRequestDigest, changeLicenseStatusRequestDigest, approveTransferRequestDigest,
+  type AdminOperationResult } from './service.js';
 import { AdminAccessError } from './policy.js';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,6 +18,7 @@ const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控
   license renew --operation-id UUID --license-id UUID --expected-revision N --business-reference REF --reason TEXT [--confirm-digest DIGEST]
   license revoke --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license restore --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
+  license approve-transfer --operation-id UUID --license-id UUID --expected-revision N --database-id UUID --source-instance-id UUID --source-identity-jkt JKT --target-instance-id UUID --target-identity-jkt JKT --source-generation N --expected-binding-revision N --reason TEXT [--confirm-digest DIGEST]
   license get --license-id UUID
   operation get --operation-id UUID
   audit list --license-id UUID [--limit 50]
@@ -147,6 +149,28 @@ async function runMutation(argv: string[], stdout: OutputStream): Promise<number
     invoke = (service) => verb === 'revoke'
       ? service.revokeLicense({ ...request, confirmedRequestDigest: confirm ?? '' })
       : service.restoreLicense({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'approve-transfer') {
+    assertAllowedOptions(options, [
+      'operation-id', 'license-id', 'expected-revision', 'database-id', 'source-instance-id', 'source-identity-jkt',
+      'target-instance-id', 'target-identity-jkt', 'source-generation', 'expected-binding-revision', 'reason', 'confirm-digest',
+    ]);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      databaseId: option(options, 'database-id'),
+      sourceInstanceId: option(options, 'source-instance-id'),
+      sourceIdentityJkt: option(options, 'source-identity-jkt'),
+      targetInstanceId: option(options, 'target-instance-id'),
+      targetIdentityJkt: option(options, 'target-identity-jkt'),
+      sourceGeneration: option(options, 'source-generation'),
+      expectedBindingRevision: option(options, 'expected-binding-revision'),
+      reason: option(options, 'reason'),
+    };
+    action = 'transfer_approve';
+    digest = approveTransferRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.approveTransfer({ ...request, confirmedRequestDigest: confirm ?? '' });
   } else {
     fail('ADMIN_COMMAND_INVALID');
   }
@@ -217,7 +241,7 @@ export async function runAdminCli(
     return 0;
   }
   try {
-    if (['create', 'issue-code', 'renew', 'revoke', 'restore'].includes(argv[1] ?? '') && argv[0] === 'license') {
+    if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer'].includes(argv[1] ?? '') && argv[0] === 'license') {
       return await runMutation(argv, stdout);
     }
     return await runRead(argv, stdout);

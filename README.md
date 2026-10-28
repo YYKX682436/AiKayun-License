@@ -1,8 +1,8 @@
 # 艾卡云独立授权中心
 
-这是独立私有的授权中心仓库，按 AiKayun ⑦-1A R3 最终协议实现 ⑦-1B-1 的服务端基础闭环。服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。
+这是独立私有的授权中心仓库，服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。⑦-1B-2B-1 在 ⑦-1B-1/2A 基础上实现了授权中心正常迁移协议；正常迁移采用目标服务器新生成的 Ed25519 实例身份密钥，强化了⑦-1A R3 中“通常保留原 instance/key”的旧建议。协议差异和运行边界见 [`docs/normal-transfer-7-1b-2b-1.md`](docs/normal-transfer-7-1b-2b-1.md)。
 
-当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复和实例操作查询/继续接口，并为隔离测试与受控开发运维提供本机管理 CLI。没有商城客户端、经营门禁、支付接入、公网管理 API、MFA 管理面或生产部署配置。
+当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复、实例操作查询/继续、正常迁移 prepare/commit 接口，以及隔离测试与受控开发运维用的本机管理 CLI。商城客户端的本地密钥切换、签名回执投影、安装器和真实切流尚未实现。
 
 ## 本地隔离运行
 
@@ -69,6 +69,8 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 - `POST /v1/leases/renew`
 - `POST /v1/operations/query`
 - `POST /v1/operations/continue`
+- `POST /v1/transfers/prepare`（旧 active 身份签名）
+- `POST /v1/transfers/commit`（目标新身份签名）
 
 `leases/renew` 只为数据库中已确认且仍有效的权益签发新 lease，也可为原绑定实例恢复最新权益 revision。它不接受客户端申报付款，不修改订阅截止时间。测试夹具会直接在隔离数据库准备许可证、激活码和确认权益事件；服务没有可在生产调用的测试放行或权益发放接口。
 
@@ -85,4 +87,4 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 
 ## 后续阶段边界
 
-本轮未实现商业授权管理网页/公网管理 API、MFA、支付事件接入、取消接口、实例替换/迁移、灾难迁移、商城本地凭证投影、time-reset、密钥轮换、灾难恢复迁移或生产部署。管理 CLI 被硬性限制在非 production 环境和 loopback 数据库；这不构成正式生产管理员认证。`002_admin_operations` 为现有 `001_core` 追加管理员操作与不可变审计表及激活码作废状态。后续上线前仍需专门完成强认证/MFA、正式密钥管理、证书/域名与代理互操作、最小数据库角色、备份恢复、运维演练和部署安全审查。
+本轮未实现商业授权管理网页/公网管理 API、MFA、支付事件接入、取消接口、灾难迁移、商城本地凭证投影、time-reset、中心签名私钥轮换或生产部署。迁移审批仅沿用受限本机 CLI 的 OS UID 与数据库 role 身份；`NODE_ENV=production` 仍被硬性拒绝。因此，正常迁移代码和 HTTPS API 只能在隔离测试/开发环境验收，不能宣称可直接用于生产。目标商城的身份密钥切换和文件/数据库 journal 属于后续客户端工作。`001_core`、`002_admin_operations` 保持不变，本轮数据结构使用追加迁移 `003_normal_transfers`。后续上线前仍需专门完成强认证/MFA、正式密钥管理、证书/域名与代理互操作、最小数据库角色、备份恢复、运维演练和部署安全审查。

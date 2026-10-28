@@ -50,3 +50,53 @@ export function renewalIntentDigest(input: {
     ...(input.recoveryOfOperationId ? { recovery_of_operation_id: input.recoveryOfOperationId } : {}),
   });
 }
+
+export function transferPrepareIntentDigest(input: {
+  licenseId: string;
+  databaseId: string;
+  instanceId: string;
+  sourceIdentityJkt: string;
+  targetInstanceId: string;
+  targetIdentityJkt: string;
+  approvalId: string;
+  sourceGeneration: string;
+  expectedBindingRevision: string;
+  expectedRevision: string;
+}): string {
+  return digestCanonical({
+    v: 1,
+    kind: 'transfer_prepare',
+    license_id: input.licenseId,
+    database_id: input.databaseId,
+    source_instance_id: input.instanceId,
+    source_identity_jkt: input.sourceIdentityJkt,
+    target_instance_id: input.targetInstanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    approval_id: input.approvalId,
+    source_generation: input.sourceGeneration,
+    expected_binding_revision: input.expectedBindingRevision,
+    expected_revision: input.expectedRevision,
+  });
+}
+
+export function transferCommitIntentDigest(input: {
+  licenseId: string;
+  databaseId: string;
+  instanceId: string;
+  targetIdentityJkt: string;
+  approvalId: string;
+  prepareOperationId: string;
+  ticketDigest: string;
+}): string {
+  return digestCanonical({
+    v: 1,
+    kind: 'transfer_commit',
+    license_id: input.licenseId,
+    database_id: input.databaseId,
+    instance_id: input.instanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    approval_id: input.approvalId,
+    prepare_operation_id: input.prepareOperationId,
+    ticket_digest: input.ticketDigest,
+  });
+}

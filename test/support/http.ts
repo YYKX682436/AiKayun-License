@@ -90,7 +90,7 @@ export async function requestChallenge(input: {
   port: number;
   config: RuntimeConfig;
   identity: TestIdentity;
-  operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue';
+  operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit';
   operationId: string;
   intentDigest: string;
   instanceId: string;

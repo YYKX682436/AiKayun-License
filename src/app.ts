@@ -5,18 +5,23 @@ import type { Kysely } from 'kysely';
 import type { RuntimeConfig } from './config.js';
 import type { Database } from './db/types.js';
 import { LicenseApiError } from './errors.js';
-import { activationIntentDigest, renewalIntentDigest } from './intent.js';
+import { sha256Base64url } from './crypto/identity.js';
+import { activationIntentDigest, renewalIntentDigest, transferCommitIntentDigest, transferPrepareIntentDigest } from './intent.js';
 import { parseStrictJson } from './strict-json.js';
 import { authenticateChallengeRequest, authenticateOperationRequest, databaseNow, issueChallenge } from './services/common.js';
 import {
   continueOperation,
   processActivation,
   processRenewal,
+  processTransferCommit,
+  processTransferPrepare,
   queryOperation,
   type ActivationInput,
   type MutationResult,
   type OperationQueryInput,
   type RenewalInput,
+  type TransferCommitInput,
+  type TransferPrepareInput,
 } from './services/operations.js';
 
 declare module 'fastify' {
@@ -105,11 +110,38 @@ const querySchema = {
   properties: commonMutationProperties,
 };
 
+const transferPrepareSchema = {
+  type: 'object', additionalProperties: false,
+  required: [...Object.keys(commonMutationProperties), 'approval_id', 'target_instance_id', 'target_identity_jkt',
+    'target_public_jwk', 'source_generation', 'expected_binding_revision', 'expected_revision'],
+  properties: {
+    ...commonMutationProperties,
+    approval_id: { type: 'string', pattern: uuid },
+    target_instance_id: { type: 'string', pattern: uuid },
+    target_identity_jkt: { type: 'string', pattern: digest },
+    target_public_jwk: jwkSchema,
+    source_generation: { type: 'string', pattern: '^[1-9][0-9]{0,18}$' },
+    expected_binding_revision: { type: 'string', pattern: '^(0|[1-9][0-9]{0,18})$' },
+    expected_revision: { type: 'string', pattern: '^[1-9][0-9]{0,18}$' },
+  },
+};
+
+const transferCommitSchema = {
+  type: 'object', additionalProperties: false,
+  required: [...Object.keys(commonMutationProperties), 'approval_id', 'prepare_operation_id', 'transfer_ticket'],
+  properties: {
+    ...commonMutationProperties,
+    approval_id: { type: 'string', pattern: uuid },
+    prepare_operation_id: { type: 'string', pattern: uuid },
+    transfer_ticket: { type: 'string', minLength: 100, maxLength: 16384 },
+  },
+};
+
 const challengeSchema = {
   type: 'object', additionalProperties: false,
   required: ['operation', 'operation_id', 'intent_digest', 'instance_id', 'public_jwk', 'client_nonce'],
   properties: {
-    operation: { type: 'string', enum: ['activation', 'renewal', 'recovery', 'query', 'continue'] },
+    operation: { type: 'string', enum: ['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit'] },
     operation_id: { type: 'string', pattern: uuid },
     intent_digest: { type: 'string', pattern: digest },
     instance_id: { type: 'string', pattern: uuid },
@@ -146,6 +178,17 @@ function operationResponse(result: MutationResult, reply: FastifyReply) {
   if (result.responseType === 'license') return reply.code(statusCode).send({ license: result.token });
   if (result.responseType === 'status') return reply.code(statusCode).send({ status_receipt: result.token });
   return reply.code(statusCode).send({ operation_receipt: result.token });
+}
+
+function transferResponse(result: MutationResult, reply: FastifyReply) {
+  if (result.kind === 'retryable') return reply.code(409).send({ error: { code: result.code } });
+  if (result.state === 'committed' && result.outcomeCode === 'TRANSFER_PREPARED') {
+    return reply.code(200).send({ transfer_ticket: result.token });
+  }
+  if (result.state === 'committed' && result.outcomeCode === 'TRANSFER_COMMITTED') {
+    return reply.code(200).send({ transfer_receipt: result.token });
+  }
+  return operationResponse(result, reply);
 }
 
 export function createApp({ config, db, now: providedNow, challengeNow: providedChallengeNow }: CreateAppOptions): FastifyInstance {
@@ -193,7 +236,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/challenges', { schema: { body: challengeSchema } }, async (request, reply) => {
     const body = request.body as {
-      operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue';
+      operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit';
       operation_id: string; intent_digest: string; instance_id: string; public_jwk: unknown; client_nonce: string;
     };
     const now = await readNow();
@@ -285,6 +328,41 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     if (expectedIntent !== renewal.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
     const token = await continueOperation(db, config, auth, expectedKind, renewal);
     return reply.send({ operation_receipt: token });
+  });
+
+  app.post('/v1/transfers/prepare', { schema: { body: transferPrepareSchema } }, async (request, reply) => {
+    const body = request.body as TransferPrepareInput;
+    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'transfer_prepare');
+    const expectedIntent = transferPrepareIntentDigest({
+      licenseId: body.license_id,
+      databaseId: body.database_id,
+      instanceId: body.instance_id,
+      sourceIdentityJkt: body.identity_jkt,
+      targetInstanceId: body.target_instance_id,
+      targetIdentityJkt: body.target_identity_jkt,
+      approvalId: body.approval_id,
+      sourceGeneration: body.source_generation,
+      expectedBindingRevision: body.expected_binding_revision,
+      expectedRevision: body.expected_revision,
+    });
+    if (expectedIntent !== body.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
+    return transferResponse(await processTransferPrepare(db, config, auth, body), reply);
+  });
+
+  app.post('/v1/transfers/commit', { schema: { body: transferCommitSchema } }, async (request, reply) => {
+    const body = request.body as TransferCommitInput;
+    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'transfer_commit');
+    const expectedIntent = transferCommitIntentDigest({
+      licenseId: body.license_id,
+      databaseId: body.database_id,
+      instanceId: body.instance_id,
+      targetIdentityJkt: body.identity_jkt,
+      approvalId: body.approval_id,
+      prepareOperationId: body.prepare_operation_id,
+      ticketDigest: sha256Base64url(body.transfer_ticket),
+    });
+    if (expectedIntent !== body.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
+    return transferResponse(await processTransferCommit(db, config, auth, body), reply);
   });
 
   return app;

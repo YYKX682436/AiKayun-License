@@ -60,6 +60,16 @@ export interface RenewLicenseRequest extends BaseRequest {
   businessReference: string;
 }
 
+export interface ApproveTransferRequest extends BaseRequest {
+  databaseId: string;
+  sourceInstanceId: string;
+  sourceIdentityJkt: string;
+  targetInstanceId: string;
+  targetIdentityJkt: string;
+  sourceGeneration: string;
+  expectedBindingRevision: string;
+}
+
 export type LicenseStatusView = {
   license: {
     id: string;
@@ -357,6 +367,134 @@ export function changeLicenseStatusRequestDigest(input: Omit<BaseRequest, 'confi
   });
 }
 
+export function approveTransferRequestDigest(input: Omit<ApproveTransferRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.databaseId, 'ADMIN_DATABASE_ID_INVALID');
+  ensureUuid(input.sourceInstanceId, 'ADMIN_INSTANCE_ID_INVALID');
+  ensureUuid(input.targetInstanceId, 'ADMIN_INSTANCE_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  ensureRevision(input.sourceGeneration);
+  ensureRevision(input.expectedBindingRevision, true);
+  const reason = ensureReason(input.reason);
+  if (input.sourceInstanceId !== input.targetInstanceId) throw new AdminOperationError('ADMIN_TRANSFER_INSTANCE_MISMATCH');
+  if (!/^[A-Za-z0-9_-]{43}$/.test(input.sourceIdentityJkt) || !/^[A-Za-z0-9_-]{43}$/.test(input.targetIdentityJkt) ||
+    input.sourceIdentityJkt === input.targetIdentityJkt) throw new AdminOperationError('ADMIN_TRANSFER_IDENTITY_INVALID');
+  return digestRequest('transfer_approve', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    database_id: input.databaseId,
+    source_instance_id: input.sourceInstanceId,
+    source_identity_jkt: input.sourceIdentityJkt,
+    target_instance_id: input.targetInstanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    source_generation: input.sourceGeneration,
+    expected_binding_revision: input.expectedBindingRevision,
+    reason,
+  });
+}
+
+async function approveTransfer(session: AdminSession, input: ApproveTransferRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const requestDigest = approveTransferRequestDigest({ ...input, reason });
+  return executeMutation(session, {
+    operationId: input.operationId,
+    requestDigest,
+    action: 'transfer_approve',
+    licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision,
+    reason,
+    confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return {
+      state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now,
+      result: { license_id: input.licenseId },
+    };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return {
+      state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { license_id: license.id, expected_revision: input.expectedRevision, observed_revision: revision },
+    };
+    if (license.status !== 'active') return {
+      state: 'rejected', outcomeCode: 'LICENSE_REVOKED', resultRevision: revision, now,
+      result: { license_id: license.id, status: license.status, revision },
+    };
+    if (license.confirmed_subscription_end.getTime() <= now.getTime()) return {
+      state: 'rejected', outcomeCode: 'SUBSCRIPTION_EXPIRED', resultRevision: revision, now,
+      result: { license_id: license.id, subscription_end: license.confirmed_subscription_end.toISOString(), revision },
+    };
+    if (license.current_generation.toString() !== input.sourceGeneration) return {
+      state: 'rejected', outcomeCode: 'TRANSFER_SOURCE_GENERATION_MISMATCH', resultRevision: revision, now,
+      result: { license_id: license.id, expected_generation: input.sourceGeneration, current_generation: license.current_generation.toString() },
+    };
+    const source = await trx.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', input.licenseId).where('state', '=', 'active').forUpdate().executeTakeFirst();
+    if (!source || source.database_id !== input.databaseId || source.instance_id !== input.sourceInstanceId ||
+      source.identity_jkt !== input.sourceIdentityJkt || source.generation.toString() !== input.sourceGeneration) return {
+      state: 'rejected', outcomeCode: 'TRANSFER_SOURCE_BINDING_MISMATCH', resultRevision: revision, now,
+      result: { license_id: input.licenseId, active_generation: source?.generation.toString() ?? null },
+    };
+    const pendingApprovals = await trx.selectFrom('license_transfer_approvals').select('approval_id')
+      .where('license_id', '=', input.licenseId).where('expires_at', '>', now)
+      .where('expected_revision', '=', revision).where('source_generation', '=', license.current_generation.toString()).execute();
+    if (pendingApprovals.length > 0) return {
+      state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_ALREADY_VALID', resultRevision: revision, now,
+      result: { license_id: input.licenseId, valid_approval_count: pendingApprovals.length },
+    };
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    await trx.insertInto('license_transfer_approvals').values({
+      approval_id: input.operationId,
+      request_digest: requestDigest,
+      license_id: input.licenseId,
+      database_id: input.databaseId,
+      source_instance_id: input.sourceInstanceId,
+      source_identity_jkt: input.sourceIdentityJkt,
+      target_instance_id: input.targetInstanceId,
+      target_identity_jkt: input.targetIdentityJkt,
+      source_generation: input.sourceGeneration,
+      expected_binding_revision: input.expectedBindingRevision,
+      expected_revision: input.expectedRevision,
+      actor_os_uid: session.actor.osUid,
+      actor_os_username: session.actor.osUsername,
+      actor_database_role: session.actor.databaseRole,
+      reason,
+      approved_at: now,
+      expires_at: expiresAt,
+    }).execute();
+    const result = {
+      approval_id: input.operationId,
+      license_id: input.licenseId,
+      database_id: input.databaseId,
+      source_instance_id: input.sourceInstanceId,
+      source_identity_jkt: input.sourceIdentityJkt,
+      target_instance_id: input.targetInstanceId,
+      target_identity_jkt: input.targetIdentityJkt,
+      source_generation: input.sourceGeneration,
+      expected_binding_revision: input.expectedBindingRevision,
+      expected_revision: revision,
+      approved_at: now.toISOString(),
+      expires_at: expiresAt.toISOString(),
+    };
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: input.licenseId,
+      operationId: input.operationId,
+      kind: 'admin_transfer_approved',
+      reason,
+      details: result,
+      now,
+    });
+    await trx.insertInto('license_transfer_events').values({
+      event_id: randomUUID(), license_id: input.licenseId, approval_id: input.operationId,
+      prepare_operation_id: null, commit_operation_id: null, plan_id: null, kind: 'approved',
+      actor: actorLabel(session.actor), safe_details: result, created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'TRANSFER_APPROVED', result, resultRevision: revision, now };
+  });
+}
+
 async function insertFinalLicenseOperation(
   session: AdminSession,
   input: CreateLicenseRequest,
@@ -630,6 +768,7 @@ export interface AdminService {
   renewLicense(input: RenewLicenseRequest): Promise<AdminOperationResult>;
   revokeLicense(input: BaseRequest): Promise<AdminOperationResult>;
   restoreLicense(input: BaseRequest): Promise<AdminOperationResult>;
+  approveTransfer(input: ApproveTransferRequest): Promise<AdminOperationResult>;
   getLicense(licenseId: string): Promise<LicenseStatusView | undefined>;
   getOperation(operationId: string): Promise<Record<string, unknown> | undefined>;
   listAudit(licenseId: string, limit?: number): Promise<Array<Record<string, unknown>>>;
@@ -644,6 +783,7 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
     renewLicense: (input) => renewLicense(session, input),
     revokeLicense: (input) => changeStatus(session, 'license_revoke', input),
     restoreLicense: (input) => changeStatus(session, 'license_restore', input),
+    approveTransfer: (input) => approveTransfer(session, input),
     async getLicense(licenseId) {
       ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
       const license = await session.db.selectFrom('licenses').selectAll().where('id', '=', licenseId).executeTakeFirst();
@@ -696,11 +836,21 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
       const operation = await session.db.selectFrom('license_admin_operations').selectAll()
         .where('operation_id', '=', operationId).executeTakeFirst();
       if (!operation) return undefined;
-      const [adminAudits, licenseAudits, entitlementEvents] = await Promise.all([
+      const [adminAudits, licenseAudits, entitlementEvents, transferApproval, transferPlans, transferEvents] = await Promise.all([
         session.db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('entitlement_events').selectAll()
           .where('external_event_id', '=', `admin:${operationId}`).execute(),
+        session.db.selectFrom('license_transfer_approvals').selectAll().where('approval_id', '=', operationId).executeTakeFirst(),
+        session.db.selectFrom('license_transfer_plans').select([
+          'plan_id', 'license_id', 'approval_id', 'prepare_operation_id', 'prepare_intent_digest', 'database_id',
+          'source_instance_id', 'source_identity_jkt', 'target_instance_id', 'target_identity_jkt', 'source_generation',
+          'expected_binding_revision', 'expected_revision', 'entitlement_revision', 'ticket_digest', 'state', 'expires_at',
+          'created_at', 'committed_at', 'commit_operation_id', 'committed_generation',
+        ]).where('approval_id', '=', operationId).execute(),
+        session.db.selectFrom('license_transfer_events').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('prepare_operation_id', '=', operationId), eb('commit_operation_id', '=', operationId),
+        ])).orderBy('created_at', 'asc').execute(),
       ]);
       return {
         operation: mapOperation(operation, false),
@@ -711,6 +861,9 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         admin_audit_events: adminAudits,
         license_audit_events: licenseAudits,
         entitlement_events: entitlementEvents,
+        transfer_approval: transferApproval ?? null,
+        transfer_plans: transferPlans,
+        transfer_events: transferEvents,
       };
     },
     async listAudit(licenseId, limit = 50) {
