@@ -19,7 +19,8 @@ AiKayun ⑦-1A 审定基线：`225600b55bbd91bcb7393097b7b5fd44a3465816`。
 | `npm test` | 12 项通过：RFC/HTTP 签名互操作 7 项、UTC 账期 3 项、安全启动配置 2 项 |
 | `npm run test:integration` | 18 项通过：真实 PostgreSQL 迁移、HTTPS/RFC 9421 请求、签名 JWT 回执和数据库状态断言 |
 | 总数 | 30 项测试通过；没有依赖固定 sleep 推测锁顺序 |
-| GitHub Actions | 提交 `cf7fc70f14cd253f20695117ae5e3759e3e266e2` 的第 2 次尝试通过；PostgreSQL 初始化、`npm ci`、类型检查、构建、单元与集成测试均通过。第 1 次尝试在 runner 启动前受账户付款/支出限额影响 |
+| GitHub Actions（前序验收） | 提交 `cf7fc70f14cd253f20695117ae5e3759e3e266e2` 的第 2 次尝试通过；第 1 次尝试在 runner 启动前受账户付款/支出限额影响 |
+| GitHub Actions（R1） | 提交 `646442c86b28defd806ab6c188ea16f3633ea302` 通过；PostgreSQL 初始化、`npm ci`、类型检查、构建、12 项单元测试和 18 项集成测试均通过 |
 
 集成测试包括：
 
@@ -72,4 +73,4 @@ HTTP 日志关闭，异常回执只返回稳定错误码；签名私钥、TLS �
 - 没有验证同一私钥被完整复制后的物理单实例性；网络协议无法区分持有相同密钥的复制实例。
 - GitHub Actions 对 checkout/setup-node 发出 Node.js 20 弃用提示，并在 runner 上强制使用 Node.js 24；该提示不影响本次通过结果。
 
-工作流记录：[成功的第 2 次尝试](https://github.com/YYKX682436/AiKayun-License/actions/runs/40688336507)。
+工作流记录：[前序验收](https://github.com/YYKX682436/AiKayun-License/actions/runs/40688336507)、[R1 验收](https://github.com/YYKX682436/AiKayun-License/actions/runs/40692426994)。
