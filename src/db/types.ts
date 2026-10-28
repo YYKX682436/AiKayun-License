@@ -64,12 +64,12 @@ export interface LicenseOperationsTable {
   operation_id: string;
   actor_jkt: string;
   intent_digest: string;
-  kind: 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit';
+  kind: 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
   license_id: string;
   database_id: string;
   state: 'committed' | 'rejected' | 'cancelled';
   outcome_code: string;
-  response_type: 'license' | 'status' | 'operation';
+  response_type: 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding';
   result_generation: Bigint | null;
   result_revision: Bigint | null;
   response_jws: string;
@@ -118,7 +118,7 @@ export interface LicenseAuditEventsTable {
 export interface LicenseAdminOperationsTable {
   operation_id: string;
   request_digest: string;
-  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve' | 'transfer_revoke';
+  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve' | 'transfer_revoke' | 'disaster_transfer_approve' | 'disaster_transfer_revoke';
   license_id: string;
   expected_revision: Bigint;
   actor_os_uid: number;
@@ -147,6 +147,115 @@ export interface LicenseAdminAuditEventsTable {
   state: LicenseAdminOperationsTable['state'];
   outcome_code: string;
   result: Json;
+  created_at: Timestamp;
+}
+
+export interface LicenseDisasterRecoveryRequestsTable {
+  request_id: string;
+  request_digest: string;
+  license_id: string;
+  account_reference: string;
+  source_activation_id: string;
+  database_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  target_instance_id: string;
+  target_instance_mode: 'preserve' | 'replace';
+  target_identity_jkt: string;
+  source_generation: Bigint;
+  expected_binding_revision: Bigint;
+  expected_revision: Bigint;
+  entitlement_revision: Bigint;
+  incident_type: 'private_key_lost' | 'instance_unavailable' | 'identity_material_lost' | 'other';
+  recovery_reason: string;
+  verification_record_ref: string;
+  backup_check_result: 'database_identity_and_history_reviewed' | 'identity_material_missing' | 'unable_to_verify';
+  old_server_isolation: 'confirmed_isolated' | 'unknown' | 'not_confirmed';
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  created_at: Timestamp;
+}
+
+export interface LicenseDisasterTransferApprovalsTable {
+  approval_id: string;
+  request_id: string;
+  request_digest: string;
+  license_id: string;
+  account_reference: string;
+  source_activation_id: string;
+  database_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  target_instance_id: string;
+  target_instance_mode: 'preserve' | 'replace';
+  target_identity_jkt: string;
+  source_generation: Bigint;
+  expected_binding_revision: Bigint;
+  expected_revision: Bigint;
+  entitlement_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  recovery_reason: string;
+  approved_at: Timestamp;
+  expires_at: Timestamp;
+}
+
+export interface LicenseDisasterTransferRevocationsTable {
+  revocation_operation_id: string;
+  approval_id: string;
+  license_id: string;
+  request_digest: string;
+  expected_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  revoked_at: Timestamp;
+}
+
+export interface LicenseDisasterTransferPlansTable {
+  plan_id: string;
+  request_id: string;
+  approval_id: string;
+  license_id: string;
+  prepare_operation_id: string;
+  prepare_intent_digest: string;
+  source_activation_id: string;
+  database_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  target_instance_id: string;
+  target_identity_jkt: string;
+  target_identity_jwk_public: Json;
+  source_generation: Bigint;
+  expected_binding_revision: Bigint;
+  expected_revision: Bigint;
+  entitlement_revision: Bigint;
+  ticket_jws: string;
+  ticket_digest: string;
+  state: 'prepared' | 'committed' | 'expired' | 'invalidated';
+  expires_at: Timestamp;
+  created_at: Timestamp;
+  committed_at: NullableTimestamp;
+  commit_operation_id: string | null;
+  committed_generation: Bigint | null;
+  result_mode: 'active_lease' | 'binding_only' | null;
+  disaster_result_jws: string | null;
+}
+
+export interface LicenseDisasterTransferEventsTable {
+  event_id: string;
+  license_id: string;
+  request_id: string;
+  approval_id: string;
+  prepare_operation_id: string | null;
+  commit_operation_id: string | null;
+  plan_id: string | null;
+  kind: 'requested' | 'approved' | 'approval_revoked' | 'prepared' | 'expired' | 'invalidated' | 'committed' | 'rejected';
+  actor: string;
+  safe_details: Json;
   created_at: Timestamp;
 }
 
@@ -239,6 +348,11 @@ export interface Database {
   license_transfer_plans: LicenseTransferPlansTable;
   license_transfer_events: LicenseTransferEventsTable;
   license_transfer_revocations: LicenseTransferRevocationsTable;
+  license_disaster_recovery_requests: LicenseDisasterRecoveryRequestsTable;
+  license_disaster_transfer_approvals: LicenseDisasterTransferApprovalsTable;
+  license_disaster_transfer_revocations: LicenseDisasterTransferRevocationsTable;
+  license_disaster_transfer_plans: LicenseDisasterTransferPlansTable;
+  license_disaster_transfer_events: LicenseDisasterTransferEventsTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;
@@ -250,3 +364,6 @@ export type LicenseAdminOperationRow = Selectable<LicenseAdminOperationsTable>;
 export type LicenseAdminAuditEventRow = Selectable<LicenseAdminAuditEventsTable>;
 export type LicenseTransferApprovalRow = Selectable<LicenseTransferApprovalsTable>;
 export type LicenseTransferPlanRow = Selectable<LicenseTransferPlansTable>;
+export type LicenseDisasterRecoveryRequestRow = Selectable<LicenseDisasterRecoveryRequestsTable>;
+export type LicenseDisasterTransferApprovalRow = Selectable<LicenseDisasterTransferApprovalsTable>;
+export type LicenseDisasterTransferPlanRow = Selectable<LicenseDisasterTransferPlansTable>;

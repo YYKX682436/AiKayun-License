@@ -100,3 +100,59 @@ export function transferCommitIntentDigest(input: {
     ticket_digest: input.ticketDigest,
   });
 }
+
+export function disasterTransferPrepareIntentDigest(input: {
+  licenseId: string;
+  accountReference: string;
+  databaseId: string;
+  approvalId: string;
+  requestId: string;
+  sourceActivationId: string;
+  sourceInstanceId: string;
+  sourceIdentityJkt: string;
+  targetInstanceId: string;
+  targetIdentityJkt: string;
+  sourceGeneration: string;
+  expectedBindingRevision: string;
+  expectedRevision: string;
+}): string {
+  return digestCanonical({
+    v: 1,
+    kind: 'disaster_transfer_prepare',
+    license_id: input.licenseId,
+    account_reference: input.accountReference,
+    database_id: input.databaseId,
+    approval_id: input.approvalId,
+    request_id: input.requestId,
+    source_activation_id: input.sourceActivationId,
+    source_instance_id: input.sourceInstanceId,
+    source_identity_jkt: input.sourceIdentityJkt,
+    target_instance_id: input.targetInstanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    source_generation: input.sourceGeneration,
+    expected_binding_revision: input.expectedBindingRevision,
+    expected_revision: input.expectedRevision,
+  });
+}
+
+export function disasterTransferCommitIntentDigest(input: {
+  licenseId: string;
+  databaseId: string;
+  targetInstanceId: string;
+  targetIdentityJkt: string;
+  approvalId: string;
+  prepareOperationId: string;
+  disasterTicketDigest: string;
+}): string {
+  return digestCanonical({
+    v: 1,
+    kind: 'disaster_transfer_commit',
+    license_id: input.licenseId,
+    database_id: input.databaseId,
+    target_instance_id: input.targetInstanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    approval_id: input.approvalId,
+    prepare_operation_id: input.prepareOperationId,
+    disaster_ticket_digest: input.disasterTicketDigest,
+  });
+}

@@ -70,6 +70,33 @@ export interface ApproveTransferRequest extends BaseRequest {
   expectedBindingRevision: string;
 }
 
+export type DisasterIncidentType = 'private_key_lost' | 'instance_unavailable' | 'identity_material_lost' | 'other';
+export type DisasterBackupCheckResult = 'database_identity_and_history_reviewed' | 'identity_material_missing' | 'unable_to_verify';
+export type DisasterOldServerIsolation = 'confirmed_isolated' | 'unknown' | 'not_confirmed';
+
+export interface ApproveDisasterTransferRequest extends BaseRequest {
+  accountReference: string;
+  sourceActivationId: string;
+  databaseId: string;
+  sourceInstanceId: string;
+  sourceIdentityJkt: string;
+  targetInstanceId: string;
+  targetInstanceMode: 'preserve' | 'replace';
+  targetIdentityJkt: string;
+  sourceGeneration: string;
+  expectedBindingRevision: string;
+  incidentType: DisasterIncidentType;
+  recoveryReason: string;
+  verificationRecordRef: string;
+  backupCheckResult: DisasterBackupCheckResult;
+  oldServerIsolation: DisasterOldServerIsolation;
+  expiresInHours?: number;
+}
+
+export interface RevokeDisasterTransferApprovalRequest extends BaseRequest {
+  approvalId: string;
+}
+
 export type LicenseStatusView = {
   license: {
     id: string;
@@ -105,6 +132,7 @@ export type LicenseStatusView = {
     revoked_at: string | null;
     status: 'issued' | 'expired' | 'consumed' | 'revoked';
   }>;
+  disasterTransferApprovals: Array<Record<string, unknown>>;
 };
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -185,6 +213,40 @@ async function lockAdminOperation(trx: AdminTransaction, operationId: string): P
 
 async function lockLicense(trx: AdminTransaction, licenseId: string): Promise<LicenseRow | undefined> {
   return trx.selectFrom('licenses').selectAll().where('id', '=', licenseId).forUpdate().executeTakeFirst();
+}
+
+async function lockActivationInstance(trx: AdminTransaction, instanceId: string): Promise<void> {
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'activation-instance:' + instanceId}, 0))`.execute(trx);
+}
+
+async function hasCurrentNormalTransfer(trx: AdminTransaction, licenseId: string, revision: string, generation: string, now: Date): Promise<boolean> {
+  const approval = await sql<{ present: boolean }>`
+    SELECT EXISTS (
+      SELECT 1 FROM license_transfer_approvals a
+      LEFT JOIN license_transfer_revocations r ON r.approval_id = a.approval_id
+      WHERE a.license_id = ${licenseId} AND a.expected_revision = ${revision}
+        AND a.source_generation = ${generation} AND a.expires_at > ${now} AND r.approval_id IS NULL
+    ) AS present
+  `.execute(trx);
+  if (approval.rows[0]?.present) return true;
+  const plan = await trx.selectFrom('license_transfer_plans').select('plan_id')
+    .where('license_id', '=', licenseId).where('state', '=', 'prepared').executeTakeFirst();
+  return plan !== undefined;
+}
+
+async function hasCurrentDisasterTransfer(trx: AdminTransaction, licenseId: string, revision: string, generation: string, now: Date): Promise<boolean> {
+  const approval = await sql<{ present: boolean }>`
+    SELECT EXISTS (
+      SELECT 1 FROM license_disaster_transfer_approvals a
+      LEFT JOIN license_disaster_transfer_revocations r ON r.approval_id = a.approval_id
+      WHERE a.license_id = ${licenseId} AND a.expected_revision = ${revision}
+        AND a.source_generation = ${generation} AND a.expires_at > ${now} AND r.approval_id IS NULL
+    ) AS present
+  `.execute(trx);
+  if (approval.rows[0]?.present) return true;
+  const plan = await trx.selectFrom('license_disaster_transfer_plans').select('plan_id')
+    .where('license_id', '=', licenseId).where('state', '=', 'prepared').executeTakeFirst();
+  return plan !== undefined;
 }
 
 async function appendCoreAudit(
@@ -407,6 +469,75 @@ export function revokeTransferApprovalRequestDigest(input: Omit<RevokeTransferAp
   });
 }
 
+export function approveDisasterTransferRequestDigest(input: Omit<ApproveDisasterTransferRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.sourceActivationId, 'ADMIN_DISASTER_SOURCE_ACTIVATION_INVALID');
+  ensureUuid(input.databaseId, 'ADMIN_DATABASE_ID_INVALID');
+  ensureUuid(input.sourceInstanceId, 'ADMIN_INSTANCE_ID_INVALID');
+  ensureUuid(input.targetInstanceId, 'ADMIN_INSTANCE_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  ensureRevision(input.sourceGeneration);
+  ensureRevision(input.expectedBindingRevision, true);
+  const accountReference = ensureText(input.accountReference, 'ADMIN_ACCOUNT_REFERENCE_INVALID', 200);
+  const reason = ensureReason(input.reason);
+  const recoveryReason = ensureReason(input.recoveryReason);
+  const verificationRecordRef = ensureText(input.verificationRecordRef, 'ADMIN_VERIFICATION_REFERENCE_INVALID', 300);
+  if (!/^(case|ticket|audit):[A-Za-z0-9][A-Za-z0-9._/-]{0,260}$/i.test(verificationRecordRef)) {
+    throw new AdminOperationError('ADMIN_VERIFICATION_REFERENCE_INVALID');
+  }
+  if (!['preserve', 'replace'].includes(input.targetInstanceMode) ||
+    (input.targetInstanceMode === 'preserve' && input.sourceInstanceId !== input.targetInstanceId) ||
+    (input.targetInstanceMode === 'replace' && input.sourceInstanceId === input.targetInstanceId)) {
+    throw new AdminOperationError('ADMIN_DISASTER_INSTANCE_MODE_INVALID');
+  }
+  if (!['private_key_lost', 'instance_unavailable', 'identity_material_lost', 'other'].includes(input.incidentType) ||
+    !['database_identity_and_history_reviewed', 'identity_material_missing', 'unable_to_verify'].includes(input.backupCheckResult) ||
+    !['confirmed_isolated', 'unknown', 'not_confirmed'].includes(input.oldServerIsolation)) {
+    throw new AdminOperationError('ADMIN_DISASTER_DECLARATION_INVALID');
+  }
+  if (!/^[A-Za-z0-9_-]{43}$/.test(input.sourceIdentityJkt) || !/^[A-Za-z0-9_-]{43}$/.test(input.targetIdentityJkt) ||
+    input.sourceIdentityJkt === input.targetIdentityJkt) throw new AdminOperationError('ADMIN_DISASTER_IDENTITY_INVALID');
+  const expiresInHours = input.expiresInHours ?? 24;
+  if (!Number.isInteger(expiresInHours) || expiresInHours < 1 || expiresInHours > 72) {
+    throw new AdminOperationError('ADMIN_DISASTER_APPROVAL_EXPIRY_INVALID');
+  }
+  return digestRequest('disaster_transfer_approve', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    account_reference: accountReference,
+    source_activation_id: input.sourceActivationId,
+    database_id: input.databaseId,
+    source_instance_id: input.sourceInstanceId,
+    source_identity_jkt: input.sourceIdentityJkt,
+    target_instance_id: input.targetInstanceId,
+    target_instance_mode: input.targetInstanceMode,
+    target_identity_jkt: input.targetIdentityJkt,
+    source_generation: input.sourceGeneration,
+    expected_binding_revision: input.expectedBindingRevision,
+    incident_type: input.incidentType,
+    recovery_reason: recoveryReason,
+    verification_record_ref: verificationRecordRef,
+    backup_check_result: input.backupCheckResult,
+    old_server_isolation: input.oldServerIsolation,
+    expires_in_hours: expiresInHours,
+    reason,
+  });
+}
+
+export function revokeDisasterTransferApprovalRequestDigest(input: Omit<RevokeDisasterTransferApprovalRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.approvalId, 'ADMIN_DISASTER_APPROVAL_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  const reason = ensureReason(input.reason);
+  return digestRequest('disaster_transfer_revoke', {
+    operation_id: input.operationId, license_id: input.licenseId,
+    expected_revision: input.expectedRevision, approval_id: input.approvalId, reason,
+  });
+}
+
 async function revokeTransferApproval(session: AdminSession, input: RevokeTransferApprovalRequest): Promise<AdminOperationResult> {
   const reason = ensureReason(input.reason);
   const requestDigest = revokeTransferApprovalRequestDigest({ ...input, reason });
@@ -513,6 +644,10 @@ async function approveTransfer(session: AdminSession, input: ApproveTransferRequ
       state: 'rejected', outcomeCode: 'TRANSFER_APPROVAL_ALREADY_VALID', resultRevision: revision, now,
       result: { license_id: input.licenseId, valid_approval_count: validApprovals.filter(Boolean).length },
     };
+    if (await hasCurrentDisasterTransfer(trx, input.licenseId, revision, license.current_generation.toString(), now)) return {
+      state: 'rejected', outcomeCode: 'DISASTER_TRANSFER_REQUIRES_EXPLICIT_REVOCATION', resultRevision: revision, now,
+      result: { license_id: input.licenseId },
+    };
     const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     await trx.insertInto('license_transfer_approvals').values({
       approval_id: input.operationId,
@@ -566,6 +701,171 @@ async function approveTransfer(session: AdminSession, input: ApproveTransferRequ
 
 export interface RevokeTransferApprovalRequest extends BaseRequest {
   approvalId: string;
+}
+
+async function approveDisasterTransfer(session: AdminSession, input: ApproveDisasterTransferRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const normalized = {
+    ...input,
+    reason,
+    recoveryReason: ensureReason(input.recoveryReason),
+    accountReference: ensureText(input.accountReference, 'ADMIN_ACCOUNT_REFERENCE_INVALID', 200),
+    verificationRecordRef: ensureText(input.verificationRecordRef, 'ADMIN_VERIFICATION_REFERENCE_INVALID', 300),
+    expiresInHours: input.expiresInHours ?? 24,
+  };
+  const requestDigest = approveDisasterTransferRequestDigest(normalized);
+  return executeMutation(session, {
+    operationId: input.operationId, requestDigest, action: 'disaster_transfer_approve', licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { expected_revision: input.expectedRevision, observed_revision: revision } };
+    if (license.account_id !== normalized.accountReference) return { state: 'rejected', outcomeCode: 'DISASTER_ACCOUNT_REFERENCE_MISMATCH',
+      resultRevision: revision, now, result: { license_id: license.id } };
+    if (normalized.backupCheckResult === 'unable_to_verify') return { state: 'rejected', outcomeCode: 'DISASTER_BACKUP_NOT_VERIFIED',
+      resultRevision: revision, now, result: { license_id: license.id } };
+    const source = await trx.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', license.id).where('state', '=', 'active').forUpdate().executeTakeFirst();
+    if (!source || source.id !== input.sourceActivationId || source.database_id !== input.databaseId ||
+      source.instance_id !== input.sourceInstanceId || source.identity_jkt !== input.sourceIdentityJkt ||
+      source.generation.toString() !== input.sourceGeneration || license.current_generation.toString() !== input.sourceGeneration) {
+      return { state: 'rejected', outcomeCode: 'DISASTER_SOURCE_BINDING_MISMATCH', resultRevision: revision, now,
+        result: { license_id: license.id, active_activation_id: source?.id ?? null, current_generation: license.current_generation.toString() } };
+    }
+    if (await hasCurrentNormalTransfer(trx, license.id, revision, license.current_generation.toString(), now)) return {
+      state: 'rejected', outcomeCode: 'NORMAL_TRANSFER_REQUIRES_EXPLICIT_REVOCATION', resultRevision: revision, now,
+      result: { license_id: license.id },
+    };
+    if (await hasCurrentDisasterTransfer(trx, license.id, revision, license.current_generation.toString(), now)) return {
+      state: 'rejected', outcomeCode: 'DISASTER_TRANSFER_APPROVAL_ALREADY_ACTIVE', resultRevision: revision, now,
+      result: { license_id: license.id },
+    };
+    const targetWasUsed = await trx.selectFrom('license_activations').select('id')
+      .where('license_id', '=', license.id).where('identity_jkt', '=', input.targetIdentityJkt).executeTakeFirst();
+    if (targetWasUsed) return { state: 'rejected', outcomeCode: 'DISASTER_TARGET_IDENTITY_WAS_USED', resultRevision: revision, now,
+      result: { license_id: license.id, target_identity_jkt: input.targetIdentityJkt } };
+    if (input.targetInstanceMode === 'replace') {
+      await lockActivationInstance(trx, input.targetInstanceId);
+      const collision = await trx.selectFrom('license_activations').select(['license_id', 'id'])
+        .where('instance_id', '=', input.targetInstanceId).where('state', '=', 'active').executeTakeFirst();
+      if (collision) return { state: 'rejected', outcomeCode: 'DISASTER_TARGET_INSTANCE_ALREADY_ACTIVE', resultRevision: revision, now,
+        result: { target_instance_id: input.targetInstanceId, active_license_id: collision.license_id } };
+    }
+
+    const expiresAt = new Date(now.getTime() + normalized.expiresInHours! * 60 * 60 * 1000);
+    const snapshot = {
+      request_id: input.operationId, approval_id: input.operationId, license_id: license.id, account_reference: license.account_id,
+      source_activation_id: source.id, database_id: source.database_id, source_instance_id: source.instance_id,
+      source_identity_jkt: source.identity_jkt, target_instance_id: input.targetInstanceId,
+      target_instance_mode: input.targetInstanceMode, target_identity_jkt: input.targetIdentityJkt,
+      source_generation: source.generation.toString(), expected_binding_revision: input.expectedBindingRevision,
+      expected_revision: revision, entitlement_revision: license.entitlement_revision.toString(),
+      incident_type: input.incidentType, recovery_reason: normalized.recoveryReason,
+      verification_record_ref: normalized.verificationRecordRef, backup_check_result: input.backupCheckResult,
+      old_server_isolation: input.oldServerIsolation, approved_at: now.toISOString(), expires_at: expiresAt.toISOString(),
+    };
+    const common = {
+      request_id: input.operationId, request_digest: requestDigest, license_id: license.id, account_reference: license.account_id,
+      source_activation_id: source.id, database_id: source.database_id, source_instance_id: source.instance_id,
+      source_identity_jkt: source.identity_jkt, target_instance_id: input.targetInstanceId,
+      target_instance_mode: input.targetInstanceMode, target_identity_jkt: input.targetIdentityJkt,
+      source_generation: source.generation.toString(), expected_binding_revision: input.expectedBindingRevision,
+      expected_revision: revision, entitlement_revision: license.entitlement_revision.toString(),
+    };
+    await trx.insertInto('license_disaster_recovery_requests').values({
+      ...common, incident_type: input.incidentType, recovery_reason: normalized.recoveryReason,
+      verification_record_ref: normalized.verificationRecordRef, backup_check_result: input.backupCheckResult,
+      old_server_isolation: input.oldServerIsolation, actor_os_uid: session.actor.osUid,
+      actor_os_username: session.actor.osUsername, actor_database_role: session.actor.databaseRole, created_at: now,
+    }).execute();
+    await trx.insertInto('license_disaster_transfer_approvals').values({
+      approval_id: input.operationId, request_id: input.operationId, request_digest: requestDigest,
+      license_id: license.id, account_reference: license.account_id, source_activation_id: source.id,
+      database_id: source.database_id, source_instance_id: source.instance_id, source_identity_jkt: source.identity_jkt,
+      target_instance_id: input.targetInstanceId, target_instance_mode: input.targetInstanceMode,
+      target_identity_jkt: input.targetIdentityJkt, source_generation: source.generation.toString(),
+      expected_binding_revision: input.expectedBindingRevision, expected_revision: revision,
+      entitlement_revision: license.entitlement_revision.toString(), actor_os_uid: session.actor.osUid,
+      actor_os_username: session.actor.osUsername, actor_database_role: session.actor.databaseRole,
+      recovery_reason: normalized.recoveryReason, approved_at: now, expires_at: expiresAt,
+    }).execute();
+    await appendCoreAudit(trx, session.actor, { licenseId: license.id, operationId: input.operationId,
+      kind: 'admin_disaster_transfer_approved', reason, details: { ...snapshot, request_digest: requestDigest }, now });
+    await trx.insertInto('license_disaster_transfer_events').values({
+      event_id: randomUUID(), license_id: license.id, request_id: input.operationId, approval_id: input.operationId,
+      prepare_operation_id: null, commit_operation_id: null, plan_id: null, kind: 'requested',
+      actor: actorLabel(session.actor), safe_details: { request_digest: requestDigest, verification_record_ref: normalized.verificationRecordRef }, created_at: now,
+    }).execute();
+    await trx.insertInto('license_disaster_transfer_events').values({
+      event_id: randomUUID(), license_id: license.id, request_id: input.operationId, approval_id: input.operationId,
+      prepare_operation_id: null, commit_operation_id: null, plan_id: null, kind: 'approved',
+      actor: actorLabel(session.actor), safe_details: snapshot, created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'DISASTER_TRANSFER_APPROVED', result: snapshot, resultRevision: revision, now };
+  });
+}
+
+async function revokeDisasterTransferApproval(session: AdminSession, input: RevokeDisasterTransferApprovalRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const requestDigest = revokeDisasterTransferApprovalRequestDigest({ ...input, reason });
+  return executeMutation(session, {
+    operationId: input.operationId, requestDigest, action: 'disaster_transfer_revoke', licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { expected_revision: input.expectedRevision, observed_revision: revision } };
+    const approval = await trx.selectFrom('license_disaster_transfer_approvals').selectAll()
+      .where('approval_id', '=', input.approvalId).forUpdate().executeTakeFirst();
+    const adminApproval = await trx.selectFrom('license_admin_operations').selectAll()
+      .where('operation_id', '=', input.approvalId).executeTakeFirst();
+    if (!approval || !adminApproval || approval.license_id !== input.licenseId ||
+      adminApproval.action !== 'disaster_transfer_approve' || adminApproval.state !== 'succeeded' ||
+      adminApproval.request_digest !== approval.request_digest) return { state: 'rejected', outcomeCode: 'DISASTER_APPROVAL_NOT_FOUND',
+      resultRevision: revision, now, result: { approval_id: input.approvalId } };
+    const existing = await trx.selectFrom('license_disaster_transfer_revocations').selectAll()
+      .where('approval_id', '=', input.approvalId).executeTakeFirst();
+    if (existing) return { state: 'rejected', outcomeCode: 'DISASTER_APPROVAL_ALREADY_REVOKED', resultRevision: revision, now,
+      result: { approval_id: input.approvalId, revocation_operation_id: existing.revocation_operation_id } };
+    const committed = await trx.selectFrom('license_disaster_transfer_plans').select('plan_id')
+      .where('approval_id', '=', input.approvalId).where('state', '=', 'committed').executeTakeFirst();
+    if (committed) return { state: 'rejected', outcomeCode: 'DISASTER_TRANSFER_ALREADY_COMMITTED', resultRevision: revision, now,
+      result: { approval_id: input.approvalId, plan_id: committed.plan_id } };
+    const prepared = await trx.selectFrom('license_disaster_transfer_plans').selectAll()
+      .where('approval_id', '=', input.approvalId).where('state', '=', 'prepared').forUpdate().executeTakeFirst();
+    if (prepared) {
+      await trx.updateTable('license_disaster_transfer_plans').set({ state: 'invalidated' })
+        .where('plan_id', '=', prepared.plan_id).where('state', '=', 'prepared').execute();
+      await trx.insertInto('license_disaster_transfer_events').values({
+        event_id: randomUUID(), license_id: input.licenseId, request_id: approval.request_id, approval_id: input.approvalId,
+        prepare_operation_id: prepared.prepare_operation_id, commit_operation_id: null, plan_id: prepared.plan_id,
+        kind: 'invalidated', actor: actorLabel(session.actor), safe_details: { reason: 'approval_revoked' }, created_at: now,
+      }).execute();
+    }
+    await trx.insertInto('license_disaster_transfer_revocations').values({
+      revocation_operation_id: input.operationId, approval_id: input.approvalId, license_id: input.licenseId,
+      request_digest: requestDigest, expected_revision: revision,
+      actor_os_uid: session.actor.osUid, actor_os_username: session.actor.osUsername,
+      actor_database_role: session.actor.databaseRole, reason, revoked_at: now,
+    }).execute();
+    const result = { approval_id: input.approvalId, request_id: approval.request_id, license_id: input.licenseId,
+      revoked_at: now.toISOString(), invalidated_plan_id: prepared?.plan_id ?? null };
+    await appendCoreAudit(trx, session.actor, { licenseId: input.licenseId, operationId: input.operationId,
+      kind: 'admin_disaster_transfer_approval_revoked', reason, details: result, now });
+    await trx.insertInto('license_disaster_transfer_events').values({
+      event_id: randomUUID(), license_id: input.licenseId, request_id: approval.request_id, approval_id: input.approvalId,
+      prepare_operation_id: null, commit_operation_id: null, plan_id: null, kind: 'approval_revoked',
+      actor: actorLabel(session.actor), safe_details: { revocation_operation_id: input.operationId, reason }, created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'DISASTER_TRANSFER_APPROVAL_REVOKED', resultRevision: revision, now, result };
+  });
 }
 
 async function insertFinalLicenseOperation(
@@ -843,6 +1143,8 @@ export interface AdminService {
   restoreLicense(input: BaseRequest): Promise<AdminOperationResult>;
   approveTransfer(input: ApproveTransferRequest): Promise<AdminOperationResult>;
   revokeTransferApproval(input: RevokeTransferApprovalRequest): Promise<AdminOperationResult>;
+  approveDisasterTransfer(input: ApproveDisasterTransferRequest): Promise<AdminOperationResult>;
+  revokeDisasterTransferApproval(input: RevokeDisasterTransferApprovalRequest): Promise<AdminOperationResult>;
   getLicense(licenseId: string): Promise<LicenseStatusView | undefined>;
   getOperation(operationId: string): Promise<Record<string, unknown> | undefined>;
   listAudit(licenseId: string, limit?: number): Promise<Array<Record<string, unknown>>>;
@@ -859,6 +1161,8 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
     restoreLicense: (input) => changeStatus(session, 'license_restore', input),
     approveTransfer: (input) => approveTransfer(session, input),
     revokeTransferApproval: (input) => revokeTransferApproval(session, input),
+    approveDisasterTransfer: (input) => approveDisasterTransfer(session, input),
+    revokeDisasterTransferApproval: (input) => revokeDisasterTransferApproval(session, input),
     async getLicense(licenseId) {
       ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
       const license = await session.db.selectFrom('licenses').selectAll().where('id', '=', licenseId).executeTakeFirst();
@@ -868,6 +1172,17 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
       const codes = await session.db.selectFrom('activation_codes')
         .select(['id', 'created_at', 'expires_at', 'consumed_at', 'revoked_at'])
         .where('license_id', '=', licenseId).orderBy('created_at', 'desc').execute();
+      const disasterApprovals = await session.db.selectFrom('license_disaster_transfer_approvals as approvals')
+        .leftJoin('license_disaster_transfer_revocations as revocations', 'revocations.approval_id', 'approvals.approval_id')
+        .select([
+          'approvals.approval_id', 'approvals.request_id', 'approvals.account_reference', 'approvals.source_activation_id',
+          'approvals.database_id', 'approvals.source_instance_id', 'approvals.source_identity_jkt',
+          'approvals.target_instance_id', 'approvals.target_instance_mode', 'approvals.target_identity_jkt',
+          'approvals.source_generation', 'approvals.expected_binding_revision', 'approvals.expected_revision',
+          'approvals.entitlement_revision', 'approvals.actor_os_uid', 'approvals.actor_os_username',
+          'approvals.actor_database_role', 'approvals.recovery_reason', 'approvals.approved_at', 'approvals.expires_at',
+          'revocations.revocation_operation_id', 'revocations.revoked_at',
+        ]).where('approvals.license_id', '=', licenseId).orderBy('approvals.approved_at', 'desc').execute();
       const now = await databaseNow(session.db);
       return {
         license: {
@@ -904,6 +1219,9 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
           revoked_at: code.revoked_at?.toISOString() ?? null,
           status: code.consumed_at ? 'consumed' as const : code.revoked_at ? 'revoked' as const : code.expires_at.getTime() <= now.getTime() ? 'expired' as const : 'issued' as const,
         })),
+        disasterTransferApprovals: disasterApprovals.map((row) => ({ ...row,
+          status: row.revocation_operation_id ? 'revoked' : row.expires_at.getTime() <= now.getTime() ? 'expired' : 'approved',
+        })),
       };
     },
     async getOperation(operationId) {
@@ -911,7 +1229,8 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
       const operation = await session.db.selectFrom('license_admin_operations').selectAll()
         .where('operation_id', '=', operationId).executeTakeFirst();
       if (!operation) return undefined;
-      const [adminAudits, licenseAudits, entitlementEvents, transferApproval, transferPlans, transferEvents, transferRevocation] = await Promise.all([
+      const [adminAudits, licenseAudits, entitlementEvents, transferApproval, transferPlans, transferEvents, transferRevocation,
+        disasterRequest, disasterApproval, disasterPlans, disasterEvents, disasterRevocation] = await Promise.all([
         session.db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
         session.db.selectFrom('entitlement_events').selectAll()
@@ -929,6 +1248,23 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         session.db.selectFrom('license_transfer_revocations').selectAll().where((eb) => eb.or([
           eb('approval_id', '=', operationId), eb('revocation_operation_id', '=', operationId),
         ])).execute(),
+        session.db.selectFrom('license_disaster_recovery_requests').selectAll().where('request_id', '=', operationId).executeTakeFirst(),
+        session.db.selectFrom('license_disaster_transfer_approvals').selectAll().where('approval_id', '=', operationId).executeTakeFirst(),
+        session.db.selectFrom('license_disaster_transfer_plans').select([
+          'plan_id', 'request_id', 'approval_id', 'license_id', 'prepare_operation_id', 'prepare_intent_digest',
+          'source_activation_id', 'database_id', 'source_instance_id', 'source_identity_jkt', 'target_instance_id',
+          'target_identity_jkt', 'source_generation', 'expected_binding_revision', 'expected_revision',
+          'entitlement_revision', 'ticket_digest', 'state', 'expires_at', 'created_at', 'committed_at',
+          'commit_operation_id', 'committed_generation', 'result_mode',
+        ]).where((eb) => eb.or([eb('approval_id', '=', operationId), eb('prepare_operation_id', '=', operationId), eb('commit_operation_id', '=', operationId)]))
+          .orderBy('created_at', 'asc').execute(),
+        session.db.selectFrom('license_disaster_transfer_events').selectAll().where((eb) => eb.or([
+          eb('request_id', '=', operationId), eb('approval_id', '=', operationId),
+          eb('prepare_operation_id', '=', operationId), eb('commit_operation_id', '=', operationId),
+        ])).orderBy('created_at', 'asc').execute(),
+        session.db.selectFrom('license_disaster_transfer_revocations').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('revocation_operation_id', '=', operationId),
+        ])).execute(),
       ]);
       return {
         operation: mapOperation(operation, false),
@@ -943,6 +1279,11 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         transfer_plans: transferPlans,
         transfer_events: transferEvents,
         transfer_revocations: transferRevocation,
+        disaster_recovery_request: disasterRequest ?? null,
+        disaster_transfer_approval: disasterApproval ?? null,
+        disaster_transfer_plans: disasterPlans,
+        disaster_transfer_events: disasterEvents,
+        disaster_transfer_revocations: disasterRevocation,
       };
     },
     async listAudit(licenseId, limit = 50) {

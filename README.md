@@ -1,8 +1,8 @@
 # 艾卡云独立授权中心
 
-这是独立私有的授权中心仓库，服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。⑦-1B-2B-1 在 ⑦-1B-1/2A 基础上实现了授权中心正常迁移协议；正常迁移采用目标服务器新生成的 Ed25519 实例身份密钥，强化了⑦-1A R3 中“通常保留原 instance/key”的旧建议。协议差异和运行边界见 [`docs/normal-transfer-7-1b-2b-1.md`](docs/normal-transfer-7-1b-2b-1.md)。
+这是独立私有的授权中心仓库，服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。⑦-1B-2B-1实现授权中心正常迁移；⑦-1B-2B-2追加来源私钥不可用时的受控灾难迁移。正常迁移使用目标新 Ed25519 key并需来源持钥证明；灾难迁移使用受控管理员审批加目标新 key持钥证明，两者端点、ticket及回执用途隔离。协议和边界分别见 [`docs/normal-transfer-7-1b-2b-1.md`](docs/normal-transfer-7-1b-2b-1.md) 与 [`docs/disaster-transfer-7-1b-2b-2.md`](docs/disaster-transfer-7-1b-2b-2.md)。
 
-当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复、实例操作查询/继续、正常迁移 prepare/commit 接口，以及隔离测试与受控开发运维用的本机管理 CLI。商城客户端的本地密钥切换、签名回执投影、安装器和真实切流尚未实现。
+当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复、实例操作查询/继续、正常和灾难迁移 prepare/commit 接口，以及隔离测试与受控开发运维用的本机管理 CLI。灾难回执在权益已过期或 revoked 时仅证明身份重绑，不包含经营 grants 或新 lease。商城客户端的本地密钥切换、签名回执投影、安装器和真实切流尚未实现。
 
 ## 本地隔离运行
 
@@ -50,7 +50,7 @@ npm test
 LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/license_center_test npm run test:integration
 ```
 
-`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对本地真实 PostgreSQL 18 执行迁移，以真实 TLS HTTP 服务发送 RFC 9421 请求；测试中的激活码、许可证、权益事件、私钥和证书均为临时数据，不使用商户或商业授权凭据。基线验收见 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)，本轮管理内核交付及验收记录见 [`docs/acceptance-7-1b-2a.md`](docs/acceptance-7-1b-2a.md)。
+`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对本地真实 PostgreSQL 18 执行迁移，以真实 TLS HTTP 服务发送 RFC 9421 请求；测试中的激活码、许可证、权益事件、私钥和证书均为临时数据，不使用商户或商业授权凭据。基线验收见 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)，管理内核见 [`docs/acceptance-7-1b-2a.md`](docs/acceptance-7-1b-2a.md)，正常迁移与本阶段灾难迁移分别见 [`docs/acceptance-7-1b-2b-1-r2.md`](docs/acceptance-7-1b-2b-1-r2.md) 和 [`docs/acceptance-7-1b-2b-2.md`](docs/acceptance-7-1b-2b-2.md)。
 
 ## 本机管理 CLI（隔离环境）
 
@@ -71,6 +71,8 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 - `POST /v1/operations/continue`
 - `POST /v1/transfers/prepare`（旧 active 身份签名）
 - `POST /v1/transfers/commit`（目标新身份签名）
+- `POST /v1/disaster-transfers/prepare`（审批指定的目标新身份签名）
+- `POST /v1/disaster-transfers/commit`（目标新身份二次持钥签名）
 
 `leases/renew` 只为数据库中已确认且仍有效的权益签发新 lease，也可为原绑定实例恢复最新权益 revision。它不接受客户端申报付款，不修改订阅截止时间。测试夹具会直接在隔离数据库准备许可证、激活码和确认权益事件；服务没有可在生产调用的测试放行或权益发放接口。
 
@@ -87,4 +89,4 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 
 ## 后续阶段边界
 
-本轮未实现商业授权管理网页/公网管理 API、MFA、支付事件接入、灾难迁移、商城本地凭证投影、time-reset、中心签名私钥轮换或生产部署。迁移审批仅沿用受限本机 CLI 的 OS UID 与数据库 role 身份；`NODE_ENV=production` 仍被硬性拒绝。因此，正常迁移代码和 HTTPS API 只能在隔离测试/开发环境验收，不能宣称可直接用于生产。目标商城的身份密钥切换和文件/数据库 journal 属于后续客户端工作。`001_core` 至 `003_normal_transfers` 保持不变；本轮以追加迁移 `004_transfer_approval_revocations` 保存审批撤销投影。后续上线前仍需专门完成强认证/MFA、正式密钥管理、证书/域名与代理互操作、最小数据库角色、备份恢复、运维演练和部署安全审查。
+本阶段未实现商业授权管理网页/公网管理 API、MFA、支付事件接入、商城本地凭证投影、time-reset、中心签名私钥轮换或生产部署。正常和灾难迁移审批仅沿用受限本机 CLI 的 OS UID 与数据库 role 身份；`NODE_ENV=production` 仍被硬性拒绝。灾难审批中的客户核验、备份内容和旧机隔离均为不可由授权中心自行证明的人工声明。真实切流前仍须完成旧机器隔离、历史密钥/业务数据核对、未决资金与履约查单；license generation 不等于物理执行隔离。因此这些迁移代码只能在隔离测试/受控开发中验收，不能宣称可直接商用。`001_core` 至 `004_transfer_approval_revocations`保持不变；本阶段只追加 `005_disaster_transfers`。强认证/MFA、正式密钥管理、商城恢复器、备份恢复、运维演练和部署安全审查仍需单独完成。

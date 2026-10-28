@@ -1,6 +1,7 @@
 import { AdminOperationError, createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest,
   renewLicenseRequestDigest, changeLicenseStatusRequestDigest, approveTransferRequestDigest,
   revokeTransferApprovalRequestDigest,
+  approveDisasterTransferRequestDigest, revokeDisasterTransferApprovalRequestDigest,
   type AdminOperationResult } from './service.js';
 import { AdminAccessError } from './policy.js';
 import { resolve } from 'node:path';
@@ -21,6 +22,8 @@ const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控
   license restore --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license approve-transfer --operation-id UUID --license-id UUID --expected-revision N --database-id UUID --source-instance-id UUID --source-identity-jkt JKT --target-instance-id UUID --target-identity-jkt JKT --source-generation N --expected-binding-revision N --reason TEXT [--confirm-digest DIGEST]
   license revoke-transfer-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
+  license approve-disaster-transfer --operation-id UUID --license-id UUID --expected-revision N --account-reference REF --source-activation-id UUID --database-id UUID --source-instance-id UUID --source-identity-jkt JKT --source-generation N --target-instance-id UUID --target-instance-mode preserve|replace --target-identity-jkt JKT --expected-binding-revision N --incident-type TYPE --recovery-reason TEXT --verification-record-ref case:REF --backup-check-result VALUE --old-server-isolation VALUE --reason TEXT [--expires-in-hours 24] [--confirm-digest DIGEST]
+  license revoke-disaster-transfer-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license get --license-id UUID
   operation get --operation-id UUID
   audit list --license-id UUID [--limit 50]
@@ -181,6 +184,55 @@ async function runMutation(argv: string[], stdout: OutputStream): Promise<number
     digest = revokeTransferApprovalRequestDigest(request);
     fields = request;
     invoke = (service) => service.revokeTransferApproval({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'approve-disaster-transfer') {
+    assertAllowedOptions(options, [
+      'operation-id', 'license-id', 'expected-revision', 'account-reference', 'source-activation-id', 'database-id',
+      'source-instance-id', 'source-identity-jkt', 'source-generation', 'target-instance-id', 'target-instance-mode',
+      'target-identity-jkt', 'expected-binding-revision', 'incident-type', 'recovery-reason', 'verification-record-ref',
+      'backup-check-result', 'old-server-isolation', 'reason', 'expires-in-hours', 'confirm-digest',
+    ]);
+    const expiryText = optionalOption(options, 'expires-in-hours');
+    const expiresInHours = expiryText === undefined ? 24 : Number(expiryText);
+    if (!Number.isInteger(expiresInHours)) fail('ADMIN_DISASTER_APPROVAL_EXPIRY_INVALID');
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      accountReference: option(options, 'account-reference'),
+      sourceActivationId: option(options, 'source-activation-id'),
+      databaseId: option(options, 'database-id'),
+      sourceInstanceId: option(options, 'source-instance-id'),
+      sourceIdentityJkt: option(options, 'source-identity-jkt'),
+      sourceGeneration: option(options, 'source-generation'),
+      targetInstanceId: option(options, 'target-instance-id'),
+      targetInstanceMode: option(options, 'target-instance-mode') as 'preserve' | 'replace',
+      targetIdentityJkt: option(options, 'target-identity-jkt'),
+      expectedBindingRevision: option(options, 'expected-binding-revision'),
+      incidentType: option(options, 'incident-type') as 'private_key_lost' | 'instance_unavailable' | 'identity_material_lost' | 'other',
+      recoveryReason: option(options, 'recovery-reason'),
+      verificationRecordRef: option(options, 'verification-record-ref'),
+      backupCheckResult: option(options, 'backup-check-result') as 'database_identity_and_history_reviewed' | 'identity_material_missing' | 'unable_to_verify',
+      oldServerIsolation: option(options, 'old-server-isolation') as 'confirmed_isolated' | 'unknown' | 'not_confirmed',
+      expiresInHours,
+      reason: option(options, 'reason'),
+    };
+    action = 'disaster_transfer_approve';
+    digest = approveDisasterTransferRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.approveDisasterTransfer({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'revoke-disaster-transfer-approval') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'approval-id', 'expected-revision', 'reason', 'confirm-digest']);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      approvalId: option(options, 'approval-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      reason: option(options, 'reason'),
+    };
+    action = 'disaster_transfer_revoke';
+    digest = revokeDisasterTransferApprovalRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.revokeDisasterTransferApproval({ ...request, confirmedRequestDigest: confirm ?? '' });
   } else {
     fail('ADMIN_COMMAND_INVALID');
   }
@@ -251,7 +303,8 @@ export async function runAdminCli(
     return 0;
   }
   try {
-    if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer', 'revoke-transfer-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {
+    if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer', 'revoke-transfer-approval',
+      'approve-disaster-transfer', 'revoke-disaster-transfer-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {
       return await runMutation(argv, stdout);
     }
     return await runRead(argv, stdout);

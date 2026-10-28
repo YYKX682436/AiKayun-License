@@ -110,6 +110,12 @@ npm run admin -- license approve-transfer --operation-id <UUID> --license-id <UU
 
 `revoke-transfer-approval` 按审批 ID追加不可逆撤销事实，operation ID独立，摘要绑定license、审批、expected revision和原因。撤销不变更许可证revision或权益；未提交的prepared ticket在同一license行锁下失效，撤销后可审批新的目标。目标JKT必须未出现在该license的任何activation历史中，避免正常迁移重新启用旧私钥。003保持不变，此撤销机制通过追加迁移004部署。
 
+`approve-disaster-transfer` 专供旧实例无法提供可靠私钥证明的事故。审批摘要还绑定当前 account、原 active activation ID、database/instance/JKT/generation、目标 instance 模式和新 target JKT、expected 管理 revision、商城声明的 expected binding revision、事故类型、恢复原因、人工核验记录引用、备份检查/旧机隔离声明和审批时效。命令只会把这些人工核验声明写入不可变审计；它不验证联系人、付款、备份内容、密钥文件或旧机器是否真的离线。`unable_to_verify` 备份检查会拒绝审批；`identity_material_missing` 也不能证明业务数据库/历史解密密钥完整。旧机 `unknown` 或 `not_confirmed` 状态会被明确保留，绝不是已隔离的证明。
+
+灾难审批允许已过期或 revoked 的 license，以人工审批后重绑身份来恢复历史订单、退款、提现或交付所需上下文。若权益当前有效，commit 才签正常 lease；若已过期或 revoked，只签 `aikayun-license-disaster-binding+jwt` 且没有 grants/new lease。绑定证据不续费、不解除 revoked，也不能恢复新订单权限。之后若权益通过正式操作恢复，目标实例仍须使用新的有效权益状态正常续签。
+
+`revoke-disaster-transfer-approval` 只追加撤销记录；已准备 ticket 会原子失效，不能复活。若要更换目标 JKT/instance，必须先撤销旧审批并重新创建、复核和确认新审批。详细协议、JWT用途、锁顺序、数据/资金隔离前置条件见 [`disaster-transfer-7-1b-2b-2.md`](disaster-transfer-7-1b-2b-2.md)。现有 `NODE_ENV=production` 禁用、loopback 数据库、UID allowlist和数据库身份限制均保持。当前无管理员 MFA/正式客户身份核验系统，不能将本 CLI 视为可商用的灾难找回能力。
+
 该命令仍严格限定于 `isolated-development`、loopback PostgreSQL 和 allowlisted OS UID；生产环境启动限制没有移除。当前没有管理员 MFA，也没有公网后台。后端迁移协议虽已实现，本 CLI 的审批只能用于隔离测试/受控开发，不能作为生产审批流程。
 
 ## 一次性激活码

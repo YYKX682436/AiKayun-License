@@ -8,7 +8,7 @@ import { verifyTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClai
 import { validateIdentityJwk } from '../crypto/identity.js';
 import { verifyHttpMessage, type VerifiedHttpSignature } from '../crypto/http-signature.js';
 
-export type ChallengeOperation = 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit';
+export type ChallengeOperation = 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
 export interface ChallengeRequestBody {
   operation: ChallengeOperation;
   operation_id: string;
@@ -151,8 +151,8 @@ async function verifyChallengeToken(token: string, config: RuntimeConfig, now: D
   const iat = assertIntegerClaim(claims, 'iat');
   const nbf = assertIntegerClaim(claims, 'nbf');
   const exp = assertIntegerClaim(claims, 'exp');
-  const operation = assertStringClaim(claims, 'operation', 16) as ChallengeOperation;
-  if (!['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit'].includes(operation) || nbf !== iat || exp <= iat || exp > iat + 300) {
+  const operation = assertStringClaim(claims, 'operation', 32) as ChallengeOperation;
+  if (!['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit', 'disaster_transfer_prepare', 'disaster_transfer_commit'].includes(operation) || nbf !== iat || exp <= iat || exp > iat + 300) {
     throw new LicenseApiError(401, 'CHALLENGE_INVALID');
   }
   const clientNonce = assertStringClaim(claims, 'client_nonce', 128);

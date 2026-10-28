@@ -260,3 +260,257 @@ export async function signTransferReceipt(config: RuntimeConfig, input: {
     new_lease: input.newLease,
   });
 }
+
+export interface DisasterTransferTicketClaims {
+  plan_id: string;
+  request_id: string;
+  approval_id: string;
+  approval_request_digest: string;
+  prepare_operation_id: string;
+  prepare_intent_digest: string;
+  prepare_request_nonce: string;
+  prepare_request_digest: string;
+  license_id: string;
+  account_reference: string;
+  database_id: string;
+  source_activation_id: string;
+  source_instance_id: string;
+  source_identity_jkt: string;
+  source_activation_generation: string;
+  target_instance_id: string;
+  target_identity_jkt: string;
+  expected_binding_revision: string;
+  expected_revision: string;
+  entitlement_revision: string;
+}
+
+const uuidClaim = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const decimalClaim = /^(0|[1-9][0-9]{0,18})$/;
+const digestClaim = /^[A-Za-z0-9_-]{43}$/;
+
+export async function signDisasterTransferTicket(
+  config: RuntimeConfig,
+  input: DisasterTransferTicketClaims & { now: Date },
+): Promise<string> {
+  const iat = Math.floor(input.now.getTime() / 1000);
+  const claims = { ...input } as Record<string, unknown>;
+  delete claims['now'];
+  return signTypedJwt(config, 'aikayun-license-disaster-transfer-ticket+jwt', {
+    v: 1,
+    iss: config.issuer,
+    aud: 'aikayun-commerce',
+    sub: input.license_id,
+    jti: input.plan_id,
+    iat,
+    nbf: iat,
+    exp: iat + 10 * 60,
+    ...claims,
+  });
+}
+
+export async function verifyDisasterTransferTicket(
+  token: unknown,
+  config: RuntimeConfig,
+  validationTime: Date,
+): Promise<{ token: string; claims: Record<string, unknown>; expired: boolean }> {
+  if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > 16 * 1024) throw new Error('Invalid disaster transfer ticket');
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid disaster transfer ticket');
+  let issuedAt: number;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (!Number.isSafeInteger(payload['iat'])) throw new Error('iat');
+    issuedAt = Number(payload['iat']);
+  } catch {
+    throw new Error('Invalid disaster transfer ticket');
+  }
+  const names = [
+    'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'plan_id', 'request_id', 'approval_id',
+    'approval_request_digest', 'prepare_operation_id', 'prepare_intent_digest', 'prepare_request_nonce',
+    'prepare_request_digest', 'license_id', 'account_reference', 'database_id', 'source_activation_id',
+    'source_instance_id', 'source_identity_jkt', 'source_activation_generation', 'target_instance_id',
+    'target_identity_jkt', 'expected_binding_revision', 'expected_revision', 'entitlement_revision',
+  ];
+  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-transfer-ticket+jwt', names, new Date(issuedAt * 1000));
+  assertExactClaims(verified.claims, names);
+  if (assertIntegerClaim(verified.claims, 'v') !== 1 || assertStringClaim(verified.claims, 'sub', 36) !== assertStringClaim(verified.claims, 'license_id', 36) ||
+    assertStringClaim(verified.claims, 'jti', 36) !== assertStringClaim(verified.claims, 'plan_id', 36) ||
+    assertIntegerClaim(verified.claims, 'nbf') !== issuedAt || assertIntegerClaim(verified.claims, 'exp') !== issuedAt + 600 ||
+    verified.claims['aud'] !== 'aikayun-commerce' || issuedAt <= 0 || issuedAt > Math.floor(validationTime.getTime() / 1000) + 60) {
+    throw new Error('Invalid disaster transfer ticket claims');
+  }
+  for (const name of ['plan_id', 'request_id', 'approval_id', 'prepare_operation_id', 'license_id', 'database_id',
+    'source_activation_id', 'source_instance_id', 'target_instance_id']) {
+    if (!uuidClaim.test(assertStringClaim(verified.claims, name, 36))) throw new Error('Invalid disaster transfer ticket identifier');
+  }
+  for (const name of ['approval_request_digest', 'prepare_intent_digest', 'prepare_request_digest',
+    'source_identity_jkt', 'target_identity_jkt']) {
+    if (!digestClaim.test(assertStringClaim(verified.claims, name, 64))) throw new Error('Invalid disaster transfer ticket digest');
+  }
+  const accountReference = assertStringClaim(verified.claims, 'account_reference', 200);
+  if (accountReference.trim() !== accountReference) throw new Error('Invalid disaster transfer account reference');
+  for (const name of ['source_activation_generation', 'expected_binding_revision', 'expected_revision', 'entitlement_revision']) {
+    if (!decimalClaim.test(assertStringClaim(verified.claims, name, 19))) throw new Error('Invalid disaster transfer revision');
+  }
+  const nonce = assertStringClaim(verified.claims, 'prepare_request_nonce', 128);
+  if (!digestClaim.test(nonce)) throw new Error('Invalid disaster transfer prepare nonce');
+  return { token, claims: verified.claims, expired: Math.floor(validationTime.getTime() / 1000) >= assertIntegerClaim(verified.claims, 'exp') };
+}
+
+export async function signDisasterTransferResult(config: RuntimeConfig, input: {
+  mode: 'active_lease' | 'binding_only';
+  licenseId: string;
+  databaseId: string;
+  accountReference: string;
+  sourceActivationId: string;
+  sourceInstanceId: string;
+  sourceIdentityJkt: string;
+  sourceGeneration: string;
+  targetInstanceId: string;
+  targetIdentityJkt: string;
+  targetGeneration: string;
+  expectedBindingRevision: string;
+  expectedRevision: string;
+  resultRevision: string;
+  entitlementRevision: string;
+  operationId: string;
+  intentDigest: string;
+  requestNonce: string;
+  requestDigest: string;
+  subscriptionEnd: Date;
+  licenseStatus: 'active' | 'revoked';
+  lease?: string;
+  now: Date;
+}): Promise<string> {
+  const iat = Math.floor(input.now.getTime() / 1000);
+  const exp = input.mode === 'active_lease'
+    ? Math.min(iat + 10 * 60, Math.floor(input.subscriptionEnd.getTime() / 1000))
+    : iat + 10 * 60;
+  if (exp <= iat) throw new Error('Cannot sign an expired disaster transfer result');
+  const binding = {
+    v: 1,
+    iss: config.issuer,
+    aud: 'aikayun-commerce',
+    sub: input.licenseId,
+    jti: randomUUID(),
+    iat,
+    nbf: iat,
+    exp,
+    operation_id: input.operationId,
+    intent_digest: input.intentDigest,
+    request_nonce: input.requestNonce,
+    request_digest: input.requestDigest,
+    license_id: input.licenseId,
+    account_reference: input.accountReference,
+    database_id: input.databaseId,
+    source_activation_id: input.sourceActivationId,
+    source_instance_id: input.sourceInstanceId,
+    source_identity_jkt: input.sourceIdentityJkt,
+    source_activation_generation: input.sourceGeneration,
+    target_instance_id: input.targetInstanceId,
+    target_identity_jkt: input.targetIdentityJkt,
+    target_activation_generation: input.targetGeneration,
+    expected_binding_revision: input.expectedBindingRevision,
+    expected_revision: input.expectedRevision,
+    result_revision: input.resultRevision,
+    entitlement_revision: input.entitlementRevision,
+    subscription_end: Math.floor(input.subscriptionEnd.getTime() / 1000),
+  };
+  if (input.mode === 'active_lease') {
+    if (!input.lease || input.licenseStatus !== 'active') throw new Error('Active disaster result requires an active lease');
+    return signTypedJwt(config, 'aikayun-license-disaster-transfer+jwt', {
+      ...binding,
+      result_mode: 'active_lease',
+      license_status: 'active',
+      new_lease: input.lease,
+    });
+  }
+  const entitlementState = input.licenseStatus === 'revoked' ? 'revoked' : 'expired';
+  return signTypedJwt(config, 'aikayun-license-disaster-binding+jwt', {
+    ...binding,
+    result_mode: 'binding_only',
+    purpose: 'historical_obligations_identity_rebinding',
+    entitlement_state: entitlementState,
+    license_status: input.licenseStatus,
+  });
+}
+
+const disasterResultClaims = [
+  'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'operation_id', 'intent_digest', 'request_nonce',
+  'request_digest', 'license_id', 'account_reference', 'database_id', 'source_activation_id', 'source_instance_id',
+  'source_identity_jkt', 'source_activation_generation', 'target_instance_id', 'target_identity_jkt',
+  'target_activation_generation', 'expected_binding_revision', 'expected_revision', 'result_revision',
+  'entitlement_revision', 'subscription_end',
+] as const;
+
+function validateDisasterResultBinding(claims: Record<string, unknown>): void {
+  if (assertIntegerClaim(claims, 'v') !== 1 || claims['aud'] !== 'aikayun-commerce' ||
+    assertStringClaim(claims, 'sub', 36) !== assertStringClaim(claims, 'license_id', 36)) throw new Error('Invalid disaster result binding');
+  for (const name of ['operation_id', 'license_id', 'database_id', 'source_activation_id', 'source_instance_id', 'target_instance_id']) {
+    if (!uuidClaim.test(assertStringClaim(claims, name, 36))) throw new Error('Invalid disaster result identifier');
+  }
+  for (const name of ['intent_digest', 'request_digest', 'source_identity_jkt', 'target_identity_jkt']) {
+    if (!digestClaim.test(assertStringClaim(claims, name, 64))) throw new Error('Invalid disaster result digest');
+  }
+  if (!digestClaim.test(assertStringClaim(claims, 'request_nonce', 128))) throw new Error('Invalid disaster result nonce');
+  assertStringClaim(claims, 'account_reference', 200);
+  for (const name of ['source_activation_generation', 'target_activation_generation', 'expected_binding_revision',
+    'expected_revision', 'result_revision', 'entitlement_revision']) {
+    if (!decimalClaim.test(assertStringClaim(claims, name, 19))) throw new Error('Invalid disaster result revision');
+  }
+  assertIntegerClaim(claims, 'subscription_end');
+}
+
+export async function verifyDisasterTransferReceipt(
+  token: unknown,
+  config: RuntimeConfig,
+  now: Date,
+): Promise<Record<string, unknown>> {
+  const claims = [...disasterResultClaims, 'result_mode', 'license_status', 'new_lease'];
+  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-transfer+jwt', claims, now);
+  assertExactClaims(verified.claims, claims);
+  validateDisasterResultBinding(verified.claims);
+  if (verified.claims['result_mode'] !== 'active_lease' || verified.claims['license_status'] !== 'active') {
+    throw new Error('Invalid active disaster transfer receipt');
+  }
+  const nested = await verifyTypedJwt(verified.claims['new_lease'], config, 'aikayun-license+jwt', [
+    'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'instance_id', 'database_id', 'identity_jkt',
+    'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
+    'request_nonce', 'request_digest',
+  ], now);
+  if (nested.claims['sub'] !== verified.claims['license_id'] || nested.claims['instance_id'] !== verified.claims['target_instance_id'] ||
+    nested.claims['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
+    nested.claims['activation_generation'] !== verified.claims['target_activation_generation'] ||
+    nested.claims['request_nonce'] !== verified.claims['request_nonce'] || nested.claims['request_digest'] !== verified.claims['request_digest'] ||
+    nested.claims['grants'] instanceof Array === false ||
+    (nested.claims['grants'] as unknown[]).join(',') !== 'create_order,create_top_up') {
+    throw new Error('Nested disaster transfer lease does not match its receipt');
+  }
+  assertExactClaims(nested.claims, [
+    'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'instance_id', 'database_id', 'identity_jkt',
+    'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
+    'request_nonce', 'request_digest',
+  ]);
+  return verified.claims;
+}
+
+export async function verifyDisasterBindingReceipt(
+  token: unknown,
+  config: RuntimeConfig,
+  now: Date,
+): Promise<Record<string, unknown>> {
+  const claims = [...disasterResultClaims, 'result_mode', 'purpose', 'entitlement_state', 'license_status'];
+  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-binding+jwt', claims, now);
+  assertExactClaims(verified.claims, claims);
+  validateDisasterResultBinding(verified.claims);
+  if (verified.claims['result_mode'] !== 'binding_only' ||
+    verified.claims['purpose'] !== 'historical_obligations_identity_rebinding' ||
+    !['expired', 'revoked'].includes(String(verified.claims['entitlement_state'])) ||
+    !['active', 'revoked'].includes(String(verified.claims['license_status']))) {
+    throw new Error('Invalid disaster binding receipt');
+  }
+  if ((verified.claims['entitlement_state'] === 'revoked') !== (verified.claims['license_status'] === 'revoked')) {
+    throw new Error('Disaster binding receipt entitlement state does not match license status');
+  }
+  return verified.claims;
+}
