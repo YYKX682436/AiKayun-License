@@ -704,6 +704,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     const protectedTables = [
       'licenses', 'license_activations', 'activation_codes', 'request_nonces',
       'license_operations', 'license_operation_attempts', 'entitlement_events', 'license_audit_events',
+      'license_admin_operations', 'license_admin_audit_events',
     ];
     for (const table of protectedTables) {
       await expect(sql`TRUNCATE TABLE ${sql.table(table)} CASCADE`.execute(db)).rejects.toMatchObject({ code: '55000' });

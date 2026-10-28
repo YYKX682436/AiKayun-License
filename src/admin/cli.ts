@@ -1,0 +1,235 @@
+import { AdminOperationError, createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest,
+  renewLicenseRequestDigest, changeLicenseStatusRequestDigest, type AdminOperationResult } from './service.js';
+import { AdminAccessError } from './policy.js';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+type OutputStream = NodeJS.WriteStream & { isTTY?: boolean };
+
+const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控开发）
+
+写操作使用两步确认：先运行不带 --confirm-digest 的命令，复核输出摘要；再用同一参数追加 --confirm-digest <请求摘要> 执行。
+所有写命令必须提供稳定 --operation-id、明确目标、expected revision 和 --reason。
+
+命令：
+  license create --operation-id UUID --license-id UUID --expected-revision 0 --plan monthly|yearly --account-id REF --reason TEXT [--confirm-digest DIGEST]
+  license issue-code --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--expires-in-hours 24] [--replace-code-id UUID] [--confirm-digest DIGEST]
+  license renew --operation-id UUID --license-id UUID --expected-revision N --business-reference REF --reason TEXT [--confirm-digest DIGEST]
+  license revoke --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
+  license restore --operation-id UUID --license-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
+  license get --license-id UUID
+  operation get --operation-id UUID
+  audit list --license-id UUID [--limit 50]
+
+CLI 不提供 actor 参数。执行身份来自 allowlisted OS UID 与已认证的独立 PostgreSQL session_user；reason 只是审计备注。
+`;
+
+function fail(code: string): never {
+  throw new AdminOperationError(code);
+}
+
+function parseFlags(args: string[]): Map<string, string> {
+  const options = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (!flag || !flag.startsWith('--') || flag === '--') fail('ADMIN_ARGUMENT_INVALID');
+    if (options.has(flag)) fail('ADMIN_ARGUMENT_DUPLICATE');
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) fail('ADMIN_ARGUMENT_VALUE_REQUIRED');
+    options.set(flag, value);
+    index += 1;
+  }
+  return options;
+}
+
+function option(options: Map<string, string>, name: string): string {
+  const value = options.get(`--${name}`);
+  if (value === undefined) fail(`ADMIN_ARGUMENT_${name.toUpperCase().replaceAll('-', '_')}_REQUIRED`);
+  return value;
+}
+
+function optionalOption(options: Map<string, string>, name: string): string | undefined {
+  return options.get(`--${name}`);
+}
+
+function assertAllowedOptions(options: Map<string, string>, names: string[]): void {
+  const allowed = new Set(names.map((name) => `--${name}`));
+  for (const name of options.keys()) if (!allowed.has(name)) fail('ADMIN_ARGUMENT_UNKNOWN');
+}
+
+function printJson(stream: OutputStream, value: unknown): void {
+  stream.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeReview(stream: OutputStream, action: string, requestDigest: string, fields: Record<string, unknown>): void {
+  printJson(stream, {
+    review_required: true,
+    action,
+    fields,
+    request_digest: requestDigest,
+    instruction: '复核字段后以完全相同的请求追加 --confirm-digest <request_digest> 执行；本次没有写入数据库。',
+  });
+}
+
+function withoutSecret(result: AdminOperationResult): Omit<AdminOperationResult, 'activationCode'> {
+  const { activationCode: _activationCode, ...safe } = result;
+  return safe;
+}
+
+async function runMutation(argv: string[], stdout: OutputStream): Promise<number> {
+  const [domain, verb, ...flagArgs] = argv;
+  if (domain !== 'license' || !verb) fail('ADMIN_COMMAND_INVALID');
+  const options = parseFlags(flagArgs);
+  const confirm = optionalOption(options, 'confirm-digest');
+
+  let action = '';
+  let digest = '';
+  let fields: Record<string, unknown> = {};
+  let invoke: (service: Awaited<ReturnType<typeof createAdminService>>) => Promise<AdminOperationResult>;
+
+  if (verb === 'create') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'expected-revision', 'plan', 'account-id', 'reason', 'confirm-digest']);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision') as '0',
+      plan: option(options, 'plan') as 'monthly' | 'yearly',
+      accountId: option(options, 'account-id'),
+      reason: option(options, 'reason'),
+    };
+    if (request.expectedRevision !== '0') fail('ADMIN_EXPECTED_REVISION_INVALID');
+    action = 'license_create';
+    digest = createLicenseRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.createLicense({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'issue-code') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'expected-revision', 'reason', 'expires-in-hours', 'replace-code-id', 'confirm-digest']);
+    const expiryText = optionalOption(options, 'expires-in-hours');
+    const expiresInHours = expiryText === undefined ? 24 : Number(expiryText);
+    if (!Number.isInteger(expiresInHours)) fail('ADMIN_CODE_EXPIRY_INVALID');
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      reason: option(options, 'reason'),
+      expiresInHours,
+      ...(optionalOption(options, 'replace-code-id') ? { replaceCodeId: optionalOption(options, 'replace-code-id')! } : {}),
+    };
+    action = 'activation_code_issue';
+    digest = issueActivationCodeRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.issueActivationCode({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'renew') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'expected-revision', 'business-reference', 'reason', 'confirm-digest']);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      businessReference: option(options, 'business-reference'),
+      reason: option(options, 'reason'),
+    };
+    action = 'license_renew';
+    digest = renewLicenseRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.renewLicense({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'revoke' || verb === 'restore') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'expected-revision', 'reason', 'confirm-digest']);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      reason: option(options, 'reason'),
+    };
+    const statusAction = verb === 'revoke' ? 'license_revoke' : 'license_restore';
+    action = statusAction;
+    digest = changeLicenseStatusRequestDigest(request, statusAction);
+    fields = request;
+    invoke = (service) => verb === 'revoke'
+      ? service.revokeLicense({ ...request, confirmedRequestDigest: confirm ?? '' })
+      : service.restoreLicense({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else {
+    fail('ADMIN_COMMAND_INVALID');
+  }
+
+  if (!confirm) {
+    writeReview(stdout, action, digest, fields);
+    return 0;
+  }
+  if (confirm !== digest) fail('ADMIN_CONFIRMATION_DIGEST_MISMATCH');
+  if (verb === 'issue-code' && !stdout.isTTY) fail('ADMIN_ACTIVATION_CODE_REQUIRES_TTY');
+  const service = await createAdminService();
+  try {
+    const result = await invoke(service);
+    printJson(stdout, withoutSecret(result));
+    if (result.activationCode) stdout.write(`一次性激活码（仅本次显示）: ${result.activationCode}\n`);
+    else if (verb === 'issue-code' && result.replayed) stdout.write('该操作已提交；原激活码明文不可恢复，请按审计结果受控作废并重发。\n');
+    return result.state === 'succeeded' ? 0 : 2;
+  } finally {
+    await service.close();
+  }
+}
+
+async function runRead(argv: string[], stdout: OutputStream): Promise<number> {
+  const [domain, verb, ...flagArgs] = argv;
+  const options = parseFlags(flagArgs);
+  const service = await createAdminService();
+  try {
+    if (domain === 'license' && verb === 'get') {
+      assertAllowedOptions(options, ['license-id']);
+      const license = await service.getLicense(option(options, 'license-id'));
+      if (!license) {
+        printJson(stdout, { found: false });
+        return 1;
+      }
+      printJson(stdout, license);
+      return 0;
+    }
+    if (domain === 'operation' && verb === 'get') {
+      assertAllowedOptions(options, ['operation-id']);
+      const operation = await service.getOperation(option(options, 'operation-id'));
+      if (!operation) {
+        printJson(stdout, { found: false });
+        return 1;
+      }
+      printJson(stdout, operation);
+      return 0;
+    }
+    if (domain === 'audit' && verb === 'list') {
+      assertAllowedOptions(options, ['license-id', 'limit']);
+      const limitText = optionalOption(options, 'limit');
+      const limit = limitText === undefined ? 50 : Number(limitText);
+      printJson(stdout, await service.listAudit(option(options, 'license-id'), limit));
+      return 0;
+    }
+    fail('ADMIN_COMMAND_INVALID');
+  } finally {
+    await service.close();
+  }
+}
+
+export async function runAdminCli(
+  argv = process.argv.slice(2),
+  stdout: OutputStream = process.stdout,
+  stderr: OutputStream = process.stderr,
+): Promise<number> {
+  if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
+    stdout.write(helpText);
+    return 0;
+  }
+  try {
+    if (['create', 'issue-code', 'renew', 'revoke', 'restore'].includes(argv[1] ?? '') && argv[0] === 'license') {
+      return await runMutation(argv, stdout);
+    }
+    return await runRead(argv, stdout);
+  } catch (error) {
+    const code = error instanceof AdminOperationError || error instanceof AdminAccessError
+      ? error.code
+      : 'ADMIN_OPERATION_FAILED';
+    stderr.write(`${code}\n`);
+    return 2;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  process.exitCode = await runAdminCli();
+}

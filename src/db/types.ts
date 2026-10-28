@@ -2,6 +2,8 @@ import type { ColumnType, Generated, Selectable } from 'kysely';
 
 type Timestamp = ColumnType<Date, Date | string, Date | string>;
 type Bigint = ColumnType<string, number | string, number | string>;
+type DefaultedBigint = ColumnType<string, number | string | undefined, number | string>;
+type NullableTimestamp = ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 type Json = ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>;
 
 export interface LicensesTable {
@@ -12,7 +14,7 @@ export interface LicensesTable {
   anchor_day: number;
   confirmed_subscription_end: Timestamp;
   status: 'active' | 'revoked';
-  current_generation: Bigint;
+  current_generation: DefaultedBigint;
   entitlement_revision: Bigint;
   revision: Bigint;
   created_at: Timestamp;
@@ -39,7 +41,8 @@ export interface ActivationCodesTable {
   license_id: string;
   token_hash: string;
   expires_at: Timestamp;
-  consumed_at: Timestamp | null;
+  consumed_at: NullableTimestamp;
+  revoked_at: NullableTimestamp;
   created_at: Timestamp;
 }
 
@@ -112,6 +115,41 @@ export interface LicenseAuditEventsTable {
   created_at: Timestamp;
 }
 
+export interface LicenseAdminOperationsTable {
+  operation_id: string;
+  request_digest: string;
+  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore';
+  license_id: string;
+  expected_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  state: 'succeeded' | 'rejected';
+  outcome_code: string;
+  result: Json;
+  result_revision: Bigint | null;
+  created_at: Timestamp;
+  finalized_at: Timestamp;
+}
+
+export interface LicenseAdminAuditEventsTable {
+  event_id: string;
+  operation_id: string;
+  license_id: string;
+  action: LicenseAdminOperationsTable['action'];
+  request_digest: string;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  expected_revision: Bigint;
+  reason: string;
+  state: LicenseAdminOperationsTable['state'];
+  outcome_code: string;
+  result: Json;
+  created_at: Timestamp;
+}
+
 export interface Database {
   licenses: LicensesTable;
   license_activations: LicenseActivationsTable;
@@ -121,6 +159,8 @@ export interface Database {
   license_operation_attempts: LicenseOperationAttemptsTable;
   entitlement_events: EntitlementEventsTable;
   license_audit_events: LicenseAuditEventsTable;
+  license_admin_operations: LicenseAdminOperationsTable;
+  license_admin_audit_events: LicenseAdminAuditEventsTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;
@@ -128,3 +168,5 @@ export type ActivationRow = Selectable<LicenseActivationsTable>;
 export type ActivationCodeRow = Selectable<ActivationCodesTable>;
 export type RequestNonceRow = Selectable<RequestNoncesTable>;
 export type OperationRow = Selectable<LicenseOperationsTable>;
+export type LicenseAdminOperationRow = Selectable<LicenseAdminOperationsTable>;
+export type LicenseAdminAuditEventRow = Selectable<LicenseAdminAuditEventsTable>;

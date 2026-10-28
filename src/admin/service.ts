@@ -1,0 +1,724 @@
+import { randomBytes, randomUUID } from 'node:crypto';
+import canonicalize from 'canonicalize';
+import { sql, type Transaction } from 'kysely';
+import type { LicenseAdminOperationRow, LicenseRow, Database } from '../db/types.js';
+import { databaseNow } from '../services/common.js';
+import { addCalendarPeriod, type BillingPlan } from '../entitlements/calendar.js';
+import { sha256Base64url } from '../crypto/identity.js';
+import { applyConfirmedRenewalToLockedLicense, lockEntitlementEvent } from '../services/entitlements.js';
+import { AdminAccessError, openAdminSession, type AdminActor, type AdminSession } from './policy.js';
+
+type AdminTransaction = Transaction<Database>;
+type AdminAction = LicenseAdminOperationRow['action'];
+type AdminState = LicenseAdminOperationRow['state'];
+
+export class AdminOperationError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = 'AdminOperationError';
+  }
+}
+
+export interface AdminOperationResult {
+  operationId: string;
+  requestDigest: string;
+  action: AdminAction;
+  licenseId: string;
+  state: AdminState;
+  outcomeCode: string;
+  expectedRevision: string;
+  resultRevision: string | null;
+  result: Record<string, unknown>;
+  replayed: boolean;
+  activationCode?: string;
+}
+
+interface BaseRequest {
+  operationId: string;
+  licenseId: string;
+  expectedRevision: string;
+  reason: string;
+  confirmedRequestDigest: string;
+}
+
+export interface CreateLicenseRequest {
+  operationId: string;
+  licenseId: string;
+  expectedRevision: '0';
+  plan: BillingPlan;
+  accountId: string;
+  reason: string;
+  confirmedRequestDigest: string;
+}
+
+export interface IssueActivationCodeRequest extends BaseRequest {
+  replaceCodeId?: string;
+  expiresInHours?: number;
+}
+
+export interface RenewLicenseRequest extends BaseRequest {
+  businessReference: string;
+}
+
+export type LicenseStatusView = {
+  license: {
+    id: string;
+    account_id: string;
+    plan: BillingPlan;
+    billing_anchor_utc: string;
+    anchor_day: number;
+    confirmed_subscription_end: string;
+    status: LicenseRow['status'];
+    current_generation: string;
+    entitlement_revision: string;
+    revision: string;
+    created_at: string;
+    updated_at: string;
+  };
+  activations: Array<{
+    id: string;
+    generation: string;
+    instance_id: string;
+    database_id: string;
+    identity_jkt: string;
+    state: 'active' | 'retired';
+    activated_at: string;
+    retired_at: string | null;
+    last_seen_at: string;
+    origin_display: string | null;
+  }>;
+  activationCodes: Array<{
+    id: string;
+    created_at: string;
+    expires_at: string;
+    consumed_at: string | null;
+    revoked_at: string | null;
+    status: 'issued' | 'expired' | 'consumed' | 'revoked';
+  }>;
+};
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const revisionPattern = /^(0|[1-9][0-9]{0,18})$/;
+const int64Max = 9_223_372_036_854_775_807n;
+
+function ensureUuid(value: string, code: string): void {
+  if (!uuidPattern.test(value)) throw new AdminOperationError(code);
+}
+
+function ensureRevision(value: string, allowZero = false): void {
+  if (!revisionPattern.test(value) || (!allowZero && value === '0') || BigInt(value) > int64Max) {
+    throw new AdminOperationError('ADMIN_EXPECTED_REVISION_INVALID');
+  }
+}
+
+function ensureReason(value: string): string {
+  const reason = value.trim();
+  if (reason.length < 5 || reason.length > 1000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(reason)) {
+    throw new AdminOperationError('ADMIN_REASON_REQUIRED');
+  }
+  return reason;
+}
+
+function ensureText(value: string, code: string, maxLength: number): string {
+  const text = value.trim();
+  if (text.length < 1 || text.length > maxLength || /[\u0000-\u001f\u007f]/.test(text)) throw new AdminOperationError(code);
+  return text;
+}
+
+function digestRequest(action: AdminAction, request: Record<string, unknown>): string {
+  const canonical = canonicalize({ v: 1, action, ...request });
+  if (typeof canonical !== 'string') throw new AdminOperationError('ADMIN_REQUEST_INVALID');
+  return sha256Base64url(canonical);
+}
+
+function actorLabel(actor: AdminActor): string {
+  return `os_uid:${actor.osUid};os_user:${actor.osUsername};db_role:${actor.databaseRole}`;
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function mapOperation(row: LicenseAdminOperationRow, replayed: boolean): AdminOperationResult {
+  return {
+    operationId: row.operation_id,
+    requestDigest: row.request_digest,
+    action: row.action,
+    licenseId: row.license_id,
+    state: row.state,
+    outcomeCode: row.outcome_code,
+    expectedRevision: row.expected_revision.toString(),
+    resultRevision: row.result_revision?.toString() ?? null,
+    result: asObject(row.result),
+    replayed,
+  };
+}
+
+function assertReplay(row: LicenseAdminOperationRow, input: {
+  requestDigest: string;
+  action: AdminAction;
+  actor: AdminActor;
+}): AdminOperationResult {
+  if (row.actor_os_uid !== input.actor.osUid || row.actor_database_role !== input.actor.databaseRole) {
+    throw new AdminOperationError('ADMIN_OPERATION_ACTOR_MISMATCH');
+  }
+  if (row.request_digest !== input.requestDigest || row.action !== input.action) {
+    throw new AdminOperationError('ADMIN_OPERATION_ID_CONFLICT');
+  }
+  return mapOperation(row, true);
+}
+
+async function lockAdminOperation(trx: AdminTransaction, operationId: string): Promise<void> {
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'license-admin-operation:' + operationId}, 0))`.execute(trx);
+}
+
+async function lockLicense(trx: AdminTransaction, licenseId: string): Promise<LicenseRow | undefined> {
+  return trx.selectFrom('licenses').selectAll().where('id', '=', licenseId).forUpdate().executeTakeFirst();
+}
+
+async function appendCoreAudit(
+  trx: AdminTransaction,
+  actor: AdminActor,
+  input: { licenseId: string; operationId: string; kind: string; reason: string; details: Record<string, unknown>; now: Date },
+): Promise<void> {
+  await trx.insertInto('license_audit_events').values({
+    id: randomUUID(),
+    license_id: input.licenseId,
+    operation_id: input.operationId,
+    kind: input.kind,
+    actor: actorLabel(actor),
+    safe_details: { reason: input.reason, ...input.details },
+    created_at: input.now,
+  }).execute();
+}
+
+interface FinalOutcome {
+  state: AdminState;
+  outcomeCode: string;
+  result: Record<string, unknown>;
+  resultRevision: string | null;
+  now: Date;
+  activationCode?: string;
+}
+
+async function writeFinalOperation(trx: AdminTransaction, actor: AdminActor, input: {
+  operationId: string;
+  requestDigest: string;
+  action: AdminAction;
+  licenseId: string;
+  expectedRevision: string;
+  reason: string;
+}, outcome: FinalOutcome): Promise<void> {
+  await trx.insertInto('license_admin_operations').values({
+    operation_id: input.operationId,
+    request_digest: input.requestDigest,
+    action: input.action,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    actor_os_uid: actor.osUid,
+    actor_os_username: actor.osUsername,
+    actor_database_role: actor.databaseRole,
+    reason: input.reason,
+    state: outcome.state,
+    outcome_code: outcome.outcomeCode,
+    result: outcome.result,
+    result_revision: outcome.resultRevision,
+    created_at: outcome.now,
+    finalized_at: outcome.now,
+  }).execute();
+  await trx.insertInto('license_admin_audit_events').values({
+    event_id: randomUUID(),
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    action: input.action,
+    request_digest: input.requestDigest,
+    actor_os_uid: actor.osUid,
+    actor_os_username: actor.osUsername,
+    actor_database_role: actor.databaseRole,
+    expected_revision: input.expectedRevision,
+    reason: input.reason,
+    state: outcome.state,
+    outcome_code: outcome.outcomeCode,
+    result: outcome.result,
+    created_at: outcome.now,
+  }).execute();
+}
+
+async function executeMutation(
+  session: AdminSession,
+  input: {
+    operationId: string;
+    requestDigest: string;
+    action: AdminAction;
+    licenseId: string;
+    expectedRevision: string;
+    reason: string;
+    confirmedRequestDigest: string;
+  },
+  perform: (trx: AdminTransaction) => Promise<FinalOutcome>,
+): Promise<AdminOperationResult> {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureRevision(input.expectedRevision, input.expectedRevision === '0');
+  if (input.confirmedRequestDigest !== input.requestDigest) throw new AdminOperationError('ADMIN_CONFIRMATION_DIGEST_MISMATCH');
+  try {
+    return await session.db.transaction().execute(async (trx) => {
+      await lockAdminOperation(trx, input.operationId);
+      const existing = await trx.selectFrom('license_admin_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirst();
+      if (existing) return assertReplay(existing, { requestDigest: input.requestDigest, action: input.action, actor: session.actor });
+      const outcome = await perform(trx);
+      await writeFinalOperation(trx, session.actor, input, outcome);
+      return {
+        operationId: input.operationId,
+        requestDigest: input.requestDigest,
+        action: input.action,
+        licenseId: input.licenseId,
+        state: outcome.state,
+        outcomeCode: outcome.outcomeCode,
+        expectedRevision: input.expectedRevision,
+        resultRevision: outcome.resultRevision,
+        result: outcome.result,
+        replayed: false,
+        ...(outcome.activationCode ? { activationCode: outcome.activationCode } : {}),
+      };
+    });
+  } catch (error) {
+    if (error instanceof AdminOperationError || error instanceof AdminAccessError) throw error;
+    let committed: LicenseAdminOperationRow | undefined;
+    try {
+      committed = await session.db.selectFrom('license_admin_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirst();
+    } catch {
+      throw new AdminOperationError('ADMIN_COMMIT_OUTCOME_UNKNOWN');
+    }
+    if (committed) return assertReplay(committed, { requestDigest: input.requestDigest, action: input.action, actor: session.actor });
+    throw new AdminOperationError('ADMIN_COMMIT_OUTCOME_UNKNOWN');
+  }
+}
+
+export function createLicenseRequestDigest(input: Omit<CreateLicenseRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  if (input.expectedRevision !== '0') throw new AdminOperationError('ADMIN_EXPECTED_REVISION_INVALID');
+  if (input.plan !== 'monthly' && input.plan !== 'yearly') throw new AdminOperationError('ADMIN_PLAN_INVALID');
+  const accountId = ensureText(input.accountId, 'ADMIN_ACCOUNT_ID_INVALID', 200);
+  const reason = ensureReason(input.reason);
+  return digestRequest('license_create', {
+    operation_id: input.operationId, license_id: input.licenseId, expected_revision: '0',
+    plan: input.plan, account_id: accountId, reason,
+  });
+}
+
+export function issueActivationCodeRequestDigest(input: Omit<IssueActivationCodeRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  const reason = ensureReason(input.reason);
+  const expiresInHours = input.expiresInHours ?? 24;
+  if (!Number.isInteger(expiresInHours) || expiresInHours < 1 || expiresInHours > 72) throw new AdminOperationError('ADMIN_CODE_EXPIRY_INVALID');
+  if (input.replaceCodeId) ensureUuid(input.replaceCodeId, 'ADMIN_ACTIVATION_CODE_ID_INVALID');
+  return digestRequest('activation_code_issue', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    reason,
+    expires_in_hours: expiresInHours,
+    ...(input.replaceCodeId ? { replace_code_id: input.replaceCodeId } : {}),
+  });
+}
+
+export function renewLicenseRequestDigest(input: Omit<RenewLicenseRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  const reason = ensureReason(input.reason);
+  const businessReference = ensureText(input.businessReference, 'ADMIN_BUSINESS_REFERENCE_REQUIRED', 200);
+  return digestRequest('license_renew', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    business_reference: businessReference,
+    reason,
+  });
+}
+
+export function changeLicenseStatusRequestDigest(input: Omit<BaseRequest, 'confirmedRequestDigest'>, action: 'license_revoke' | 'license_restore'): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  const reason = ensureReason(input.reason);
+  return digestRequest(action, {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    reason,
+  });
+}
+
+async function insertFinalLicenseOperation(
+  session: AdminSession,
+  input: CreateLicenseRequest,
+): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const accountId = ensureText(input.accountId, 'ADMIN_ACCOUNT_ID_INVALID', 200);
+  const requestDigest = createLicenseRequestDigest({ ...input, reason, accountId });
+  return executeMutation(session, {
+    operationId: input.operationId,
+    requestDigest,
+    action: 'license_create',
+    licenseId: input.licenseId,
+    expectedRevision: '0',
+    reason,
+    confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'license-admin-target:' + input.licenseId}, 0))`.execute(trx);
+    const now = await databaseNow(trx);
+    const exists = await trx.selectFrom('licenses').selectAll().where('id', '=', input.licenseId).forUpdate().executeTakeFirst();
+    if (exists) {
+      return {
+        state: 'rejected', outcomeCode: 'LICENSE_ID_ALREADY_EXISTS', resultRevision: exists.revision.toString(), now,
+        result: { license_id: input.licenseId, observed_revision: exists.revision.toString(), observed_status: exists.status },
+      };
+    }
+    const anchorDay = now.getUTCDate();
+    const subscriptionEnd = addCalendarPeriod(now, input.plan, anchorDay);
+    await trx.insertInto('licenses').values({
+      id: input.licenseId,
+      account_id: accountId,
+      plan: input.plan,
+      billing_anchor_utc: now,
+      anchor_day: anchorDay,
+      confirmed_subscription_end: subscriptionEnd,
+      status: 'active',
+      entitlement_revision: '1',
+      revision: '1',
+      created_at: now,
+      updated_at: now,
+    }).execute();
+    const result = {
+      license_id: input.licenseId,
+      account_id: accountId,
+      plan: input.plan,
+      billing_anchor_utc: now.toISOString(),
+      anchor_day: anchorDay,
+      subscription_end: subscriptionEnd.toISOString(),
+      status: 'active',
+      current_generation: '0',
+      entitlement_revision: '1',
+      revision: '1',
+    };
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: input.licenseId, operationId: input.operationId, kind: 'admin_license_created', reason,
+      details: { plan: input.plan, anchor_day: anchorDay, billing_anchor_utc: now.toISOString(), subscription_end: subscriptionEnd.toISOString(), revision: '1' }, now,
+    });
+    return { state: 'succeeded', outcomeCode: 'LICENSE_CREATED', result, resultRevision: '1', now };
+  });
+}
+
+async function issueActivationCode(
+  session: AdminSession,
+  input: IssueActivationCodeRequest,
+): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const normalized = { ...input, reason, expiresInHours: input.expiresInHours ?? 24 };
+  const requestDigest = issueActivationCodeRequestDigest(normalized);
+  return executeMutation(session, {
+    operationId: input.operationId,
+    requestDigest,
+    action: 'activation_code_issue',
+    licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision,
+    reason,
+    confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return {
+      state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now,
+      result: { license_id: input.licenseId },
+    };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return {
+      state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { license_id: license.id, expected_revision: input.expectedRevision, observed_revision: revision, status: license.status },
+    };
+    if (license.status !== 'active') return {
+      state: 'rejected', outcomeCode: 'LICENSE_REVOKED', resultRevision: revision, now,
+      result: { license_id: license.id, observed_revision: revision, status: license.status },
+    };
+    if (license.confirmed_subscription_end.getTime() <= now.getTime()) return {
+      state: 'rejected', outcomeCode: 'SUBSCRIPTION_EXPIRED', resultRevision: revision, now,
+      result: { license_id: license.id, observed_revision: revision, subscription_end: license.confirmed_subscription_end.toISOString() },
+    };
+    if (BigInt(license.current_generation) > 0n) return {
+      state: 'rejected', outcomeCode: 'LICENSE_ALREADY_ACTIVATED', resultRevision: revision, now,
+      result: { license_id: license.id, current_generation: license.current_generation.toString() },
+    };
+    const existingCodes = await trx.selectFrom('activation_codes').selectAll()
+      .where('license_id', '=', license.id).where('consumed_at', 'is', null).where('revoked_at', 'is', null)
+      .orderBy('created_at', 'asc').forUpdate().execute();
+    const validCodes = existingCodes.filter((code) => code.expires_at.getTime() > now.getTime());
+    if (validCodes.length > 1) return {
+      state: 'rejected', outcomeCode: 'ACTIVATION_CODE_STATE_AMBIGUOUS', resultRevision: revision, now,
+      result: { license_id: license.id, unresolved_code_count: validCodes.length },
+    };
+    if (validCodes.length === 1 && input.replaceCodeId !== validCodes[0]!.id) return {
+      state: 'rejected', outcomeCode: 'ACTIVATION_CODE_REPLACEMENT_REQUIRED', resultRevision: revision, now,
+      result: { license_id: license.id, active_code_id: validCodes[0]!.id, expires_at: validCodes[0]!.expires_at.toISOString() },
+    };
+    if (input.replaceCodeId && validCodes[0]?.id !== input.replaceCodeId) return {
+      state: 'rejected', outcomeCode: 'ACTIVATION_CODE_REPLACEMENT_TARGET_INVALID', resultRevision: revision, now,
+      result: { license_id: license.id, replace_code_id: input.replaceCodeId },
+    };
+    const nextRevision = (BigInt(license.revision) + 1n).toString();
+    const updatedLicense = await trx.updateTable('licenses').set({ revision: nextRevision, updated_at: now })
+      .where('id', '=', license.id).where('revision', '=', revision).returning('id').executeTakeFirst();
+    if (!updatedLicense) throw new AdminOperationError('EXPECTED_REVISION_MISMATCH');
+    const retiredCodeIds: string[] = [];
+    for (const code of existingCodes) {
+      if (code.expires_at.getTime() <= now.getTime() || code.id === input.replaceCodeId) {
+        await trx.updateTable('activation_codes').set({ revoked_at: now })
+          .where('id', '=', code.id).where('consumed_at', 'is', null).where('revoked_at', 'is', null).execute();
+        retiredCodeIds.push(code.id);
+      }
+    }
+    const activationCode = randomBytes(32).toString('base64url');
+    const codeId = randomUUID();
+    const expiresAt = new Date(now.getTime() + normalized.expiresInHours * 60 * 60 * 1000);
+    await trx.insertInto('activation_codes').values({
+      id: codeId,
+      license_id: license.id,
+      token_hash: sha256Base64url(activationCode),
+      expires_at: expiresAt,
+      created_at: now,
+    }).execute();
+    const result = {
+      license_id: license.id, code_id: codeId, expires_at: expiresAt.toISOString(),
+      replaced_code_ids: retiredCodeIds, previous_revision: revision, revision: nextRevision,
+    };
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: license.id, operationId: input.operationId, kind: 'admin_activation_code_issued', reason,
+      details: { code_id: codeId, expires_at: expiresAt.toISOString(), replaced_code_ids: retiredCodeIds }, now,
+    });
+    return { state: 'succeeded', outcomeCode: 'ACTIVATION_CODE_ISSUED', result, resultRevision: nextRevision, now, activationCode };
+  });
+}
+
+async function renewLicense(session: AdminSession, input: RenewLicenseRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const businessReference = ensureText(input.businessReference, 'ADMIN_BUSINESS_REFERENCE_REQUIRED', 200);
+  const requestDigest = renewLicenseRequestDigest({ ...input, reason, businessReference });
+  return executeMutation(session, {
+    operationId: input.operationId,
+    requestDigest,
+    action: 'license_renew',
+    licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision,
+    reason,
+    confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const externalEventId = `admin:${input.operationId}`;
+    await lockEntitlementEvent(trx, externalEventId);
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return {
+      state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now,
+      result: { license_id: input.licenseId, business_reference: businessReference },
+    };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return {
+      state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { license_id: license.id, expected_revision: input.expectedRevision, observed_revision: revision, status: license.status },
+    };
+    const renewal = await applyConfirmedRenewalToLockedLicense(trx, license, {
+      externalEventId,
+      actor: actorLabel(session.actor),
+      now,
+      operationId: input.operationId,
+      auditDetails: { operation_id: input.operationId, business_reference: businessReference, reason },
+    });
+    const current = await trx.selectFrom('licenses').selectAll().where('id', '=', license.id).executeTakeFirstOrThrow();
+    const result = {
+      license_id: license.id,
+      event_id: renewal.eventId,
+      previous_end: renewal.previousEnd.toISOString(),
+      new_end: renewal.newEnd.toISOString(),
+      plan: license.plan,
+      status: current.status,
+      entitlement_revision: renewal.revision,
+      revision: current.revision.toString(),
+      business_reference: businessReference,
+    };
+    return { state: 'succeeded', outcomeCode: 'LICENSE_RENEWED', result, resultRevision: current.revision.toString(), now };
+  });
+}
+
+async function changeStatus(
+  session: AdminSession,
+  action: 'license_revoke' | 'license_restore',
+  input: BaseRequest,
+): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const requestDigest = changeLicenseStatusRequestDigest({ ...input, reason }, action);
+  return executeMutation(session, {
+    operationId: input.operationId,
+    requestDigest,
+    action,
+    licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision,
+    reason,
+    confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return {
+      state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now,
+      result: { license_id: input.licenseId },
+    };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return {
+      state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { license_id: license.id, expected_revision: input.expectedRevision, observed_revision: revision, status: license.status },
+    };
+    const expectedStatus = action === 'license_revoke' ? 'active' : 'revoked';
+    const newStatus = action === 'license_revoke' ? 'revoked' : 'active';
+    if (license.status !== expectedStatus) return {
+      state: 'rejected', outcomeCode: action === 'license_revoke' ? 'LICENSE_ALREADY_REVOKED' : 'LICENSE_NOT_REVOKED',
+      resultRevision: revision, now,
+      result: { license_id: license.id, observed_revision: revision, status: license.status },
+    };
+    const nextEntitlementRevision = (BigInt(license.entitlement_revision) + 1n).toString();
+    const nextRevision = (BigInt(license.revision) + 1n).toString();
+    await trx.updateTable('licenses').set({
+      status: newStatus,
+      entitlement_revision: nextEntitlementRevision,
+      revision: nextRevision,
+      updated_at: now,
+    }).where('id', '=', license.id).where('revision', '=', revision).execute();
+    const currentActivation = await trx.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', license.id).where('state', '=', 'active').executeTakeFirst();
+    const result = {
+      license_id: license.id,
+      previous_status: license.status,
+      status: newStatus,
+      previous_revision: revision,
+      revision: nextRevision,
+      previous_entitlement_revision: license.entitlement_revision.toString(),
+      entitlement_revision: nextEntitlementRevision,
+      subscription_end: license.confirmed_subscription_end.toISOString(),
+      current_generation: license.current_generation.toString(),
+      activation_id: currentActivation?.id ?? null,
+      activation_generation: currentActivation?.generation.toString() ?? null,
+    };
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: license.id,
+      operationId: input.operationId,
+      kind: action === 'license_revoke' ? 'admin_license_revoked' : 'admin_license_restored',
+      reason,
+      details: result,
+      now,
+    });
+    return { state: 'succeeded', outcomeCode: action === 'license_revoke' ? 'LICENSE_REVOKED' : 'LICENSE_RESTORED', result, resultRevision: nextRevision, now };
+  });
+}
+
+export interface AdminService {
+  createLicense(input: CreateLicenseRequest): Promise<AdminOperationResult>;
+  issueActivationCode(input: IssueActivationCodeRequest): Promise<AdminOperationResult>;
+  renewLicense(input: RenewLicenseRequest): Promise<AdminOperationResult>;
+  revokeLicense(input: BaseRequest): Promise<AdminOperationResult>;
+  restoreLicense(input: BaseRequest): Promise<AdminOperationResult>;
+  getLicense(licenseId: string): Promise<LicenseStatusView | undefined>;
+  getOperation(operationId: string): Promise<Record<string, unknown> | undefined>;
+  listAudit(licenseId: string, limit?: number): Promise<Array<Record<string, unknown>>>;
+  close(): Promise<void>;
+}
+
+export async function createAdminService(policyFile?: string): Promise<AdminService> {
+  const session = await openAdminSession(policyFile);
+  return {
+    createLicense: (input) => insertFinalLicenseOperation(session, input),
+    issueActivationCode: (input) => issueActivationCode(session, input),
+    renewLicense: (input) => renewLicense(session, input),
+    revokeLicense: (input) => changeStatus(session, 'license_revoke', input),
+    restoreLicense: (input) => changeStatus(session, 'license_restore', input),
+    async getLicense(licenseId) {
+      ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
+      const license = await session.db.selectFrom('licenses').selectAll().where('id', '=', licenseId).executeTakeFirst();
+      if (!license) return undefined;
+      const activations = await session.db.selectFrom('license_activations').selectAll()
+        .where('license_id', '=', licenseId).orderBy('generation', 'desc').execute();
+      const codes = await session.db.selectFrom('activation_codes')
+        .select(['id', 'created_at', 'expires_at', 'consumed_at', 'revoked_at'])
+        .where('license_id', '=', licenseId).orderBy('created_at', 'desc').execute();
+      const now = await databaseNow(session.db);
+      return {
+        license: {
+          id: license.id,
+          account_id: license.account_id,
+          plan: license.plan,
+          billing_anchor_utc: license.billing_anchor_utc.toISOString(),
+          anchor_day: license.anchor_day,
+          confirmed_subscription_end: license.confirmed_subscription_end.toISOString(),
+          status: license.status,
+          current_generation: license.current_generation.toString(),
+          entitlement_revision: license.entitlement_revision.toString(),
+          revision: license.revision.toString(),
+          created_at: license.created_at.toISOString(),
+          updated_at: license.updated_at.toISOString(),
+        },
+        activations: activations.map((activation) => ({
+          id: activation.id,
+          generation: activation.generation.toString(),
+          instance_id: activation.instance_id,
+          database_id: activation.database_id,
+          identity_jkt: activation.identity_jkt,
+          state: activation.state,
+          activated_at: activation.activated_at.toISOString(),
+          retired_at: activation.retired_at?.toISOString() ?? null,
+          last_seen_at: activation.last_seen_at.toISOString(),
+          origin_display: activation.origin_display,
+        })),
+        activationCodes: codes.map((code) => ({
+          id: code.id,
+          created_at: code.created_at.toISOString(),
+          expires_at: code.expires_at.toISOString(),
+          consumed_at: code.consumed_at?.toISOString() ?? null,
+          revoked_at: code.revoked_at?.toISOString() ?? null,
+          status: code.consumed_at ? 'consumed' as const : code.revoked_at ? 'revoked' as const : code.expires_at.getTime() <= now.getTime() ? 'expired' as const : 'issued' as const,
+        })),
+      };
+    },
+    async getOperation(operationId) {
+      ensureUuid(operationId, 'ADMIN_OPERATION_ID_INVALID');
+      const operation = await session.db.selectFrom('license_admin_operations').selectAll()
+        .where('operation_id', '=', operationId).executeTakeFirst();
+      if (!operation) return undefined;
+      const [adminAudits, licenseAudits, entitlementEvents] = await Promise.all([
+        session.db.selectFrom('license_admin_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
+        session.db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute(),
+        session.db.selectFrom('entitlement_events').selectAll()
+          .where('external_event_id', '=', `admin:${operationId}`).execute(),
+      ]);
+      return {
+        operation: mapOperation(operation, false),
+        actor: { os_uid: operation.actor_os_uid, os_username: operation.actor_os_username, database_role: operation.actor_database_role },
+        reason: operation.reason,
+        expected_revision: operation.expected_revision.toString(),
+        result: operation.result,
+        admin_audit_events: adminAudits,
+        license_audit_events: licenseAudits,
+        entitlement_events: entitlementEvents,
+      };
+    },
+    async listAudit(licenseId, limit = 50) {
+      ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AdminOperationError('ADMIN_AUDIT_LIMIT_INVALID');
+      return session.db.selectFrom('license_admin_audit_events').selectAll()
+        .where('license_id', '=', licenseId).orderBy('created_at', 'desc').limit(limit).execute() as Promise<Array<Record<string, unknown>>>;
+    },
+    close: () => session.close(),
+  };
+}

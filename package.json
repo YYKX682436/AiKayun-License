@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "admin": "tsx src/admin/cli.ts",
     "keygen": "tsx src/crypto/keygen.ts"
   },
   "dependencies": {

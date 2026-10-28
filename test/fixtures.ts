@@ -43,7 +43,7 @@ export async function createActivationCode(db: Kysely<Database>, licenseId: stri
   const tokenHash = createHash('sha256').update(code).digest('base64url');
   await db.insertInto('activation_codes').values({
     id: randomUUID(), license_id: licenseId, token_hash: tokenHash,
-    expires_at: new Date(now.getTime() + 24 * 60 * 60 * 1000), consumed_at: null, created_at: now,
+    expires_at: new Date(now.getTime() + 24 * 60 * 60 * 1000), consumed_at: null, revoked_at: null, created_at: now,
   }).execute();
   return { code, tokenHash };
 }

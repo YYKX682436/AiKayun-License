@@ -2,7 +2,7 @@
 
 这是独立私有的授权中心仓库，按 AiKayun ⑦-1A R3 最终协议实现 ⑦-1B-1 的服务端基础闭环。服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。
 
-当前仓库不依赖商城进程或商城数据库。它只提供本轮约定的挑战、首次激活、lease 续签/恢复和操作查询/继续接口；没有商城客户端、经营门禁、支付接入、授权管理网页或生产部署配置。
+当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复和实例操作查询/继续接口，并为隔离测试与受控开发运维提供本机管理 CLI。没有商城客户端、经营门禁、支付接入、公网管理 API、MFA 管理面或生产部署配置。
 
 ## 本地隔离运行
 
@@ -50,7 +50,13 @@ npm test
 LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/license_center_test npm run test:integration
 ```
 
-`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对本地真实 PostgreSQL 18 执行迁移，以真实 TLS HTTP 服务发送 RFC 9421 请求；测试中的激活码、许可证、权益事件、私钥和证书均为临时数据，不使用商户或商业授权凭据。完整验收记录见 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)。
+`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对本地真实 PostgreSQL 18 执行迁移，以真实 TLS HTTP 服务发送 RFC 9421 请求；测试中的激活码、许可证、权益事件、私钥和证书均为临时数据，不使用商户或商业授权凭据。基线验收见 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)，本轮管理内核交付及验收记录见 [`docs/acceptance-7-1b-2a.md`](docs/acceptance-7-1b-2a.md)。
+
+## 本机管理 CLI（隔离环境）
+
+CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工确认续费、撤销/恢复，以及查询管理操作与审计。它要求受保护策略文件中的本机 UID allowlist 和独立 PostgreSQL `session_user`，仅连接 loopback 数据库；写命令先生成请求摘要供人工复核，再以相同摘要确认。激活码明文只在首次成功发码且 stdout 为 TTY 时显示一次。完整权限边界、策略样例与操作步骤见 [`docs/admin-cli.md`](docs/admin-cli.md)。
+
+本 CLI 仅用于隔离测试与受控开发运维；`NODE_ENV=production` 时拒绝启动。当前没有管理员 MFA，也没有公网管理入口，不符合正式生产远程管理安全标准。它不接收付款，也不能把命令备注当作身份认证。
 
 ## 服务接口
 
@@ -79,4 +85,4 @@ LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/li
 
 ## 后续阶段边界
 
-本轮未实现商业授权管理后台、支付事件接入、取消接口、实例替换/迁移、灾难迁移、商城本地凭证投影、time-reset、密钥轮换、灾难恢复迁移或生产部署。这里的单一 `001_core` 迁移仅建立本轮核心数据结构；后续上线前仍需专门完成正式密钥管理、证书/域名与代理互操作、管理面授权审计、备份恢复、运维演练和部署安全审查。
+本轮未实现商业授权管理网页/公网管理 API、MFA、支付事件接入、取消接口、实例替换/迁移、灾难迁移、商城本地凭证投影、time-reset、密钥轮换、灾难恢复迁移或生产部署。管理 CLI 被硬性限制在非 production 环境和 loopback 数据库；这不构成正式生产管理员认证。`002_admin_operations` 为现有 `001_core` 追加管理员操作与不可变审计表及激活码作废状态。后续上线前仍需专门完成强认证/MFA、正式密钥管理、证书/域名与代理互操作、最小数据库角色、备份恢复、运维演练和部署安全审查。

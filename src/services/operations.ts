@@ -394,7 +394,7 @@ async function insertSuccessfulActivation(
     now,
   });
   const consumed = await trx.updateTable('activation_codes').set({ consumed_at: now })
-    .where('id', '=', code.id).where('consumed_at', 'is', null).where('expires_at', '>', now)
+    .where('id', '=', code.id).where('consumed_at', 'is', null).where('revoked_at', 'is', null).where('expires_at', '>', now)
     .returning('id').executeTakeFirst();
   if (!consumed) throw new LicenseApiError(409, 'ACTIVATION_CODE_UNAVAILABLE');
   const activationId = randomUUID();
@@ -491,7 +491,7 @@ export async function processActivation(
     const codeHash = sha256Base64url(input.activation_code);
     const code = await trx.selectFrom('activation_codes').selectAll()
       .where('token_hash', '=', codeHash).forUpdate().executeTakeFirst();
-    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.expires_at.getTime() <= now.getTime()) {
+    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.revoked_at !== null || code.expires_at.getTime() <= now.getTime()) {
       const token = await terminalOperationReceipt(trx, config, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'ACTIVATION_CODE_INVALID', responseType: 'operation',
