@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { sql, type Kysely } from 'kysely';
-import { decodeJwt, jwtVerify } from 'jose';
+import { decodeJwt, decodeProtectedHeader, jwtVerify } from 'jose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
@@ -9,6 +9,9 @@ import type { Database } from '../../src/db/types.js';
 import { activationIntentDigest, renewalIntentDigest } from '../../src/intent.js';
 import { applyConfirmedRenewal } from '../../src/services/entitlements.js';
 import { createActivationCode, createExpiredActivationFixture, createLicense, getDbNow } from '../fixtures.js';
+import { loadTrustedSigningContext } from '../../src/crypto/signing-authority.js';
+import { verifyTypedJwt } from '../../src/crypto/jwt.js';
+import { publishAndRotateTo } from '../support/signing-rotation.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
 import {
@@ -233,7 +236,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
     await runtime.initializeAuthority(db);
-    server = await startAppServer(createApp({ config: runtime.config, db }));
+    server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
   });
 
   afterAll(async () => {
@@ -584,7 +587,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       config: runtime.config,
       db,
       challengeNow: async () => new Date(Date.now() - 10 * 60 * 1000),
-    }));
+    }), runtime.config);
     const oldServer = await oldIssuer;
     const staleAttempt = await activationAttempt(prepared, 1, 'activation', oldServer);
     const continued = await sendContinue(prepared, 2);
@@ -608,7 +611,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       config: runtime.config,
       db,
       challengeNow: async () => new Date(Date.now() - 26 * 60 * 60 * 1000),
-    }));
+    }), runtime.config);
     const oldServer = await oldIssuer;
     try {
       const staleAttempt = await activationAttempt(prepared, 1, 'activation', oldServer);
@@ -808,6 +811,16 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
   });
 
   it('drops the PostgreSQL COMMIT acknowledgement and recovers the durable result by the same operation', async () => {
+    const previous = { db, server, runtime };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    try {
     const prepared = await prepareActivation();
     const proxy = new CommitAckDropProxy();
     const database = new URL(runtime.config.databaseUrl);
@@ -816,7 +829,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     proxyUrl.port = String(proxy.port);
     proxyUrl.searchParams.set('sslmode', 'disable');
     const proxyDb = createDatabase(proxyUrl.toString(), 4);
-    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
+    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }), runtime.config);
     try {
       const attempt = await activationAttempt(prepared, 1, 'activation', proxyServer);
       const commitDropped = proxy.armNextCommitAckDrop(1);
@@ -830,20 +843,43 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       const durable = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).executeTakeFirstOrThrow();
       expect(durable.state).toBe('committed');
       expect(durable.response_type).toBe('license');
+      expect(decodeProtectedHeader(durable.response_jws!)['kid']).toBe(runtime.onlineKey.kid);
       await proxyServer.stop();
       await proxyDb.destroy();
 
+      const b = await runtime.createOnlineKey();
+      await publishAndRotateTo(db, runtime, b, '2');
       const continued = await sendContinue(prepared, 2);
       expect(continued.status).toBe(200);
-      const receipt = await verifyCenterJwt(continued.json['operation_receipt'] as string, runtime);
-      expect(receipt.payload['state']).toBe('committed');
-      expect(receipt.payload['result_jws']).toBe(durable.response_jws);
+      const trusted = (await loadTrustedSigningContext(db, runtime.config)).context;
+      const operationReceiptToken = continued.json['operation_receipt'] as string;
+      const operationReceipt = await verifyTypedJwt(operationReceiptToken, {
+        ...trusted, typ: 'aikayun-license-operation+jwt', audience: 'aikayun-commerce',
+        now: new Date(trusted.trustedTime * 1000), requiredClaims: Object.keys(decodeJwt(operationReceiptToken)),
+      });
+      expect(decodeProtectedHeader(operationReceiptToken)['kid']).toBe(b.kid);
+      expect(operationReceipt.claims['state']).toBe('committed');
+      expect(operationReceipt.claims['result_jws']).toBe(durable.response_jws);
+      const originalLease = await verifyTypedJwt(durable.response_jws!, {
+        ...trusted, typ: 'aikayun-license+jwt', audience: 'aikayun-commerce',
+        now: new Date(trusted.trustedTime * 1000), requiredClaims: Object.keys(decodeJwt(durable.response_jws!)),
+      });
+      expect(decodeProtectedHeader(durable.response_jws!)['kid']).toBe(runtime.onlineKey.kid);
+      expect(originalLease.claims['activation_generation']).toBe('1');
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', prepared.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('1');
       expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).consumed_at).toBeInstanceOf(Date);
     } finally {
       await proxyServer.stop().catch(() => undefined);
       await proxyDb.destroy().catch(() => undefined);
       await proxy.stop();
+    }
+    } finally {
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
     }
   });
 

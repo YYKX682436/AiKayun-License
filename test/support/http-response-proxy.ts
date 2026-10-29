@@ -1,6 +1,7 @@
 import type { ClientRequest } from 'node:http';
 import { createServer, request as httpsRequest, type Server as HttpsServer } from 'node:https';
 import type { Socket } from 'node:net';
+import { registerTestHttpsEndpoint } from './http.js';
 
 export class HttpResponseDropProxy {
   private server?: HttpsServer;
@@ -11,12 +12,12 @@ export class HttpResponseDropProxy {
   private readonly requests = new Set<ClientRequest>();
   public port = 0;
 
-  async start(targetPort: number, key: Buffer, cert: Buffer): Promise<void> {
+  async start(targetPort: number, key: Buffer, cert: Buffer, servername = 'license.example.test'): Promise<void> {
     this.server = createServer({ key, cert }, (clientRequest, clientResponse) => {
       const clientSocket = clientRequest.socket;
       const upstream = httpsRequest({
         hostname: '127.0.0.1', port: targetPort, method: clientRequest.method,
-        path: clientRequest.url, headers: clientRequest.headers, rejectUnauthorized: false,
+        path: clientRequest.url, headers: clientRequest.headers, ca: cert, servername, rejectUnauthorized: true,
       }, (upstreamResponse) => {
         if (this.armed) {
           this.armed = false;
@@ -42,6 +43,7 @@ export class HttpResponseDropProxy {
       this.server!.listen(0, '127.0.0.1', () => resolve());
     });
     this.port = (this.server.address() as { port: number }).port;
+    registerTestHttpsEndpoint(this.port, cert, servername);
   }
 
   armNextResponseDrop(): Promise<void> {

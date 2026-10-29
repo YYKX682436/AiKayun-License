@@ -316,7 +316,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
     await runtime.initializeAuthority(db);
-    server = await startAppServer(createApp({ config: runtime.config, db }));
+    server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-transfer-'));
     await chmod(scratchDirectory, 0o700);
     policyFile = await writeAdminPolicy(runtime.config.databaseUrl);
@@ -665,7 +665,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
     await migrateToLatest(isolatedDb);
     await isolatedRuntime.initializeAuthority(isolatedDb);
-    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }));
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
     const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
     const isolatedAdmin = await createAdminService(isolatedPolicy);
     db = isolatedDb;
@@ -676,6 +676,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     try {
     const active = await activate();
     const prepared = await prepare(active);
+    const staleACommit = await makeCommitAttempt(prepared);
     const originalPrepare = await db.selectFrom('license_operations').selectAll()
       .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow();
     const planId = decodeJwt(prepared.ticket)['plan_id'] as string;
@@ -707,6 +708,14 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       reason: 'signing_key_revoked_or_retired', signer_kid: runtime.onlineKey.kid,
     });
     expect(originalPrepare.response_jws).toBe(prepared.ticket);
+
+    const staleChallengeCommit = await sendCommit(staleACommit.attempt, prepared.target);
+    expect(staleChallengeCommit.status).toBe(401);
+    expect(staleChallengeCommit.json['error']).toEqual({ code: 'CHALLENGE_INVALID' });
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', staleACommit.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', staleACommit.operationId).execute()).toHaveLength(0);
+    expect((await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', sha256(staleACommit.attempt.nonce))
+      .executeTakeFirstOrThrow()).consumed_at).toBeNull();
 
     const lateCommit = await commit(prepared);
     expect(lateCommit.response.status).toBe(401);
@@ -1122,6 +1131,20 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
   });
 
   it('recovers committed transfer after a dropped HTTP response and resolves a PostgreSQL COMMIT acknowledgement loss by operation query', async () => {
+    const previous = { db, server, runtime, admin, policyFile };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
+    const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
+    const isolatedAdmin = await createAdminService(isolatedPolicy);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    admin = isolatedAdmin;
+    policyFile = isolatedPolicy;
+    try {
     const active = await activate();
     const prepared = await prepare(active);
     const httpProxy = new HttpResponseDropProxy();
@@ -1152,7 +1175,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     proxyUrl.port = String(pgProxy.port);
     proxyUrl.searchParams.set('sslmode', 'disable');
     const proxyDb = createDatabase(proxyUrl.toString(), 4);
-    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
+    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }), runtime.config);
     try {
       const commitAttempt = await makeCommitAttempt(prepared2, { requestServer: proxyServer });
       const droppedAck = pgProxy.armNextCommitAckDrop(1);
@@ -1163,19 +1186,37 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       expect(committedRow.state).toBe('committed');
       expect((await db.selectFrom('license_activations').selectAll().where('license_id', '=', active2.licenseId).where('state', '=', 'active').execute()))
         .toMatchObject([expect.objectContaining({ identity_jkt: prepared2.target.jkt, generation: '2' })]);
+      expect(decodeProtectedHeader(committedRow.response_jws!)['kid']).toBe(runtime.onlineKey.kid);
       await proxyServer.stop();
       await proxyDb.destroy();
+      const b = await runtime.createOnlineKey();
+      await publishAndRotateTo(db, runtime, b, '2');
       const query = await queryOperation(prepared2, commitAttempt.operationId, commitAttempt.intentDigest, 2);
       expect(query.status).toBe(200);
-      expect((await verifyCenterJwt(query.json['operation_receipt'] as string)).payload['result_jws']).toBe(committedRow.response_jws);
+      const queryReceipt = await verifyCenterJwt(query.json['operation_receipt'] as string);
+      expect(queryReceipt.protectedHeader['kid']).toBe(b.kid);
+      expect(queryReceipt.payload['result_jws']).toBe(committedRow.response_jws);
       const replay = await commit(prepared2, { operationId: commitAttempt.operationId, attemptNo: 3 });
       expect(replay.response.status).toBe(200);
       expect(replay.response.json['transfer_receipt']).toBe(committedRow.response_jws);
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', active2.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('2');
+      expect((await db.selectFrom('license_signer_authority').select('active_signing_kid')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()).active_signing_kid).toBe(b.kid);
     } finally {
       await proxyServer.stop().catch(() => undefined);
       await proxyDb.destroy().catch(() => undefined);
       await pgProxy.stop();
+    }
+    } finally {
+      await isolatedAdmin.close();
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
+      admin = previous.admin;
+      policyFile = previous.policyFile;
     }
   });
 
@@ -1378,6 +1419,147 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     expect(staleReplay.status).toBe(403);
     expect(staleReplay.json['error']).toEqual({ code: 'TIME_RESET_INSTANCE_BINDING_MISMATCH' });
     expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', resetOperationId).execute()).toHaveLength(1);
+  });
+
+  it('serializes an approved time reset against normal migration in both PostgreSQL lock orders', async () => {
+    async function createResetAttempt(active: ActiveSource) {
+      const activation = await db.selectFrom('license_activations').selectAll()
+        .where('license_id', '=', active.licenseId).where('state', '=', 'active').executeTakeFirstOrThrow();
+      const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const approvalId = randomUUID();
+      const operationId = randomUUID();
+      const oldWatermarkDigest = randomBytes(32).toString('base64url');
+      const generation = activation.generation.toString();
+      const revision = license.revision.toString();
+      const entitlementRevision = license.entitlement_revision.toString();
+      const expectedTimeEpoch = activation.time_epoch.toString();
+      const intentDigest = timeResetIntentDigest({
+        operationId, approvalId, licenseId: active.licenseId, databaseId: active.databaseId,
+        instanceId: active.instanceId, identityJkt: active.source.jkt, activationId: activation.id,
+        activationGeneration: generation, expectedRevision: revision, entitlementRevision,
+        expectedTimeEpoch, oldWatermarkDigest,
+      });
+      const request = {
+        operationId: approvalId, licenseId: active.licenseId, expectedRevision: revision,
+        reason: '联合验收：旧 generation 的一次性可信校时授权', activationId: activation.id,
+        databaseId: active.databaseId, instanceId: active.instanceId, identityJkt: active.source.jkt,
+        activationGeneration: generation, entitlementRevision, expectedTimeEpoch,
+        resetOperationId: operationId, intentDigest, oldWatermarkDigest,
+      };
+      const approval = await admin.approveTimeReset({
+        ...request, confirmedRequestDigest: approveTimeResetRequestDigest(request),
+      });
+      expect(approval.state).toBe('succeeded');
+      const challenge = await requestChallenge({
+        port: server.port, config: runtime.config, identity: active.source, operation: 'time_reset',
+        operationId, intentDigest, instanceId: active.instanceId,
+      });
+      const body = {
+        ...buildChallengeBoundBody({
+          challenge: challenge.token, operationId, intentDigest, attemptNo: 1,
+          instanceId: active.instanceId, identity: active.source, licenseId: active.licenseId, databaseId: active.databaseId,
+        }),
+        activation_id: activation.id, approval_id: approvalId, expected_generation: generation,
+        expected_revision: revision, expected_entitlement_revision: entitlementRevision,
+        expected_time_epoch: expectedTimeEpoch, old_watermark_digest: oldWatermarkDigest,
+      };
+      return { approvalId, operationId, body, nonce: challengeNonce(challenge.token), initialLicense: license };
+    }
+
+    async function lockApprovalRow(approvalId: string) {
+      let release!: () => void;
+      let acquired!: () => void;
+      const acquiredPromise = new Promise<void>((resolve) => { acquired = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('license_time_reset_approvals').select('approval_id')
+          .where('approval_id', '=', approvalId).forUpdate().executeTakeFirstOrThrow();
+        acquired();
+        await released;
+      });
+      await acquiredPromise;
+      return { release, blocker };
+    }
+
+    async function lockPlanRow(planId: string) {
+      let release!: () => void;
+      let acquired!: () => void;
+      const acquiredPromise = new Promise<void>((resolve) => { acquired = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('license_transfer_plans').select('plan_id')
+          .where('plan_id', '=', planId).forUpdate().executeTakeFirstOrThrow();
+        acquired();
+        await released;
+      });
+      await acquiredPromise;
+      return { release, blocker };
+    }
+
+    const resetFirst = await activate();
+    const resetFirstPrepared = await prepare(resetFirst);
+    const resetFirstApproval = await createResetAttempt(resetFirst);
+    const resetFirstCommit = await makeCommitAttempt(resetFirstPrepared);
+    const approvalBarrier = await lockApprovalRow(resetFirstApproval.approvalId);
+    const resetFirstRequest = signPost({
+      port: server.port, origin: runtime.config.publicOrigin, path: '/v1/time-resets/commit',
+      body: resetFirstApproval.body, identity: resetFirst.source, nonce: resetFirstApproval.nonce,
+    });
+    await waitForLicenseRowWaiters(db, 1);
+    const resetFirstTransfer = sendCommit(resetFirstCommit.attempt, resetFirstPrepared.target);
+    await waitForLicenseRowWaiters(db, 2);
+    approvalBarrier.release();
+    await approvalBarrier.blocker;
+    const [resetResponse, transferResponse] = await Promise.all([resetFirstRequest, resetFirstTransfer]);
+    expect(resetResponse.status).toBe(200);
+    expect(transferResponse.status).toBe(200);
+    expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', resetFirstApproval.operationId)
+      .executeTakeFirstOrThrow()).state).toBe('committed');
+    const firstLicense = await db.selectFrom('licenses').selectAll().where('id', '=', resetFirst.licenseId).executeTakeFirstOrThrow();
+    expect(firstLicense.current_generation).toBe('2');
+    expect(firstLicense.revision).toBe(decimalPlusOne(resetFirstApproval.initialLicense.revision.toString()));
+    expect(firstLicense.entitlement_revision).toBe(resetFirstApproval.initialLicense.entitlement_revision);
+    expect(firstLicense.confirmed_subscription_end).toEqual(resetFirstApproval.initialLicense.confirmed_subscription_end);
+    const firstActivations = await db.selectFrom('license_activations').selectAll().where('license_id', '=', resetFirst.licenseId)
+      .orderBy('generation', 'asc').execute();
+    expect(firstActivations).toHaveLength(2);
+    expect(firstActivations[0]).toMatchObject({ state: 'retired', generation: '1', time_epoch: '1', identity_jkt: resetFirst.source.jkt });
+    expect(firstActivations[1]).toMatchObject({ state: 'active', generation: '2', time_epoch: '0', identity_jkt: resetFirstPrepared.target.jkt,
+      database_id: resetFirst.databaseId });
+    expect((await db.selectFrom('license_transfer_plans').selectAll()
+      .where('prepare_operation_id', '=', resetFirstPrepared.prepareOperationId).executeTakeFirstOrThrow()).state).toBe('committed');
+
+    const transferFirst = await activate();
+    const transferFirstPrepared = await prepare(transferFirst);
+    const transferFirstApproval = await createResetAttempt(transferFirst);
+    const transferFirstCommit = await makeCommitAttempt(transferFirstPrepared);
+    const transferPlanId = decodeJwt(transferFirstPrepared.ticket)['plan_id'] as string;
+    const planBarrier = await lockPlanRow(transferPlanId);
+    const transferFirstRequest = sendCommit(transferFirstCommit.attempt, transferFirstPrepared.target);
+    await waitForLicenseRowWaiters(db, 1);
+    const lateResetRequest = signPost({
+      port: server.port, origin: runtime.config.publicOrigin, path: '/v1/time-resets/commit',
+      body: transferFirstApproval.body, identity: transferFirst.source, nonce: transferFirstApproval.nonce,
+    });
+    await waitForLicenseRowWaiters(db, 2);
+    planBarrier.release();
+    await planBarrier.blocker;
+    const [winningTransfer, staleReset] = await Promise.all([transferFirstRequest, lateResetRequest]);
+    expect(winningTransfer.status).toBe(200);
+    expect(staleReset.status).toBe(403);
+    expect(staleReset.json['error']).toEqual({ code: 'TIME_RESET_INSTANCE_BINDING_MISMATCH' });
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', transferFirstApproval.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', transferFirstApproval.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_time_reset_events').selectAll().where('operation_id', '=', transferFirstApproval.operationId).execute())
+      .toMatchObject([expect.objectContaining({ kind: 'approved' })]);
+    expect((await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', sha256(transferFirstApproval.nonce))
+      .executeTakeFirstOrThrow()).consumed_at).toBeNull();
+    const finalLicense = await db.selectFrom('licenses').selectAll().where('id', '=', transferFirst.licenseId).executeTakeFirstOrThrow();
+    expect(finalLicense.current_generation).toBe('2');
+    const activeAfterTransfer = await db.selectFrom('license_activations').selectAll().where('license_id', '=', transferFirst.licenseId)
+      .where('state', '=', 'active').executeTakeFirstOrThrow();
+    expect(activeAfterTransfer).toMatchObject({ generation: '2', time_epoch: '0',
+      identity_jkt: transferFirstPrepared.target.jkt, database_id: transferFirst.databaseId });
   });
 
   it('rejects a normal transfer Commit after its approval expires while the prepared ticket is still fresh', async () => {

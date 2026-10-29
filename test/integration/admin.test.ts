@@ -15,7 +15,7 @@ import { activationIntentDigest, renewalIntentDigest } from '../../src/intent.js
 import { addCalendarPeriod } from '../../src/entitlements/calendar.js';
 import { createActivationCode, createExpiredActivationFixture, createLicense, getDbNow } from '../fixtures.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
-import { buildChallengeBoundBody, requestChallenge, signPost, startAppServer, type RunningTestServer } from '../support/http.js';
+import { buildChallengeBoundBody, requestChallenge, signPost, startAppServer, testHttpsOptions, type RunningTestServer } from '../support/http.js';
 import { createIdentity, createTestSigningRuntime, type TestIdentity, type TestSigningRuntime } from '../support/runtime.js';
 
 interface ActivatedLicense {
@@ -192,7 +192,7 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
     db = createDatabase(databaseUrl, 24);
     await migrateToLatest(db);
     await runtime.initializeAuthority(db);
-    server = await startAppServer(createApp({ config: runtime.config, db }));
+    server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     service = await createAdminService(policyFile);
   });
 
@@ -582,7 +582,7 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
     const noAdminRoute = await new Promise<number>((resolve, reject) => {
       const request = httpsRequest({
         host: '127.0.0.1', port: server.port, path: '/v1/admin/licenses', method: 'POST',
-        rejectUnauthorized: false, headers: { 'content-type': 'application/json' },
+        ...testHttpsOptions(server.port), headers: { 'content-type': 'application/json' },
       }, (response) => {
         response.resume();
         response.on('end', () => resolve(response.statusCode ?? 0));

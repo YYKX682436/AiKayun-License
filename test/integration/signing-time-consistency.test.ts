@@ -56,7 +56,7 @@ async function boot(retireAfter?: number): Promise<TestSystem & { record: TestSi
     rolloutGate: 'isolated-development-confirmed',
     confirmedRequestDigest: initializeSignerRequestDigest(initial),
   });
-  const server = await startAppServer(createApp({ config: runtime.config, db }));
+  const server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
   return { runtime, db, server, record };
 }
 
@@ -236,7 +236,7 @@ describe('signing time and key-lifecycle consistency', () => {
   it('rejects a challenge when its signed HTTP request expires while queued on the signer lock', async () => {
     const system = await boot();
     const staleChallengeClock = async () => new Date(Date.now() - 10 * 60 * 1000);
-    const server = await startAppServer(createApp({ config: system.runtime.config, db: system.db, challengeNow: staleChallengeClock }));
+    const server = await startAppServer(createApp({ config: system.runtime.config, db: system.db, challengeNow: staleChallengeClock }), system.runtime.config);
     try {
       const identity = await createIdentity();
       const operationId = randomUUID();

@@ -1,8 +1,8 @@
 # 艾卡云独立授权中心
 
-这是独立私有的授权中心仓库，服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。⑦-1B-2B-1实现授权中心正常迁移；⑦-1B-2B-2追加来源私钥不可用时的受控灾难迁移。⑦-1B-2C-1实现中心时间锚和受审 time-reset；⑦-1B-2C-2增加独立离线根签名信任包、公钥生命周期选择和本地单调版本存储，但没有切换中心当前签名 key 或生成生产离线根。详见 [`docs/trust-bundle-7-1b-2c-2.md`](docs/trust-bundle-7-1b-2c-2.md) 与对应验收记录。
+这是独立运行的授权中心仓库，服务使用 Node.js 24、TypeScript、Fastify 5、PostgreSQL 18、Kysely、`jose` 和 RFC 9421/9530 HTTP Message Signatures 实现。**截至 2026-10-29，GitHub 仓库可见性为 Public**，与正式闭源商业发行目标冲突；本轮没有改变可见性，商业发行前必须处理该风险。⑦-1B-2B-1实现正常迁移，⑦-1B-2B-2实现受控灾难迁移；⑦-1B-2C-1实现中心时间锚和受审 time-reset；⑦-1B-2C-2实现离线根签名信任包、公钥生命周期和本地单调版本存储；⑦-1B-2C-3实现隔离环境 PostgreSQL signer authority 与受控 A→B 轮换；⑦-1B-2C-4完成全局联合安全验收。2C-3/2C-4不代表已生成生产发行根或完成商城客户端接入。详见 [`docs/signing-key-rotation-7-1b-2c-3.md`](docs/signing-key-rotation-7-1b-2c-3.md)、[`docs/acceptance-7-1b-2c-3.md`](docs/acceptance-7-1b-2c-3.md)、[`docs/acceptance-7-1b-2c-4.md`](docs/acceptance-7-1b-2c-4.md) 与 [`docs/license-client-handoff-7-1b-2c-4.md`](docs/license-client-handoff-7-1b-2c-4.md)。
 
-当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复、实例操作查询/继续、正常和灾难迁移 prepare/commit 接口、可信时间引导内核、信任包离线签发与验证，以及隔离测试与受控开发运维用的本机管理 CLI。灾难回执在权益已过期或 revoked 时仅证明身份重绑，不包含经营 grants 或新 lease。商城客户端的根信任配置、联网时间引导、持久化组件接入、密钥轮换、签名回执投影、安装器和真实切流尚未实现。
+当前仓库不依赖商城进程或商城数据库。它提供挑战、首次激活、lease 续签/恢复、实例操作查询/继续、正常和灾难迁移 prepare/commit、time-anchor/time-reset、离线信任包签发/验证及数据库权威 signer 轮换。灾难回执在权益已过期或 revoked 时仅证明身份重绑，不包含经营 grants 或新 lease。商城客户端的生产 root pin/minimum bundle、联网信任更新与时间引导、持久化 pending/projection/journal、密钥轮换接入、签名回执投影、经营准入、安装器和真实切流尚未实现。正式发行根、bundle 发布传播与客户确认也未建立。
 
 ## 本地隔离运行
 
@@ -48,9 +48,10 @@ npm run typecheck
 npm run build
 npm test
 LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/license_center_test npm run test:integration
+npm audit --audit-level=low
 ```
 
-`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对本地真实 PostgreSQL 18 执行迁移，以真实 TLS HTTP 服务发送 RFC 9421 请求；测试中的激活码、许可证、权益事件、私钥和证书均为临时数据，不使用商户或商业授权凭据。历次验收见 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)、[`docs/acceptance-7-1b-2a.md`](docs/acceptance-7-1b-2a.md)、迁移验收、[`docs/acceptance-7-1b-2c-1.md`](docs/acceptance-7-1b-2c-1.md) 与 [`docs/acceptance-7-1b-2c-2.md`](docs/acceptance-7-1b-2c-2.md)。
+`npm test` 使用 RFC 发布向量和临时 Ed25519/TLS 测试密钥。集成套件对隔离 PostgreSQL 18 执行迁移，以 TLS 验证开启的 HTTPS 服务发送 RFC 9421 请求；测试许可证、权益事件、私钥和证书均为临时数据，不使用客户或商业授权凭据。历次验收记录包括 [`docs/acceptance-7-1b-1.md`](docs/acceptance-7-1b-1.md)、[`docs/acceptance-7-1b-2a.md`](docs/acceptance-7-1b-2a.md)、[`docs/acceptance-7-1b-2c-1.md`](docs/acceptance-7-1b-2c-1.md)、[`docs/acceptance-7-1b-2c-2.md`](docs/acceptance-7-1b-2c-2.md)、2B 迁移验收、[`docs/acceptance-7-1b-2c-3.md`](docs/acceptance-7-1b-2c-3.md) 和 [`docs/acceptance-7-1b-2c-4.md`](docs/acceptance-7-1b-2c-4.md)。
 
 ## 本机管理 CLI（隔离环境）
 
@@ -65,6 +66,7 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 实现的接口为：
 
 - `POST /v1/challenges`
+- `POST /v1/time-anchor`
 - `POST /v1/activations`
 - `POST /v1/leases/renew`
 - `POST /v1/operations/query`
@@ -73,6 +75,7 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 - `POST /v1/transfers/commit`（目标新身份签名）
 - `POST /v1/disaster-transfers/prepare`（审批指定的目标新身份签名）
 - `POST /v1/disaster-transfers/commit`（目标新身份二次持钥签名）
+- `POST /v1/time-resets/commit`（需中心管理员预先审批）
 
 `leases/renew` 只为数据库中已确认且仍有效的权益签发新 lease，也可为原绑定实例恢复最新权益 revision。它不接受客户端申报付款，不修改订阅截止时间。测试夹具会直接在隔离数据库准备许可证、激活码和确认权益事件；服务没有可在生产调用的测试放行或权益发放接口。
 
@@ -89,4 +92,4 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 
 ## 后续阶段边界
 
-本阶段未实现商城本地凭证投影、生产签名 key 轮换、离线根的生产生成/备份/托管、time-anchor 网络客户端、商业授权管理网页/公网管理 API、生产管理员 MFA 或生产部署。`NODE_ENV=production` 下本机管理员 CLI 仍被硬性拒绝。灾难审批中的客户核验、备份内容和旧机隔离均为不可由授权中心自行证明的人工声明；license generation 不等于物理执行隔离。商城客户端必须在受信发行工件中预置根公钥和最低 bundle 版本，并保留 HTTPS/TLS 验证。`001_core` 至 `006_time_reset` 已验收迁移保持原样；本轮不新增迁移。生产密钥生命周期、商城恢复器、备份恢复、运维演练和部署安全审查仍需单独完成。
+中心 signer key 的数据库权威和隔离环境轮换已有实现及验收，但生产 key 配置、MFA/双人审批、受管密钥托管、离线根正式生成/备份、bundle 发布传播与客户确认、商城端 root pin/minimum、time-anchor 网络客户端、商城凭证投影/journal/经营准入、商业授权管理网页/公网管理 API 和生产部署尚未完成。`NODE_ENV=production` 下本机管理员 CLI 仍被硬性拒绝。灾难审批中的客户核验、备份内容和旧机隔离均为不可由授权中心自行证明的人工声明；license generation 不等于物理执行隔离。商城客户端必须在受信发行工件中预置生产根公钥和最低 bundle 版本，并保持 HTTPS/TLS 验证。`001_core` 至 `007_signing_key_rotation` 历史迁移保持原样；本轮没有新增迁移。生产数据库回退恢复、备份恢复、独立时间源监控、TLS 错时引导和真实灾备演练都需单独评估；见 2C-4 验收与客户端交接文档。

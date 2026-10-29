@@ -17,9 +17,26 @@ export interface HttpResponse {
   body: Buffer;
 }
 
-export async function startAppServer(app: { listen(options: { host: string; port: number }): Promise<string>; close(): Promise<void> }): Promise<RunningTestServer> {
+const tlsEndpoints = new Map<number, { ca: Buffer; servername: string }>();
+
+export function registerTestHttpsEndpoint(port: number, ca: Buffer, servername: string): void {
+  tlsEndpoints.set(port, { ca, servername });
+}
+
+export function testHttpsOptions(port: number): { ca: Buffer; servername: string; rejectUnauthorized: true } {
+  const endpoint = tlsEndpoints.get(port);
+  if (!endpoint) throw new Error(`No trusted test TLS certificate registered for port ${port}`);
+  return { ...endpoint, rejectUnauthorized: true };
+}
+
+export async function startAppServer(
+  app: { listen(options: { host: string; port: number }): Promise<string>; close(): Promise<void> },
+  tls: Pick<RuntimeConfig, 'tlsCertificate' | 'publicOrigin'>,
+): Promise<RunningTestServer> {
   const address = await app.listen({ host: '127.0.0.1', port: 0 });
-  return { port: Number(new URL(address).port), stop: () => app.close() };
+  const port = Number(new URL(address).port);
+  registerTestHttpsEndpoint(port, tls.tlsCertificate, new URL(tls.publicOrigin).hostname);
+  return { port, stop: () => app.close() };
 }
 
 export async function signPost(input: {
@@ -70,7 +87,7 @@ export async function signPost(input: {
   return new Promise((resolve, reject) => {
     const request = httpsRequest({
       host: '127.0.0.1', port: input.port, path: input.sendPath ?? input.path, method: 'POST', headers: wireHeaders,
-      rejectUnauthorized: false,
+      ...testHttpsOptions(input.port),
     }, (response) => {
       const chunks: Buffer[] = [];
       response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));

@@ -24,7 +24,7 @@ import type {
   TrustBundleSigningInput,
   TrustedOfflineRootPin,
 } from '../../src/trust/trust-bundle.js';
-import { TrustBundleStore, type TrustStoreWriteStage } from '../../src/trust/trust-bundle-store.js';
+import { createTrustedSigningKeyResolver, TrustBundleStore, type TrustStoreWriteStage } from '../../src/trust/trust-bundle-store.js';
 
 const CENTER_ISSUER = 'https://license.example.test';
 const BASE = 2_000_000_000;
@@ -616,13 +616,17 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const nonce = randomBytes(32).toString('base64url');
     const serverTime = BASE + 5;
     const anchor = await signTimeAnchor(runtime, nonce, new Date(serverTime * 1000));
+    const wallClockBefore = Date.now();
     vi.useFakeTimers();
-    vi.setSystemTime(new Date((serverTime + 5 * 365 * DAY) * 1000));
-    const verified = await verifyTimeAnchorWithTrustBundleCandidate(anchor, {
-      candidate, clientNonce: nonce, roundTripMs: 1_200,
-    });
-    expect(verified.serverTime).toBe(serverTime);
-    expect(verified.clientNonce).toBe(nonce);
+    for (const wallClockOffset of [5 * 365 * DAY, -5 * 365 * DAY]) {
+      vi.setSystemTime(new Date((serverTime + wallClockOffset) * 1000));
+      const verified = await verifyTimeAnchorWithTrustBundleCandidate(anchor, {
+        candidate, clientNonce: nonce, roundTripMs: 1_200,
+      });
+      expect(verified.serverTime).toBe(serverTime);
+      expect(verified.clientNonce).toBe(nonce);
+    }
+    vi.setSystemTime(new Date(wallClockBefore));
     await expect(verifyTimeAnchorWithTrustBundleCandidate(anchor, {
       candidate, clientNonce: randomBytes(32).toString('base64url'), roundTripMs: 1_200,
     })).rejects.toThrow();
@@ -652,12 +656,12 @@ describe('offline-root trust bundle and monotonic key selection', () => {
       resolver: accepted.resolver, issuer: CENTER_ISSUER, now: new Date((BASE + 100) * 1000),
     }))['sub']).toBeTruthy();
 
-    const outsideWindow = await lease({ privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne }, retiredAt + 1);
+    const outsideWindow = await lease({ privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne }, retiredAt);
     await expect(verifyLicenseLeaseWithTrustedKeys(outsideWindow.token, {
       resolver: accepted.resolver, issuer: CENTER_ISSUER, now: new Date((BASE + 100) * 1000),
     })).rejects.toThrow(/issuance window/i);
 
-    const laterTime = verifyUntil + 1;
+    const laterTime = verifyUntil;
     const laterBundle = await bundle({ version: '3', time: laterTime, iat: laterTime - 20, nbf: laterTime - 10, exp: laterTime + 10 * DAY, keys: [oldEntry, newEntry] });
     const laterDirectory = await mkdtemp(join(tmpdir(), 'aikayun-trust-verify-until-'));
     temporaryDirectories.push(laterDirectory);
@@ -665,6 +669,17 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     await expect(verifyLicenseLeaseWithTrustedKeys(oldLease.token, {
       resolver: later.resolver, issuer: CENTER_ISSUER, now: new Date(laterTime * 1000),
     })).rejects.toThrow(/verification-retention/i);
+    const exactBoundaryCandidate = await verifyTrustBundleSignature(laterBundle, { trustedRoot, expectedCenterIssuer: CENTER_ISSUER });
+    const beforeVerifyUntilResolver = createTrustedSigningKeyResolver(exactBoundaryCandidate, { trustedTime: verifyUntil - 1 });
+    await expect(beforeVerifyUntilResolver.resolveKey({
+      kid: centerKidOne, targetIssuer: CENTER_ISSUER, jwtTyp: 'aikayun-license+jwt', audience: 'aikayun-commerce',
+      trustedTime: verifyUntil - 1, issuedAt: retiredAt - 1, expiresAt: verifyUntil,
+    })).resolves.toMatchObject({ verifyUntil });
+    const atVerifyUntilResolver = createTrustedSigningKeyResolver(exactBoundaryCandidate, { trustedTime: verifyUntil });
+    await expect(atVerifyUntilResolver.resolveKey({
+      kid: centerKidOne, targetIssuer: CENTER_ISSUER, jwtTyp: 'aikayun-license+jwt', audience: 'aikayun-commerce',
+      trustedTime: verifyUntil, issuedAt: retiredAt - 1, expiresAt: verifyUntil,
+    })).rejects.toThrow(/retention/i);
   });
 
   it('does not allow a prepublished key to sign before not_before', async () => {
@@ -672,10 +687,16 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const futureKey = await publicEntry(centerPublicOne, centerKidOne, { not_before: BASE + 1 });
     const token = await bundle({ version: '1', time: BASE, keys: [futureKey] });
     const accepted = await (await store()).accept(token, BASE);
+    const candidate = await verifyTrustBundleSignature(token, { trustedRoot, expectedCenterIssuer: CENTER_ISSUER });
     const earlyLease = await lease({ privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne }, BASE);
     await expect(verifyLicenseLeaseWithTrustedKeys(earlyLease.token, {
       resolver: accepted.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
     })).rejects.toThrow(/issuance window/i);
+    const atBoundaryResolver = createTrustedSigningKeyResolver(candidate, { trustedTime: BASE + 1 });
+    await expect(atBoundaryResolver.resolveKey({
+      kid: centerKidOne, targetIssuer: CENTER_ISSUER, jwtTyp: 'aikayun-license+jwt', audience: 'aikayun-commerce',
+      trustedTime: BASE + 1, issuedAt: BASE + 1, expiresAt: BASE + 2,
+    })).resolves.toMatchObject({ verifyUntil: null });
   });
 
   it('requires explicit retirement propagation budget and retains a monotonic revocation tombstone', async () => {

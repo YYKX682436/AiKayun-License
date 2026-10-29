@@ -27,7 +27,7 @@ import type { Database } from '../../src/db/types.js';
 import { createActivationCode, createLicense } from '../fixtures.js';
 import { buildTrustBundleClaims, signTrustBundle } from '../../tools/offline-trust/trust-bundle-signing.js';
 import {
-  buildChallengeBoundBody, requestChallenge, signPost, startAppServer, type RunningTestServer,
+  buildChallengeBoundBody, requestChallenge, signPost, startAppServer, testHttpsOptions, type RunningTestServer,
 } from '../support/http.js';
 import { createIdentity, createTestSigningRuntime, type TestSigningRuntime } from '../support/runtime.js';
 import { waitForAdvisoryLockWaiters } from '../support/pg-waits.js';
@@ -39,7 +39,7 @@ async function postJson(port: number, path: string, value: unknown): Promise<{ s
   const body = Buffer.from(JSON.stringify(value));
   return new Promise((resolve, reject) => {
     const request = httpsRequest({
-      host: '127.0.0.1', port, path, method: 'POST', rejectUnauthorized: false,
+      host: '127.0.0.1', port, path, method: 'POST', ...testHttpsOptions(port),
       headers: { host: 'license.example.test', 'content-type': 'application/json', 'content-length': String(body.byteLength), connection: 'close' },
     }, (response) => {
       const chunks: Buffer[] = [];
@@ -74,8 +74,8 @@ describe('database-authoritative Ed25519 signing rotation', () => {
     db = createDatabase(runtimeA.config.databaseUrl, 16);
     await migrateToLatest(db);
     await runtimeA.initializeAuthority(db);
-    serverA = await startAppServer(createApp({ config: runtimeA.config, db }));
-    serverB = await startAppServer(createApp({ config: runtimeB.config, db }));
+    serverA = await startAppServer(createApp({ config: runtimeA.config, db }), runtimeA.config);
+    serverB = await startAppServer(createApp({ config: runtimeB.config, db }), runtimeB.config);
   });
 
   afterAll(async () => {

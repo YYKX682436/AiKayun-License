@@ -349,7 +349,7 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     db = createDatabase(runtime.config.databaseUrl, 32);
     await migrateToLatest(db);
     await runtime.initializeAuthority(db);
-    server = await startAppServer(createApp({ config: runtime.config, db }));
+    server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-disaster-'));
     await chmod(scratchDirectory, 0o700);
     policyFile = await writeAdminPolicy(runtime.config.databaseUrl);
@@ -531,7 +531,7 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
     await migrateToLatest(isolatedDb);
     await isolatedRuntime.initializeAuthority(isolatedDb);
-    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }));
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
     const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
     const isolatedAdmin = await createAdminService(isolatedPolicy);
     db = isolatedDb;
@@ -1237,7 +1237,7 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     proxyUrl.port = String(proxy.port);
     proxyUrl.searchParams.set('sslmode', 'disable');
     const proxyDb = createDatabase(proxyUrl.toString(), 4);
-    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
+    const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }), runtime.config);
     try {
       const lost = await makeCommitAttempt(prepared2, { challengePort: server.port });
       const ack = proxy.armNextCommitAckDrop(1);
@@ -1582,6 +1582,20 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
   });
 
   it('serializes normal-transfer commit against a disaster approval; no second migration can pass the shared license lock', async () => {
+    const previous = { db, server, runtime, admin, policyFile };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 32);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
+    const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
+    const isolatedAdmin = await createAdminService(isolatedPolicy);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    admin = isolatedAdmin;
+    policyFile = isolatedPolicy;
+    try {
     async function race(disasterApprovalFirst: boolean) {
       const active = await activate();
       const normalTarget = await createIdentity();
@@ -1601,6 +1615,19 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
           attemptNo: 1, instanceId: active.instanceId, identity: normalTarget, licenseId: active.licenseId, databaseId: active.databaseId }),
         approval_id: normal.approval.operationId, prepare_operation_id: normal.operationId, transfer_ticket: normal.ticket,
       };
+      const ticketKid = String(decodeProtectedHeader(normal.ticket)['kid']);
+      let expectedResultKid = (await db.selectFrom('license_signer_authority').select('active_signing_kid')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()).active_signing_kid!;
+      if (disasterApprovalFirst) {
+        expect(ticketKid).toBe(runtime.onlineKey.kid);
+        expect(decodeProtectedHeader(challenge.token)['kid']).toBe(ticketKid);
+        const b = await runtime.createOnlineKey();
+        await publishAndRotateTo(db, runtime, b, '2');
+        expectedResultKid = b.kid;
+      } else {
+        expect(ticketKid).toBe(expectedResultKid);
+        expect(decodeProtectedHeader(challenge.token)['kid']).toBe(ticketKid);
+      }
       // A deterministic barrier decides which contender queues on the license row first.
       let release!: () => void;
       let ready!: () => void;
@@ -1631,6 +1658,11 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       await blocker;
       const [normalResponse, disasterResult] = await Promise.all([normalPromise, disasterPromise]);
       expect(normalResponse.status).toBe(200);
+      expect(decodeProtectedHeader(normal.ticket)['kid']).toBe(ticketKid);
+      expect(decodeProtectedHeader(normalResponse.json['transfer_receipt'] as string)['kid']).toBe(expectedResultKid);
+      if (disasterApprovalFirst) {
+        expect(decodeProtectedHeader(challenge.token)['kid']).not.toBe(expectedResultKid);
+      }
       expect(disasterResult.state).toBe('rejected');
       expect(disasterResult.outcomeCode).toMatch(/NORMAL_TRANSFER_REQUIRES_EXPLICIT_REVOCATION|DISASTER_SOURCE_BINDING_MISMATCH|EXPECTED_REVISION_MISMATCH/);
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('2');
@@ -1640,6 +1672,17 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     }
     await race(true);
     await race(false);
+    } finally {
+      await isolatedAdmin.close();
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
+      admin = previous.admin;
+      policyFile = previous.policyFile;
+    }
   });
 
   it('rejects unverifiable backup claims and keeps the CLI two-step confirmation boundary', async () => {

@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { createServer, connect } from 'node:net';
+import { registerTestHttpsEndpoint } from './http.js';
 
 export interface ChildLicenseServer {
   process: ChildProcess;
@@ -68,6 +70,7 @@ export async function startChildLicenseServer(input: {
       throw new Error(`License child exited during startup (${child.exitCode}): ${stderr.trim() || 'no diagnostic output'}`);
     }
     if (await tcpConnect(port)) {
+      registerTestHttpsEndpoint(port, await readFile(input.tlsCertFile), new URL(input.publicOrigin).hostname);
       return {
         process: child,
         port,

@@ -17,6 +17,7 @@ import {
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
 import type { Database } from '../../src/db/types.js';
 import { verifyTimeAnchor, verifyTimeResetReceipt } from '../../src/crypto/time-reset.js';
+import { verifyTypedJwt } from '../../src/crypto/jwt.js';
 import { loadTrustedSigningContext } from '../../src/crypto/signing-authority.js';
 import { activationIntentDigest, timeResetIntentDigest } from '../../src/intent.js';
 import { createActivationCode, createLicense } from '../fixtures.js';
@@ -29,6 +30,7 @@ import {
   requestChallenge,
   signPost,
   startAppServer,
+  testHttpsOptions,
   type HttpResponse,
   type RunningTestServer,
 } from '../support/http.js';
@@ -87,7 +89,7 @@ async function postJson(port: number, path: string, body: unknown): Promise<Http
   const wireBody = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const request = httpsRequest({
-      host: '127.0.0.1', port, path, method: 'POST', rejectUnauthorized: false,
+      host: '127.0.0.1', port, path, method: 'POST', ...testHttpsOptions(port),
       headers: { host: 'license.example.test', 'content-type': 'application/json', 'content-length': String(wireBody.byteLength), connection: 'close' },
     }, (response) => {
       const chunks: Buffer[] = [];
@@ -283,7 +285,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
     await runtime.initializeAuthority(db);
-    server = await startAppServer(createApp({ config: runtime.config, db }));
+    server = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-time-reset-'));
     await chmod(scratchDirectory, 0o700);
     policyFile = await writeAdminPolicy(runtime.config.databaseUrl);
@@ -371,7 +373,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
       config: runtime.config,
       db,
       now: async () => new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000),
-    }));
+    }), runtime.config);
     try {
       const rejected = await postJson(unhealthyCenter.port, '/v1/time-anchor', { client_nonce: newClientNonce() });
       expect(rejected.status).toBe(503);
@@ -382,12 +384,12 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
   });
 
   it('enforces the isolated anchor body limit and its own request-rate ceiling over HTTPS', async () => {
-    const bodyLimitServer = await startAppServer(createApp({ config: runtime.config, db }));
+    const bodyLimitServer = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     try {
       const oversized = JSON.stringify({ client_nonce: newClientNonce(), extra: 'x'.repeat(600) });
       const response = await new Promise<number>((resolve, reject) => {
         const request = httpsRequest({
-          host: '127.0.0.1', port: bodyLimitServer.port, path: '/v1/time-anchor', method: 'POST', rejectUnauthorized: false,
+          host: '127.0.0.1', port: bodyLimitServer.port, path: '/v1/time-anchor', method: 'POST', ...testHttpsOptions(bodyLimitServer.port),
           headers: { host: 'license.example.test', 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(oversized)), connection: 'close' },
         }, (incoming) => { incoming.resume(); incoming.on('end', () => resolve(incoming.statusCode ?? 0)); });
         request.on('error', reject);
@@ -398,7 +400,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
       await bodyLimitServer.stop();
     }
 
-    const rateServer = await startAppServer(createApp({ config: runtime.config, db }));
+    const rateServer = await startAppServer(createApp({ config: runtime.config, db }), runtime.config);
     try {
       for (let index = 0; index < 12; index += 1) {
         const anchor = await postJson(rateServer.port, '/v1/time-anchor', { client_nonce: newClientNonce() });
@@ -708,6 +710,20 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
   });
 
   it('recovers an unknown PostgreSQL COMMIT acknowledgement by querying and replaying the operation', async () => {
+    const previous = { db, server, runtime, admin, policyFile };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }), isolatedRuntime.config);
+    const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
+    const isolatedAdmin = await createAdminService(isolatedPolicy);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    admin = isolatedAdmin;
+    policyFile = isolatedPolicy;
+    try {
     const active = await activate();
     const approval = await approveReset(active);
     const proxy = new CommitAckDropProxy();
@@ -715,7 +731,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     const proxiedUrl = new URL(runtime.config.databaseUrl);
     proxiedUrl.port = String(proxy.port);
     const proxiedDb = createDatabase(proxiedUrl.toString(), 4);
-    const proxiedServer = await startAppServer(createApp({ config: runtime.config, db: proxiedDb }));
+    const proxiedServer = await startAppServer(createApp({ config: runtime.config, db: proxiedDb }), runtime.config);
     try {
       const attempt = await makeResetAttempt(approval, 1, { port: proxiedServer.port });
       const dropped = proxy.armNextCommitAckDrop(1);
@@ -739,11 +755,47 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
       await proxiedDb.destroy();
       await proxy.stop();
     }
-    const replay = await sendApprovedReset(approval, 2);
-    expect(replay.response.status).toBe(200);
     const committed = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', approval.resetOperationId).executeTakeFirstOrThrow();
+    expect(decodeProtectedHeader(committed.response_jws!)['kid']).toBe(runtime.onlineKey.kid);
+    const b = await runtime.createOnlineKey();
+    await publishAndRotateTo(db, runtime, b, '2');
+    const queryChallenge = await requestChallenge({
+      port: server.port, config: runtime.config, identity: active.identity, operation: 'query',
+      operationId: approval.resetOperationId, intentDigest: approval.intentDigest, instanceId: active.instanceId,
+    });
+    const queryBody = buildChallengeBoundBody({
+      challenge: queryChallenge.token, operationId: approval.resetOperationId, intentDigest: approval.intentDigest,
+      attemptNo: 2, instanceId: active.instanceId, identity: active.identity, licenseId: active.licenseId, databaseId: active.databaseId,
+    });
+    const queried = await signPost({
+      port: server.port, origin: runtime.config.publicOrigin, path: '/v1/operations/query', body: queryBody,
+      identity: active.identity, nonce: nonceFromChallenge(queryChallenge.token),
+    });
+    expect(queried.status).toBe(200);
+    const queryReceipt = queried.json['operation_receipt'] as string;
+    const trusted = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const verifiedQuery = await verifyTypedJwt(queryReceipt, {
+      ...trusted, typ: 'aikayun-license-operation+jwt', audience: 'aikayun-commerce',
+      now: new Date(trusted.trustedTime * 1000), requiredClaims: Object.keys(decodeJwt(queryReceipt)),
+    });
+    expect(decodeProtectedHeader(queryReceipt)['kid']).toBe(b.kid);
+    expect(verifiedQuery.claims['result_jws']).toBe(committed.response_jws);
+    const replay = await sendApprovedReset(approval, 3);
+    expect(replay.response.status).toBe(200);
     expect(replay.response.json['time_reset_receipt']).toBe(committed.response_jws);
+    expect(decodeProtectedHeader(replay.response.json['time_reset_receipt'] as string)['kid']).toBe(runtime.onlineKey.kid);
     expect((await db.selectFrom('license_activations').select('time_epoch').where('id', '=', active.activationId).executeTakeFirstOrThrow()).time_epoch).toBe('1');
+    } finally {
+      await isolatedAdmin.close();
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
+      admin = previous.admin;
+      policyFile = previous.policyFile;
+    }
   });
 
   it('rolls back nonce consumption, epoch, operation, and audit together on a real PostgreSQL failure', async () => {
