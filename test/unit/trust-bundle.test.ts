@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   CompactSign, calculateJwkThumbprint, exportJWK, generateKeyPair,
@@ -253,6 +253,22 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     expect((await trust.getAccepted(BASE)).bundleVersion).toBe('2');
   });
 
+  it('R1 regression: rejects a newer bundle that silently drops an active key with a live lease', async () => {
+    await initKeys();
+    const trust = await store();
+    const v1 = await bundle({ version: '1', keys: [await publicEntry(centerPublicOne, centerKidOne)] });
+    await trust.accept(v1, BASE);
+    const signedByA = await lease({
+      privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
+    }, BASE - 5);
+    const v2 = await bundle({ version: '2', keys: [await publicEntry(centerPublicTwo, centerKidTwo)] });
+    await expect(trust.accept(v2, BASE)).rejects.toThrow(/lifecycle|retir|revok|remove/i);
+    const accepted = await trust.getAccepted(BASE);
+    await expect(verifyLicenseLeaseWithTrustedKeys(signedByA.token, {
+      resolver: accepted.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
+    })).resolves.toBeTruthy();
+  });
+
   it('uses a release-pinned minimum version and does not trust the first older network package', async () => {
     await initKeys();
     const trust = await store({ minimum: '2' });
@@ -283,7 +299,104 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const second = await store({ directory: secondDirectory });
     await second.accept(v1, BASE);
     await unlink(join(secondDirectory, 'trust-bundle-state.json'));
-    await expect(second.accept(v1, BASE)).rejects.toThrow(/missing/i);
+    await expect(second.accept(v1, BASE)).rejects.toThrow(/missing|checkpoint|mismatch/i);
+  });
+
+  it('R1 regression: rejects restoring a saved v1 state file while retaining the v2 checkpoint', async () => {
+    await initKeys();
+    const directory = await mkdtemp(join(tmpdir(), 'aikayun-trust-single-file-rollback-'));
+    temporaryDirectories.push(directory);
+    const trust = await store({ directory });
+    const v1 = await bundle({ version: '1' });
+    const acceptedV1 = await trust.accept(v1, BASE);
+    const signedByA = await lease({
+      privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
+    }, BASE - 5);
+    const statePath = join(directory, 'trust-bundle-state.json');
+    const savedV1State = await readFile(statePath);
+    const revokedA = await publicEntry(centerPublicOne, centerKidOne, { revoked_at: BASE - 30 });
+    const v2 = await bundle({ version: '2', keys: [revokedA] });
+    await trust.accept(v2, BASE);
+    await writeFile(statePath, savedV1State);
+
+    const restarted = await store({ directory });
+    await expect(restarted.getAccepted(BASE)).rejects.toThrow(/checkpoint|rollback|mismatch|watermark/i);
+    await expect(verifyLicenseLeaseWithTrustedKeys(signedByA.token, {
+      resolver: acceptedV1.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
+    })).rejects.toThrow(/checkpoint|mismatch|stale/i);
+  });
+
+  it('preserves a key through normal retirement and permits removal only after verify_until', async () => {
+    await initKeys();
+    const trust = await store();
+    const first = await bundle({ version: '1' });
+    await trust.accept(first, BASE);
+    const retireAt = BASE + 100;
+    const verifyUntil = retireAt + 8 * DAY;
+    const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+      not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+    });
+    const second = await bundle({
+      version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+      exp: retireAt + 25 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    const secondAccepted = await trust.accept(second, retireAt);
+    const preRetirementLease = await lease({
+      privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
+    }, retireAt - 10);
+    await expect(verifyLicenseLeaseWithTrustedKeys(preRetirementLease.token, {
+      resolver: secondAccepted.resolver, issuer: CENTER_ISSUER, now: new Date(retireAt * 1000),
+    })).resolves.toBeTruthy();
+
+    const removedBeforeRetention = await bundle({
+      version: '3', time: verifyUntil - 1, iat: verifyUntil - 21, nbf: verifyUntil - 11,
+      exp: verifyUntil + 20 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await expect(trust.accept(removedBeforeRetention, verifyUntil - 1)).rejects.toThrow(/cannot be removed/i);
+    const removedAfterRetention = await bundle({
+      version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+      exp: verifyUntil + 20 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    expect((await trust.accept(removedAfterRetention, verifyUntil)).bundleVersion).toBe('3');
+  });
+
+  it('rejects lifecycle field rewrites and backdated retirement for the same kid', async () => {
+    await initKeys();
+    const trust = await store();
+    await trust.accept(await bundle({ version: '1' }), BASE);
+    const retireAt = BASE + 100;
+    const verifyUntil = retireAt + 9 * DAY;
+    const oldRecord = await publicEntry(centerPublicOne, centerKidOne, {
+      not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+    });
+    const second = await bundle({
+      version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+      exp: retireAt + 25 * DAY, keys: [oldRecord, await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await trust.accept(second, retireAt);
+
+    const changedRecords = [
+      await publicEntry(centerPublicOne, centerKidOne, { ...oldRecord, not_before: oldRecord.not_before + 1 }),
+      await publicEntry(centerPublicOne, centerKidOne, { ...oldRecord, retire_after: retireAt - 1 }),
+      await publicEntry(centerPublicOne, centerKidOne, { ...oldRecord, verify_until: retireAt + 8 * DAY }),
+    ];
+    for (const [index, changed] of changedRecords.entries()) {
+      const candidate = await bundle({
+        version: '3', time: retireAt + 20 + index, iat: retireAt + index, nbf: retireAt + index + 1,
+        exp: retireAt + 25 * DAY, keys: [changed, await publicEntry(centerPublicTwo, centerKidTwo)],
+      });
+      await expect(trust.accept(candidate, retireAt + 20 + index)).rejects.toThrow(/immutable|retirement|not_before/i);
+    }
+
+    const activeStore = await store();
+    await activeStore.accept(await bundle({ version: '1' }), BASE);
+    const backdated = await bundle({
+      version: '2', time: BASE + 100, iat: BASE + 80, nbf: BASE + 90, exp: BASE + 20 * DAY,
+      keys: [await publicEntry(centerPublicOne, centerKidOne, {
+        not_before: BASE - 1_000, retire_after: BASE, verify_until: BASE + 8 * DAY,
+      })],
+    });
+    await expect(activeStore.accept(backdated, BASE + 100)).rejects.toThrow(/backdated/i);
   });
 
   it('rejects expired bundles without replacing the accepted last-good version', async () => {
@@ -379,7 +492,15 @@ describe('offline-root trust bundle and monotonic key selection', () => {
       resolver: accepted.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
     })).rejects.toThrow(/revoked/i);
 
-    const resurrected = await bundle({ version: '3' });
+    const omitted = await bundle({ version: '3', keys: [await publicEntry(centerPublicTwo, centerKidTwo)] });
+    const acceptedAfterOmission = await trust.accept(omitted, BASE);
+    expect(acceptedAfterOmission.revokedKids).toContain(centerKidOne);
+    await expect(verifyLicenseLeaseWithTrustedKeys(oldLease.token, {
+      resolver: acceptedAfterOmission.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
+    })).rejects.toThrow(/key|kid/i);
+    const resurrected = await bundle({ version: '4', keys: [
+      await publicEntry(centerPublicOne, centerKidOne), await publicEntry(centerPublicTwo, centerKidTwo),
+    ] });
     await expect(trust.accept(resurrected, BASE)).rejects.toThrow(/cannot be reactivated/i);
     const restoredStore = await store({ directory: trust.directory });
     expect((await restoredStore.getAccepted(BASE)).revokedKids).toContain(centerKidOne);
@@ -392,10 +513,19 @@ describe('offline-root trust bundle and monotonic key selection', () => {
 
   it('recovers every atomic-write interruption without losing the committed high-water version', async () => {
     await initKeys();
-    const stages: TrustStoreWriteStage[] = [
-      'before_write', 'after_partial_write', 'after_write', 'after_file_fsync', 'after_rename', 'after_directory_fsync',
+    const stages: Array<{ stage: TrustStoreWriteStage; expected: '1' | '2' }> = [
+      ...(['before_write', 'after_partial_write', 'after_write', 'after_file_fsync', 'after_rename', 'after_directory_fsync'] as const)
+        .map((name) => ({ stage: `checkpoint_prepare_${name}` as TrustStoreWriteStage, expected: '1' as const })),
+      ...(['before_write', 'after_partial_write', 'after_write', 'after_file_fsync'] as const)
+        .map((name) => ({ stage: `state_${name}` as TrustStoreWriteStage, expected: '1' as const })),
+      { stage: 'state_after_rename', expected: '2' },
+      { stage: 'state_after_directory_fsync', expected: '2' },
+      ...(['before_write', 'after_partial_write', 'after_write', 'after_file_fsync'] as const)
+        .map((name) => ({ stage: `checkpoint_commit_${name}` as TrustStoreWriteStage, expected: '2' as const })),
+      { stage: 'checkpoint_commit_after_rename', expected: '2' },
+      { stage: 'checkpoint_commit_after_directory_fsync', expected: '2' },
     ];
-    for (const stage of stages) {
+    for (const { stage, expected } of stages) {
       const directory = await mkdtemp(join(tmpdir(), `aikayun-trust-${stage}-`));
       temporaryDirectories.push(directory);
       const stable = await store({ directory });
@@ -408,9 +538,55 @@ describe('offline-root trust bundle and monotonic key selection', () => {
       await expect(crashing.accept(v2, BASE)).rejects.toThrow(/simulated interruption/i);
       const restarted = await store({ directory });
       const recovered = await restarted.getAccepted(BASE);
-      if (stage === 'after_directory_fsync') expect(recovered.bundleVersion).toBe('2');
-      else expect(['1', '2']).toContain(recovered.bundleVersion);
+      expect(recovered.bundleVersion).toBe(expected);
       expect(compareBundleVersions(recovered.bundleVersion, '1')).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('serializes concurrent writers and recovers a stale process lock without lowering the watermark', async () => {
+    await initKeys();
+    const directory = await mkdtemp(join(tmpdir(), 'aikayun-trust-concurrent-'));
+    temporaryDirectories.push(directory);
+    const firstStore = await store({ directory });
+    await firstStore.accept(await bundle({ version: '1' }), BASE);
+    const v2 = await bundle({ version: '2' });
+    const v3 = await bundle({ version: '3' });
+    const secondStore = await store({ directory });
+    const outcomes = await Promise.allSettled([firstStore.accept(v2, BASE), secondStore.accept(v3, BASE)]);
+    expect(outcomes.some((outcome) => outcome.status === 'fulfilled')).toBe(true);
+    const concurrentHead = await firstStore.getAccepted(BASE);
+    expect(['2', '3']).toContain(concurrentHead.bundleVersion);
+
+    const lockPath = join(directory, '.trust-bundle-write.lock');
+    await writeFile(lockPath, JSON.stringify({ pid: 2_147_483_647, host: hostname() }), { mode: 0o600 });
+    const v4 = await bundle({ version: '4' });
+    expect((await secondStore.accept(v4, BASE)).bundleVersion).toBe('4');
+    await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('retries an interrupted checkpoint recovery without losing or lowering the committed version', async () => {
+    await initKeys();
+    const recoveryStages: TrustStoreWriteStage[] = [
+      'checkpoint_recovery_before_write', 'checkpoint_recovery_after_partial_write',
+      'checkpoint_recovery_after_write', 'checkpoint_recovery_after_file_fsync',
+      'checkpoint_recovery_after_rename', 'checkpoint_recovery_after_directory_fsync',
+    ];
+    for (const stage of recoveryStages) {
+      const directory = await mkdtemp(join(tmpdir(), `aikayun-trust-recovery-${stage}-`));
+      temporaryDirectories.push(directory);
+      const stable = await store({ directory });
+      await stable.accept(await bundle({ version: '1' }), BASE);
+      const v2 = await bundle({ version: '2' });
+      const pendingStore = await store({ directory, faultAt: (observed) => {
+        if (observed === 'checkpoint_commit_before_write') throw new Error('leave state-ahead pending');
+      } });
+      await expect(pendingStore.accept(v2, BASE)).rejects.toThrow(/leave state-ahead/i);
+      const crashingRecovery = await store({ directory, faultAt: (observed) => {
+        if (observed === stage) throw new Error(`simulated interruption at ${stage}`);
+      } });
+      await expect(crashingRecovery.getAccepted(BASE)).rejects.toThrow(/simulated interruption/i);
+      const restarted = await store({ directory });
+      expect((await restarted.getAccepted(BASE)).bundleVersion).toBe('2');
     }
   });
 });

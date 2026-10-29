@@ -1,6 +1,6 @@
 import { constants as fsConstants } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, unlink, lstat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { hostname } from 'node:os';
 import type { CryptoKey } from 'jose';
@@ -21,27 +21,44 @@ import type {
 } from './trust-bundle.js';
 
 const STATE_FILE_NAME = 'trust-bundle-state.json';
-const MARKER_FILE_NAME = 'trust-bundle-store.marker.json';
+// Upgrade the old marker path in place: its old schema is rejected, never treated as a fresh install.
+const CHECKPOINT_FILE_NAME = 'trust-bundle-store.marker.json';
 const MAX_STATE_BYTES = 32 * 1024;
-const STATE_FIELDS = [
-  'state_schema', 'minimum_bundle_version', 'highest_bundle_version', 'artifact_sha256', 'token', 'revoked_kids',
+const MAX_CHECKPOINT_BYTES = 64 * 1024;
+const STATE_FIELDS = ['state_schema', 'bundle_version', 'artifact_sha256', 'token', 'revoked_kids'] as const;
+const RECORD_FIELDS = ['bundle_version', 'artifact_sha256', 'token', 'revoked_kids'] as const;
+const CHECKPOINT_FIELDS = [
+  'checkpoint_schema', 'expected_center_issuer', 'trusted_root_kid', 'minimum_bundle_version', 'committed', 'pending',
 ] as const;
+const PENDING_FIELDS = ['accepted_at', 'previous_version', 'previous_artifact_sha256', 'next'] as const;
 const digestPattern = /^[A-Za-z0-9_-]{43}$/;
 const directoryQueues = new Map<string, Promise<void>>();
 
-function isPrivateStateFileMode(value: number | bigint): boolean {
-  const numeric = Number(value);
-  const permission = numeric & 0o777;
-  return (permission === 0o400 || permission === 0o600) && (numeric & 0o7000) === 0;
-}
-
 export type TrustStoreWriteStage =
-  | 'before_write'
-  | 'after_partial_write'
-  | 'after_write'
-  | 'after_file_fsync'
-  | 'after_rename'
-  | 'after_directory_fsync';
+  | 'checkpoint_prepare_before_write'
+  | 'checkpoint_prepare_after_partial_write'
+  | 'checkpoint_prepare_after_write'
+  | 'checkpoint_prepare_after_file_fsync'
+  | 'checkpoint_prepare_after_rename'
+  | 'checkpoint_prepare_after_directory_fsync'
+  | 'state_before_write'
+  | 'state_after_partial_write'
+  | 'state_after_write'
+  | 'state_after_file_fsync'
+  | 'state_after_rename'
+  | 'state_after_directory_fsync'
+  | 'checkpoint_commit_before_write'
+  | 'checkpoint_commit_after_partial_write'
+  | 'checkpoint_commit_after_write'
+  | 'checkpoint_commit_after_file_fsync'
+  | 'checkpoint_commit_after_rename'
+  | 'checkpoint_commit_after_directory_fsync'
+  | 'checkpoint_recovery_before_write'
+  | 'checkpoint_recovery_after_partial_write'
+  | 'checkpoint_recovery_after_write'
+  | 'checkpoint_recovery_after_file_fsync'
+  | 'checkpoint_recovery_after_rename'
+  | 'checkpoint_recovery_after_directory_fsync';
 
 export interface TrustBundleStoreOptions {
   directory: string;
@@ -64,17 +81,42 @@ export interface AcceptedTrustBundle {
   readonly resolver: TrustedSigningKeyResolver;
 }
 
-interface PersistedState {
-  state_schema: 1;
-  minimum_bundle_version: string;
-  highest_bundle_version: string;
+interface BundleRecord {
+  bundle_version: string;
   artifact_sha256: string;
   token: string;
   revoked_kids: string[];
 }
 
+interface PendingRecord {
+  accepted_at: number;
+  previous_version: string | null;
+  previous_artifact_sha256: string | null;
+  next: BundleRecord;
+}
+
+interface DurableCheckpoint {
+  checkpoint_schema: 1;
+  expected_center_issuer: string;
+  trusted_root_kid: string;
+  minimum_bundle_version: string;
+  committed: BundleRecord | null;
+  pending: PendingRecord | null;
+}
+
+interface LoadedRecord {
+  record: BundleRecord;
+  candidate: RootAuthenticatedTrustBundleCandidate;
+}
+
+function isPrivateStateFileMode(value: number | bigint): boolean {
+  const numeric = Number(value);
+  const permission = numeric & 0o777;
+  return (permission === 0o400 || permission === 0o600) && (numeric & 0o7000) === 0;
+}
+
 function exactFields(value: Record<string, unknown>, fields: readonly string[]): void {
-  if (Object.keys(value).sort().join('\n') !== [...fields].sort().join('\n')) throw new Error('Trust bundle store has an invalid schema');
+  if (Object.keys(value).sort().join('\n') !== [...fields].sort().join('\n')) throw new Error('Trust bundle durable state has an invalid schema');
 }
 
 function positiveTrustedTime(value: number): number {
@@ -84,13 +126,22 @@ function positiveTrustedTime(value: number): number {
 
 function safeDigest(value: unknown): string {
   if (typeof value !== 'string' || !digestPattern.test(value) || Buffer.from(value, 'base64url').toString('base64url') !== value) {
-    throw new Error('Trust bundle store digest is invalid');
+    throw new Error('Trust bundle durable digest is invalid');
   }
   return value;
 }
 
 function safeKid(value: unknown): string {
   return safeDigest(value);
+}
+
+function safeRevocations(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 256) throw new Error('Trust bundle revocation history is invalid');
+  const revoked = value.map(safeKid);
+  if (new Set(revoked).size !== revoked.length || [...revoked].sort().join(',') !== revoked.join(',')) {
+    throw new Error('Trust bundle revocation history is not canonical');
+  }
+  return revoked;
 }
 
 function revokedKidsFor(candidate: RootAuthenticatedTrustBundleCandidate, previous: readonly string[]): string[] {
@@ -108,6 +159,60 @@ function assertNoRevocationResurrection(
   for (const key of candidate.claims.keys) {
     if (tombstones.has(key.kid) && key.revoked_at === null) throw new Error('A previously revoked center key cannot be reactivated');
   }
+}
+
+function assertLifecycleTransition(
+  previous: RootAuthenticatedTrustBundleCandidate,
+  next: RootAuthenticatedTrustBundleCandidate,
+  previousRevokedKids: readonly string[],
+  acceptedAt: number,
+): void {
+  const nextByKid = new Map(next.claims.keys.map((record) => [record.kid, record]));
+  const tombstones = new Set(previousRevokedKids);
+  for (const oldKey of previous.claims.keys) {
+    if (tombstones.has(oldKey.kid) || oldKey.revoked_at !== null) continue;
+    const replacement = nextByKid.get(oldKey.kid);
+    if (!replacement) {
+      if (oldKey.retire_after === null || oldKey.verify_until === null || acceptedAt < oldKey.verify_until) {
+        throw new Error(`Active signing key ${oldKey.kid} cannot be removed before retirement and verification retention complete`);
+      }
+      continue;
+    }
+    if (replacement.not_before !== oldKey.not_before) {
+      throw new Error(`Signing key ${oldKey.kid} not_before is immutable after acceptance`);
+    }
+    if (oldKey.retire_after === null) {
+      if (replacement.retire_after !== null && replacement.retire_after < acceptedAt) {
+        throw new Error(`Signing key ${oldKey.kid} retirement cannot be backdated`);
+      }
+    } else if (replacement.retire_after !== oldKey.retire_after || replacement.verify_until !== oldKey.verify_until) {
+      throw new Error(`Signing key ${oldKey.kid} retirement and verification windows are immutable once set`);
+    }
+  }
+
+  const previousKeys = new Map(previous.claims.keys.map((record) => [record.kid, record]));
+  for (const key of next.claims.keys) {
+    const oldKey = previousKeys.get(key.kid);
+    if (!oldKey) continue;
+    if (tombstones.has(key.kid) && key.revoked_at === null) throw new Error('A previously revoked center key cannot be reactivated');
+    if (oldKey.revoked_at !== null && key.revoked_at === null) throw new Error('A revoked center key cannot be reactivated');
+    if (oldKey.revoked_at !== null && key.revoked_at !== oldKey.revoked_at) throw new Error('A key revocation timestamp is immutable');
+  }
+}
+
+function sameRecord(left: BundleRecord | null, right: BundleRecord | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.bundle_version === right.bundle_version && left.artifact_sha256 === right.artifact_sha256 &&
+    left.token === right.token && left.revoked_kids.join(',') === right.revoked_kids.join(',');
+}
+
+function recordFromCandidate(candidate: RootAuthenticatedTrustBundleCandidate, revokedKids: readonly string[]): BundleRecord {
+  return {
+    bundle_version: candidate.claims.bundle_version,
+    artifact_sha256: candidate.artifactSha256,
+    token: candidate.token,
+    revoked_kids: [...revokedKids].sort(),
+  };
 }
 
 function resolverFor(
@@ -178,52 +283,65 @@ export class TrustBundleStore {
     }
 
     return this.withWriteLock(async () => {
-      const previous = await this.readPersistedState();
-      if (previous) {
-        const ordering = compareBundleVersions(candidate.claims.bundle_version, previous.highest_bundle_version);
+      let checkpoint = await this.recoverCheckpoint();
+      if (!checkpoint) {
+        checkpoint = {
+          checkpoint_schema: 1,
+          expected_center_issuer: this.expectedCenterIssuer,
+          trusted_root_kid: this.trustedRoot.kid,
+          minimum_bundle_version: this.minimumBundleVersion,
+          committed: null,
+          pending: null,
+        };
+      } else if (compareBundleVersions(this.minimumBundleVersion, checkpoint.minimum_bundle_version) > 0) {
+        checkpoint = { ...checkpoint, minimum_bundle_version: this.minimumBundleVersion };
+        await this.writeCheckpoint(checkpoint, 'checkpoint_prepare');
+      }
+
+      const previousRecord = checkpoint.committed;
+      const previous = previousRecord ? await this.loadRecord(previousRecord) : null;
+      if (previousRecord) {
+        const ordering = compareBundleVersions(candidate.claims.bundle_version, previousRecord.bundle_version);
         if (ordering < 0) throw new Error('Trust bundle version rollback rejected');
         if (ordering === 0) {
-          if (candidate.artifactSha256 !== previous.artifact_sha256 || candidate.token !== previous.token) {
+          if (candidate.artifactSha256 !== previousRecord.artifact_sha256 || candidate.token !== previousRecord.token) {
             throw new Error('Same trust bundle version has a different signed artifact');
           }
-          if (compareBundleVersions(previous.highest_bundle_version, this.minimumBundleVersion) < 0) {
-            throw new Error('Stored trust bundle is below the release-pinned minimum version');
-          }
-          return this.toAccepted(candidate, previous.revoked_kids, now, true);
+          return this.toAccepted(candidate, previousRecord.revoked_kids, now, true);
         }
       }
 
-      const revokedKids = revokedKidsFor(candidate, previous?.revoked_kids ?? []);
+      const revokedKids = revokedKidsFor(candidate, previousRecord?.revoked_kids ?? []);
       assertNoRevocationResurrection(candidate, revokedKids);
-      const nextBaseline = previous && compareBundleVersions(previous.minimum_bundle_version, this.minimumBundleVersion) > 0
-        ? previous.minimum_bundle_version
-        : this.minimumBundleVersion;
-      const state: PersistedState = {
-        state_schema: 1,
-        minimum_bundle_version: nextBaseline,
-        highest_bundle_version: candidate.claims.bundle_version,
-        artifact_sha256: candidate.artifactSha256,
-        token: candidate.token,
-        revoked_kids: revokedKids,
+      if (previous) assertLifecycleTransition(previous.candidate, candidate, previousRecord!.revoked_kids, now);
+      const next = recordFromCandidate(candidate, revokedKids);
+      const pending: PendingRecord = {
+        accepted_at: now,
+        previous_version: previousRecord?.bundle_version ?? null,
+        previous_artifact_sha256: previousRecord?.artifact_sha256 ?? null,
+        next,
       };
-      await this.writePersistedState(state);
+      await this.writeCheckpoint({ ...checkpoint, pending }, 'checkpoint_prepare');
+      await this.writeState(next, 'state');
+      const committed: DurableCheckpoint = { ...checkpoint, committed: next, pending: null };
+      await this.writeCheckpoint(committed, 'checkpoint_commit');
       return this.toAccepted(candidate, revokedKids, now, false);
     });
   }
 
   async getAccepted(trustedTime: number): Promise<AcceptedTrustBundle> {
     const now = positiveTrustedTime(trustedTime);
-    const state = await this.readPersistedState();
-    if (!state) throw new Error('No accepted trust bundle is persisted');
-    const requiredMinimum = compareBundleVersions(state.minimum_bundle_version, this.minimumBundleVersion) > 0
-      ? state.minimum_bundle_version
-      : this.minimumBundleVersion;
-    if (compareBundleVersions(state.highest_bundle_version, requiredMinimum) < 0) {
-      throw new Error('Persisted trust bundle is below the release-pinned minimum version');
-    }
-    const candidate = await this.candidateFromState(state);
-    assertTrustBundleValidAt(candidate, now);
-    return this.toAccepted(candidate, state.revoked_kids, now, true);
+    return this.withWriteLock(async () => {
+      const checkpoint = await this.recoverCheckpoint();
+      if (!checkpoint?.committed) throw new Error('No accepted trust bundle is persisted');
+      if (compareBundleVersions(checkpoint.committed.bundle_version, checkpoint.minimum_bundle_version) < 0 ||
+        compareBundleVersions(checkpoint.committed.bundle_version, this.minimumBundleVersion) < 0) {
+        throw new Error('Persisted trust bundle is below the release-pinned minimum version');
+      }
+      const loaded = await this.loadRecord(checkpoint.committed);
+      assertTrustBundleValidAt(loaded.candidate, now);
+      return this.toAccepted(loaded.candidate, checkpoint.committed.revoked_kids, now, true);
+    });
   }
 
   private toAccepted(
@@ -245,77 +363,241 @@ export class TrustBundleStore {
   }
 
   private async assertStillCurrent(candidate: RootAuthenticatedTrustBundleCandidate, revokedKids: readonly string[]): Promise<void> {
-    const state = await this.readPersistedState();
-    if (!state || state.artifact_sha256 !== candidate.artifactSha256 ||
-      state.highest_bundle_version !== candidate.claims.bundle_version || state.revoked_kids.join(',') !== revokedKids.join(',')) {
-      throw new Error('Trust key resolver is stale after a bundle or revocation update');
-    }
-  }
-
-  private async candidateFromState(state: PersistedState): Promise<RootAuthenticatedTrustBundleCandidate> {
-    const candidate = await verifyTrustBundleSignature(state.token, {
-      trustedRoot: this.trustedRoot,
-      expectedCenterIssuer: this.expectedCenterIssuer,
+    await this.withWriteLock(async () => {
+      const checkpoint = await this.recoverCheckpoint();
+      const current = checkpoint?.committed;
+      if (!current || current.artifact_sha256 !== candidate.artifactSha256 ||
+        current.bundle_version !== candidate.claims.bundle_version || current.revoked_kids.join(',') !== revokedKids.join(',')) {
+        throw new Error('Trust key resolver is stale after a bundle or revocation update');
+      }
     });
-    if (candidate.artifactSha256 !== state.artifact_sha256 || candidate.claims.bundle_version !== state.highest_bundle_version) {
-      throw new Error('Persisted trust bundle does not match its durable version record');
-    }
-    assertNoRevocationResurrection(candidate, state.revoked_kids);
-    return candidate;
   }
 
-  private async readPersistedState(): Promise<PersistedState | null> {
+  private async recoverCheckpoint(): Promise<DurableCheckpoint | null> {
     await this.ensurePrivateDirectory();
+    const checkpoint = await this.readCheckpoint();
+    const state = await this.readState();
+    if (!checkpoint) {
+      if (state) throw new Error('Trust bundle state exists without its independent monotonic checkpoint');
+      return null;
+    }
+    if (compareBundleVersions(this.minimumBundleVersion, checkpoint.minimum_bundle_version) < 0) {
+      throw new Error('Trusted release baseline is older than the durable checkpoint baseline');
+    }
+    if (checkpoint.pending) {
+      const pending = checkpoint.pending;
+      if (pending.previous_version !== (checkpoint.committed?.bundle_version ?? null) ||
+        pending.previous_artifact_sha256 !== (checkpoint.committed?.artifact_sha256 ?? null)) {
+        throw new Error('Trust bundle checkpoint pending transition does not extend its committed head');
+      }
+      const previous = checkpoint.committed ? await this.loadRecord(checkpoint.committed) : null;
+      const next = await this.loadRecord(pending.next);
+      const committedState = state?.record ?? null;
+      if (sameRecord(committedState, checkpoint.committed)) {
+        const aborted: DurableCheckpoint = { ...checkpoint, pending: null };
+        await this.writeCheckpoint(aborted, 'checkpoint_recovery');
+        return aborted;
+      }
+      if (sameRecord(committedState, pending.next)) {
+        assertTrustBundleValidAt(next.candidate, positiveTrustedTime(pending.accepted_at));
+        if (compareBundleVersions(next.candidate.claims.bundle_version, checkpoint.minimum_bundle_version) < 0) {
+          throw new Error('Pending trust bundle is below the checkpoint minimum version');
+        }
+        if (previous) {
+          if (compareBundleVersions(next.candidate.claims.bundle_version, previous.candidate.claims.bundle_version) <= 0) {
+            throw new Error('Pending trust bundle does not advance its committed version');
+          }
+          assertLifecycleTransition(previous.candidate, next.candidate, checkpoint.committed!.revoked_kids, pending.accepted_at);
+        }
+        const expectedRevocations = revokedKidsFor(next.candidate, checkpoint.committed?.revoked_kids ?? []);
+        if (expectedRevocations.join(',') !== pending.next.revoked_kids.join(',')) {
+          throw new Error('Pending trust bundle revocation history is inconsistent');
+        }
+        assertNoRevocationResurrection(next.candidate, expectedRevocations);
+        const committed: DurableCheckpoint = { ...checkpoint, committed: pending.next, pending: null };
+        await this.writeCheckpoint(committed, 'checkpoint_recovery');
+        return committed;
+      }
+      throw new Error('Trust bundle state does not match either side of its pending checkpoint transition');
+    }
+    if (!sameRecord(state?.record ?? null, checkpoint.committed)) {
+      throw new Error('Trust bundle state does not match its independent monotonic checkpoint');
+    }
+    if (checkpoint.committed) await this.loadRecord(checkpoint.committed);
+    if (compareBundleVersions(this.minimumBundleVersion, checkpoint.minimum_bundle_version) > 0) {
+      const raised: DurableCheckpoint = { ...checkpoint, minimum_bundle_version: this.minimumBundleVersion };
+      await this.writeCheckpoint(raised, 'checkpoint_recovery');
+      return raised;
+    }
+    return checkpoint;
+  }
+
+  private async readCheckpoint(): Promise<DurableCheckpoint | null> {
+    const file = join(this.directory, CHECKPOINT_FILE_NAME);
+    let metadata;
+    try { metadata = await lstat(file); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    if (!metadata.isFile() || metadata.isSymbolicLink() || !isPrivateStateFileMode(metadata.mode) ||
+      metadata.size <= 0 || metadata.size > MAX_CHECKPOINT_BYTES) throw new Error('Trust bundle checkpoint file is damaged');
+    const bytes = await readFile(file);
+    if (bytes.byteLength !== metadata.size) throw new Error('Trust bundle checkpoint changed while being read');
+    const value = parseStrictJson(bytes);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Trust bundle checkpoint is malformed');
+    const row = value as Record<string, unknown>;
+    exactFields(row, CHECKPOINT_FIELDS);
+    const minimum = assertMinimumBundleVersion(row['minimum_bundle_version']);
+    if (row['checkpoint_schema'] !== 1 || row['expected_center_issuer'] !== this.expectedCenterIssuer ||
+      row['trusted_root_kid'] !== this.trustedRoot.kid ||
+      !(row['committed'] === null || (row['committed'] && typeof row['committed'] === 'object' && !Array.isArray(row['committed']))) ||
+      !(row['pending'] === null || (row['pending'] && typeof row['pending'] === 'object' && !Array.isArray(row['pending'])))) {
+      throw new Error('Trust bundle checkpoint does not match this trusted release');
+    }
+    const committed = row['committed'] === null ? null : await this.parseRecord(row['committed'] as Record<string, unknown>);
+    let pending: PendingRecord | null = null;
+    if (row['pending'] !== null) {
+      const pendingRow = row['pending'] as Record<string, unknown>;
+      exactFields(pendingRow, PENDING_FIELDS);
+      const acceptedAt = positiveTrustedTime(pendingRow['accepted_at'] as number);
+      const previousVersion = pendingRow['previous_version'];
+      const previousDigest = pendingRow['previous_artifact_sha256'];
+      if (!((previousVersion === null && previousDigest === null) ||
+        (typeof previousVersion === 'string' && typeof previousDigest === 'string' && safeDigest(previousDigest)))) {
+        throw new Error('Trust bundle checkpoint pending predecessor is malformed');
+      }
+      if (!pendingRow['next'] || typeof pendingRow['next'] !== 'object' || Array.isArray(pendingRow['next'])) {
+        throw new Error('Trust bundle checkpoint pending package is malformed');
+      }
+      pending = {
+        accepted_at: acceptedAt,
+        previous_version: previousVersion as string | null,
+        previous_artifact_sha256: previousDigest as string | null,
+        next: await this.parseRecord(pendingRow['next'] as Record<string, unknown>),
+      };
+    }
+    if (committed && compareBundleVersions(committed.bundle_version, minimum) < 0) {
+      throw new Error('Trust bundle checkpoint head is below its pinned minimum version');
+    }
+    return {
+      checkpoint_schema: 1,
+      expected_center_issuer: this.expectedCenterIssuer,
+      trusted_root_kid: this.trustedRoot.kid,
+      minimum_bundle_version: minimum,
+      committed,
+      pending,
+    };
+  }
+
+  private async readState(): Promise<LoadedRecord | null> {
     const file = join(this.directory, STATE_FILE_NAME);
     let metadata;
     try { metadata = await lstat(file); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        const marker = await this.readMarker();
-        if (marker) throw new Error('Trust bundle state is missing after this store was initialized');
-        return null;
-      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;
     }
-    if (!metadata.isFile() || metadata.isSymbolicLink() || !isPrivateStateFileMode(metadata.mode)) {
-      throw new Error('Trust bundle state file is not a private regular file');
-    }
-    if (metadata.size <= 0 || metadata.size > MAX_STATE_BYTES) throw new Error('Trust bundle state file has an invalid size');
+    if (!metadata.isFile() || metadata.isSymbolicLink() || !isPrivateStateFileMode(metadata.mode) ||
+      metadata.size <= 0 || metadata.size > MAX_STATE_BYTES) throw new Error('Trust bundle state file is damaged');
     const bytes = await readFile(file);
     if (bytes.byteLength !== metadata.size) throw new Error('Trust bundle state changed while being read');
     const value = parseStrictJson(bytes);
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Trust bundle state is malformed');
     const row = value as Record<string, unknown>;
     exactFields(row, STATE_FIELDS);
-    if (row['state_schema'] !== 1 || typeof row['token'] !== 'string' || row['token'].length === 0 ||
-      !Array.isArray(row['revoked_kids']) || row['revoked_kids'].length > 256) {
-      throw new Error('Trust bundle state has an invalid schema');
-    }
-    const minimumVersion = assertMinimumBundleVersion(row['minimum_bundle_version']);
-    const highestVersion = assertMinimumBundleVersion(row['highest_bundle_version']);
-    if (compareBundleVersions(minimumVersion, highestVersion) > 0) throw new Error('Trust bundle version watermark is inconsistent');
-    const artifactSha = safeDigest(row['artifact_sha256']);
-    const revokedKids = row['revoked_kids'].map(safeKid);
-    if (new Set(revokedKids).size !== revokedKids.length || [...revokedKids].sort().join(',') !== revokedKids.join(',')) {
-      throw new Error('Trust bundle revocation tombstones are not canonical');
-    }
-    const state: PersistedState = {
-      state_schema: 1,
-      minimum_bundle_version: minimumVersion,
-      highest_bundle_version: highestVersion,
-      artifact_sha256: artifactSha,
+    if (row['state_schema'] !== 1) throw new Error('Trust bundle state schema is unsupported');
+    const record = await this.parseRecord({
+      bundle_version: row['bundle_version'],
+      artifact_sha256: row['artifact_sha256'],
       token: row['token'],
-      revoked_kids: revokedKids,
+      revoked_kids: row['revoked_kids'],
+    });
+    return { record, candidate: (await this.loadRecord(record)).candidate };
+  }
+
+  private async parseRecord(value: Record<string, unknown>): Promise<BundleRecord> {
+    exactFields(value, RECORD_FIELDS);
+    const version = assertMinimumBundleVersion(value['bundle_version']);
+    const digest = safeDigest(value['artifact_sha256']);
+    if (typeof value['token'] !== 'string' || value['token'].length === 0) throw new Error('Trust bundle durable token is malformed');
+    return {
+      bundle_version: version,
+      artifact_sha256: digest,
+      token: value['token'],
+      revoked_kids: safeRevocations(value['revoked_kids']),
     };
-    await this.candidateFromState(state);
-    const marker = await this.readMarker();
-    if (!marker) await this.writeMarker();
-    else if (compareBundleVersions(this.minimumBundleVersion, marker.minimum_bundle_version) < 0) {
-      throw new Error('Trusted release baseline is older than the store initialization baseline');
+  }
+
+  private async loadRecord(record: BundleRecord): Promise<LoadedRecord> {
+    const candidate = await verifyTrustBundleSignature(record.token, {
+      trustedRoot: this.trustedRoot,
+      expectedCenterIssuer: this.expectedCenterIssuer,
+    });
+    if (candidate.artifactSha256 !== record.artifact_sha256 || candidate.claims.bundle_version !== record.bundle_version) {
+      throw new Error('Persisted trust bundle does not match its durable checkpoint identity');
     }
-    if (compareBundleVersions(state.minimum_bundle_version, this.minimumBundleVersion) > 0) {
-      throw new Error('Trusted release baseline is older than the persisted baseline');
+    assertNoRevocationResurrection(candidate, record.revoked_kids);
+    for (const key of candidate.claims.keys) {
+      if (key.revoked_at !== null && !record.revoked_kids.includes(key.kid)) {
+        throw new Error('Durable checkpoint is missing a signed key revocation tombstone');
+      }
     }
-    return state;
+    return { record, candidate };
+  }
+
+  private async writeState(record: BundleRecord, prefix: 'state'): Promise<void> {
+    const state = { state_schema: 1 as const, ...record };
+    await this.writeAtomicJson(STATE_FILE_NAME, state, prefix, MAX_STATE_BYTES);
+  }
+
+  private async writeCheckpoint(checkpoint: DurableCheckpoint, prefix: 'checkpoint_prepare' | 'checkpoint_commit' | 'checkpoint_recovery'): Promise<void> {
+    await this.writeAtomicJson(CHECKPOINT_FILE_NAME, checkpoint, prefix, MAX_CHECKPOINT_BYTES);
+  }
+
+  private async writeAtomicJson(
+    fileName: string,
+    value: unknown,
+    prefix: 'state' | 'checkpoint_prepare' | 'checkpoint_commit' | 'checkpoint_recovery',
+    maxBytes: number,
+  ): Promise<void> {
+    await this.ensurePrivateDirectory();
+    const file = join(this.directory, fileName);
+    try {
+      const current = await lstat(file);
+      if (!current.isFile() || current.isSymbolicLink()) throw new Error(`Refusing to replace a non-regular trust bundle ${fileName}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const bytes = Buffer.from(JSON.stringify(value), 'utf8');
+    if (bytes.byteLength > maxBytes) throw new Error(`Trust bundle ${fileName} exceeds its storage limit`);
+    const temporary = join(this.directory, `.${fileName}-${process.pid}-${randomBytes(12).toString('hex')}.tmp`);
+    let handle;
+    let renamed = false;
+    try {
+      handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+      await this.faultAt?.(`${prefix}_before_write` as TrustStoreWriteStage);
+      if (this.faultAt) {
+        const half = Math.max(1, Math.floor(bytes.byteLength / 2));
+        await handle.write(bytes.subarray(0, half), 0, half, 0);
+        await this.faultAt(`${prefix}_after_partial_write` as TrustStoreWriteStage);
+        await handle.write(bytes.subarray(half), 0, bytes.byteLength - half, half);
+      } else {
+        await handle.writeFile(bytes);
+      }
+      await this.faultAt?.(`${prefix}_after_write` as TrustStoreWriteStage);
+      await handle.sync();
+      await this.faultAt?.(`${prefix}_after_file_fsync` as TrustStoreWriteStage);
+      await handle.close();
+      handle = undefined;
+      await rename(temporary, file);
+      renamed = true;
+      await this.faultAt?.(`${prefix}_after_rename` as TrustStoreWriteStage);
+      const directoryHandle = await open(this.directory, fsConstants.O_RDONLY);
+      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      await this.faultAt?.(`${prefix}_after_directory_fsync` as TrustStoreWriteStage);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      if (!renamed) await unlink(temporary).catch(() => undefined);
+    }
   }
 
   private async ensurePrivateDirectory(): Promise<void> {
@@ -326,54 +608,6 @@ export class TrustBundleStore {
     if (!metadata.isDirectory() || metadata.isSymbolicLink() || (permissions & 0o077) !== 0 ||
       (permissions & 0o700) !== 0o700 || (mode & 0o7000) !== 0) {
       throw new Error('Trust bundle state directory must be a private regular directory');
-    }
-  }
-
-  private async writePersistedState(state: PersistedState): Promise<void> {
-    await this.ensurePrivateDirectory();
-    const file = join(this.directory, STATE_FILE_NAME);
-    try {
-      const current = await lstat(file);
-      if (!current.isFile() || current.isSymbolicLink()) throw new Error('Refusing to replace a non-regular trust bundle state file');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-
-    const temporary = join(this.directory, `.trust-bundle-state-${process.pid}-${randomBytes(12).toString('hex')}.tmp`);
-    const bytes = Buffer.from(JSON.stringify(state), 'utf8');
-    if (bytes.byteLength > MAX_STATE_BYTES) throw new Error('Trust bundle state exceeds its storage limit');
-    let handle;
-    let renamed = false;
-    try {
-      handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
-      await this.faultAt?.('before_write');
-      if (this.faultAt) {
-        const half = Math.max(1, Math.floor(bytes.byteLength / 2));
-        await handle.write(bytes.subarray(0, half), 0, half, 0);
-        await this.faultAt('after_partial_write');
-        await handle.write(bytes.subarray(half), 0, bytes.byteLength - half, half);
-      } else {
-        await handle.writeFile(bytes);
-      }
-      await this.faultAt?.('after_write');
-      await handle.sync();
-      await this.faultAt?.('after_file_fsync');
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, file);
-      renamed = true;
-      await this.faultAt?.('after_rename');
-      const directoryHandle = await open(this.directory, fsConstants.O_RDONLY);
-      try {
-        await directoryHandle.sync();
-      } finally {
-        await directoryHandle.close();
-      }
-      await this.writeMarker();
-      await this.faultAt?.('after_directory_fsync');
-    } finally {
-      await handle?.close().catch(() => undefined);
-      if (!renamed) await unlink(temporary).catch(() => undefined);
     }
   }
 
@@ -442,74 +676,5 @@ export class TrustBundleStore {
     await unlink(path);
     const directoryHandle = await open(this.directory, fsConstants.O_RDONLY);
     try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
-  }
-
-  private async readMarker(): Promise<{ minimum_bundle_version: string } | null> {
-    const file = join(this.directory, MARKER_FILE_NAME);
-    let metadata;
-    try { metadata = await lstat(file); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw error;
-    }
-    if (!metadata.isFile() || metadata.isSymbolicLink() || !isPrivateStateFileMode(metadata.mode) || metadata.size > 1024) {
-      throw new Error('Trust bundle initialization marker is damaged');
-    }
-    const value = parseStrictJson(await readFile(file));
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Trust bundle initialization marker is malformed');
-    const row = value as Record<string, unknown>;
-    exactFields(row, ['marker_schema', 'expected_center_issuer', 'trusted_root_kid', 'minimum_bundle_version']);
-    const minimum = assertMinimumBundleVersion(row['minimum_bundle_version']);
-    if (row['marker_schema'] !== 1 || row['expected_center_issuer'] !== this.expectedCenterIssuer ||
-      row['trusted_root_kid'] !== this.trustedRoot.kid) throw new Error('Trust bundle initialization marker does not match this trusted release');
-    return { minimum_bundle_version: minimum };
-  }
-
-  private async writeMarker(): Promise<void> {
-    const file = join(this.directory, MARKER_FILE_NAME);
-    const value = {
-      marker_schema: 1,
-      expected_center_issuer: this.expectedCenterIssuer,
-      trusted_root_kid: this.trustedRoot.kid,
-      minimum_bundle_version: this.minimumBundleVersion,
-    };
-    const bytes = Buffer.from(JSON.stringify(value), 'utf8');
-    const temporary = join(this.directory, `.trust-bundle-marker-${process.pid}-${randomBytes(12).toString('hex')}.tmp`);
-    let handle;
-    let renamed = false;
-    try {
-      try {
-        const existing = await lstat(file);
-        if (!existing.isFile() || existing.isSymbolicLink()) throw new Error('Refusing to replace a damaged trust bundle marker');
-        const current = await readFile(file);
-        if (!current.equals(bytes)) {
-          const parsed = parseStrictJson(current);
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Trust bundle marker is malformed');
-          const row = parsed as Record<string, unknown>;
-          exactFields(row, ['marker_schema', 'expected_center_issuer', 'trusted_root_kid', 'minimum_bundle_version']);
-          if (row['marker_schema'] !== 1 || row['expected_center_issuer'] !== this.expectedCenterIssuer || row['trusted_root_kid'] !== this.trustedRoot.kid) {
-            throw new Error('Trust bundle initialization marker does not match this trusted release');
-          }
-          if (compareBundleVersions(assertMinimumBundleVersion(row['minimum_bundle_version']), this.minimumBundleVersion) > 0) {
-            throw new Error('Trusted release baseline is older than the store initialization baseline');
-          }
-          return;
-        }
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-      handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
-      await handle.writeFile(bytes);
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, file);
-      renamed = true;
-      const dirHandle = await open(this.directory, fsConstants.O_RDONLY);
-      try { await dirHandle.sync(); } finally { await dirHandle.close(); }
-    } finally {
-      await handle?.close().catch(() => undefined);
-      if (!renamed) await unlink(temporary).catch(() => undefined);
-    }
   }
 }
