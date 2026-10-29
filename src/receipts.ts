@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { RuntimeConfig } from './config.js';
 import { signTypedJwt } from './crypto/jwt.js';
-import { assertExactClaims, assertIntegerClaim, assertStringClaim, verifyTypedJwt } from './crypto/jwt.js';
+import {
+  assertExactClaims, assertIntegerClaim, assertStringClaim, verifyTypedJwt, verifyTypedJwtWithResolver,
+} from './crypto/jwt.js';
+import type { TrustedSigningKeyResolver, VerifiedJwt } from './crypto/jwt.js';
 import type { BillingPlan } from './entitlements/calendar.js';
 
 export interface LeaseInput {
@@ -314,6 +317,26 @@ export async function verifyLicenseLease(
   now: Date,
 ): Promise<Record<string, unknown>> {
   const verified = await verifyTypedJwt(token, config, 'aikayun-license+jwt', [...leaseClaims], now);
+  return validateLicenseLeaseClaims(verified, now);
+}
+
+/** Verify a real lease JWS using only the currently accepted trust-bundle resolver. */
+export async function verifyLicenseLeaseWithTrustedKeys(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; now: Date },
+): Promise<Record<string, unknown>> {
+  const verified = await verifyTypedJwtWithResolver(token, {
+    resolver: input.resolver,
+    issuer: input.issuer,
+    audience: 'aikayun-commerce',
+    typ: 'aikayun-license+jwt',
+    requiredClaims: leaseClaims,
+    now: input.now,
+  });
+  return validateLicenseLeaseClaims(verified, input.now);
+}
+
+function validateLicenseLeaseClaims(verified: VerifiedJwt, now: Date): Record<string, unknown> {
   assertExactClaims(verified.claims, leaseClaims);
   const { iat, exp } = validateBoundedTimes(verified.claims, now, 7 * 24 * 60 * 60);
   if (assertIntegerClaim(verified.claims, 'v') !== 1 || verified.claims['aud'] !== 'aikayun-commerce' ||

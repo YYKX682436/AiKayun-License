@@ -1,9 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { jwtVerify } from 'jose';
 import type { CryptoKey } from 'jose';
 import type { RuntimeConfig } from '../config.js';
-import { signTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClaim } from './jwt.js';
+import {
+  signTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClaim,
+  verifyTypedJwtWithKey, verifyTypedJwtWithResolver,
+} from './jwt.js';
+import type { TrustedSigningKeyResolver } from './jwt.js';
 import { parseStrictJsonSegment } from '../strict-json.js';
+import {
+  assertTrustBundleValidAt,
+  getRootAuthenticatedCandidateKey,
+} from '../trust/trust-bundle.js';
+import type { RootAuthenticatedTrustBundleCandidate } from '../trust/trust-bundle.js';
+import type { TrustBundleKeyRecord } from '../trust/trust-bundle.js';
 
 export const TIME_ANCHOR_TYP = 'aikayun-time-anchor+jwt';
 export const TIME_ANCHOR_AUDIENCE = 'aikayun-time-bootstrap';
@@ -68,6 +77,30 @@ export interface VerifiedTimeAnchor {
   clientNonce: string;
 }
 
+function validateVerifiedTimeAnchor(
+  verified: { header: Record<string, unknown>; claims: Record<string, unknown> },
+  input: { issuer: string; keyId: string; clientNonce: string; serverTime: number; keyRecord?: TrustBundleKeyRecord },
+): VerifiedTimeAnchor {
+  const claims = verified.claims;
+  assertExactClaims(claims, TIME_ANCHOR_CLAIMS);
+  const iat = assertIntegerClaim(claims, 'iat', 1);
+  const nbf = assertIntegerClaim(claims, 'nbf', 1);
+  const exp = assertIntegerClaim(claims, 'exp', 1);
+  const nonce = assertStringClaim(claims, 'client_nonce', 128);
+  const jti = assertStringClaim(claims, 'jti', 36);
+  if (verified.header['alg'] !== 'Ed25519' || verified.header['kid'] !== input.keyId || verified.header['typ'] !== TIME_ANCHOR_TYP ||
+    assertIntegerClaim(claims, 'v') !== 1 || claims['iss'] !== input.issuer || claims['aud'] !== TIME_ANCHOR_AUDIENCE ||
+    claims['sub'] !== 'license-center-time' || iat !== input.serverTime || nbf !== input.serverTime || exp !== input.serverTime + 30 ||
+    nonce !== input.clientNonce || !uuidPattern.test(jti)) throw new Error('Invalid time anchor claims');
+  const key = input.keyRecord;
+  if (key && (key.revoked_at !== null || iat < key.not_before ||
+    (key.retire_after !== null && iat > key.retire_after) ||
+    (key.verify_until !== null && (input.serverTime >= key.verify_until || exp > key.verify_until)))) {
+    throw new Error('Time anchor is outside its root-authenticated bundle key policy');
+  }
+  return { tokenId: jti, serverTime: input.serverTime, expiresAt: exp, clientNonce: nonce };
+}
+
 /** Verify against an out-of-band trusted key without consulting the host wall clock. */
 export async function verifyTimeAnchor(
   token: unknown,
@@ -82,23 +115,61 @@ export async function verifyTimeAnchor(
   const rawClaims = parseStrictJsonSegment(segments[1]!);
   const serverTime = rawClaims['server_time'];
   if (typeof serverTime !== 'number' || !Number.isSafeInteger(serverTime) || serverTime <= 0) throw new Error('Invalid server time');
-  const verified = await jwtVerify(token, input.publicKey, {
-    algorithms: ['Ed25519'], issuer: input.issuer, audience: TIME_ANCHOR_AUDIENCE,
-    currentDate: new Date(serverTime * 1000), clockTolerance: 0,
+  const verified = await verifyTypedJwtWithKey(token, {
+    publicKey: input.publicKey,
+    keyId: input.keyId,
+    issuer: input.issuer,
+    audience: TIME_ANCHOR_AUDIENCE,
+    typ: TIME_ANCHOR_TYP,
+    requiredClaims: TIME_ANCHOR_CLAIMS,
+    now: new Date(serverTime * 1000),
   });
-  const claims = verified.payload as Record<string, unknown>;
-  if (verified.protectedHeader['alg'] !== 'Ed25519' || verified.protectedHeader['typ'] !== TIME_ANCHOR_TYP ||
-    verified.protectedHeader['kid'] !== header['kid']) throw new Error('Unexpected time anchor header');
-  assertExactClaims(claims, TIME_ANCHOR_CLAIMS);
-  const iat = assertIntegerClaim(claims, 'iat', 1);
-  const nbf = assertIntegerClaim(claims, 'nbf', 1);
-  const exp = assertIntegerClaim(claims, 'exp', 1);
-  const nonce = assertStringClaim(claims, 'client_nonce', 128);
-  const jti = assertStringClaim(claims, 'jti', 36);
-  if (assertIntegerClaim(claims, 'v') !== 1 || claims['iss'] !== input.issuer || claims['aud'] !== TIME_ANCHOR_AUDIENCE ||
-    claims['sub'] !== 'license-center-time' || iat !== serverTime || nbf !== serverTime || exp !== serverTime + 30 ||
-    nonce !== input.clientNonce || !uuidPattern.test(jti)) throw new Error('Invalid time anchor claims');
-  return { tokenId: jti, serverTime, expiresAt: exp, clientNonce: nonce };
+  return validateVerifiedTimeAnchor(verified, {
+    issuer: input.issuer, keyId: input.keyId, clientNonce: input.clientNonce, serverTime,
+  });
+}
+
+/**
+ * Bootstrap-only path: the candidate has an offline-root signature, but has not
+ * yet become the persisted operational key set. Its center key is used only to
+ * verify the nonce-bound time anchor; bundle time and key windows are checked
+ * against the time authenticated by that anchor before returning.
+ */
+export async function verifyTimeAnchorWithTrustBundleCandidate(
+  token: unknown,
+  input: {
+    candidate: RootAuthenticatedTrustBundleCandidate;
+    clientNonce: string;
+    roundTripMs: number;
+  },
+): Promise<VerifiedTimeAnchor> {
+  if (typeof token !== 'string' || !Number.isFinite(input.roundTripMs) || input.roundTripMs < 0 || input.roundTripMs > MAX_ANCHOR_RTT_MS ||
+    !isCanonical256BitValue(input.clientNonce)) throw new Error('Time anchor request is not fresh');
+  const header = assertHeader(token, TIME_ANCHOR_TYP);
+  const rawClaims = parseStrictJsonSegment(token.split('.')[1]!);
+  const serverTime = rawClaims['server_time'];
+  if (typeof serverTime !== 'number' || !Number.isSafeInteger(serverTime) || serverTime <= 0) throw new Error('Invalid server time');
+  const kid = header['kid'];
+  if (typeof kid !== 'string') throw new Error('Invalid time anchor key id');
+  const selected = getRootAuthenticatedCandidateKey(input.candidate, kid);
+  if (selected.record.revoked_at !== null) throw new Error('A revoked key cannot bootstrap trusted time');
+  const verified = await verifyTypedJwtWithKey(token, {
+    publicKey: selected.publicKey,
+    keyId: kid,
+    issuer: input.candidate.claims.sub,
+    audience: TIME_ANCHOR_AUDIENCE,
+    typ: TIME_ANCHOR_TYP,
+    requiredClaims: TIME_ANCHOR_CLAIMS,
+    now: new Date(serverTime * 1000),
+  });
+  assertTrustBundleValidAt(input.candidate, serverTime);
+  return validateVerifiedTimeAnchor(verified, {
+    issuer: input.candidate.claims.sub,
+    keyId: kid,
+    clientNonce: input.clientNonce,
+    serverTime,
+    keyRecord: selected.record,
+  });
 }
 
 export interface TimeResetReceiptClaims {
@@ -151,30 +222,42 @@ export async function signTimeResetReceipt(
 export async function verifyTimeResetReceipt(
   token: unknown,
   input: {
-    publicKey: CryptoKey;
     issuer: string;
-    keyId: string;
     trustedServerTime: number;
     expected: Pick<TimeResetReceiptClaims,
       'license_id' | 'database_id' | 'instance_id' | 'identity_jkt' | 'activation_generation' | 'management_revision' |
       'entitlement_revision' | 'old_time_epoch' | 'new_time_epoch' | 'old_watermark_digest' | 'operation_id' | 'intent_digest' |
       'request_nonce' | 'client_nonce' | 'request_digest' | 'admin_approval_id' | 'admin_operation_id' | 'admin_approval_digest'>;
-  },
+  } & ({ publicKey: CryptoKey; keyId: string; resolver?: never } | { resolver: TrustedSigningKeyResolver; publicKey?: never; keyId?: never }),
 ): Promise<TimeResetReceiptClaims & { server_time: number; expires_at: number; receipt_id: string }> {
   if (typeof token !== 'string' || !Number.isSafeInteger(input.trustedServerTime) || input.trustedServerTime <= 0) throw new Error('Invalid reset receipt input');
-  const header = assertHeader(token, TIME_RESET_TYP, input.keyId);
+  const header = assertHeader(token, TIME_RESET_TYP, 'keyId' in input ? input.keyId : undefined);
   const segments = token.split('.');
   const rawClaims = parseStrictJsonSegment(segments[1]!);
   const serverTime = rawClaims['server_time'];
   if (typeof serverTime !== 'number' || !Number.isSafeInteger(serverTime) || input.trustedServerTime < serverTime ||
     input.trustedServerTime - serverTime > 10 * 60) throw new Error('Reset evidence is outside its fresh window');
-  const verified = await jwtVerify(token, input.publicKey, {
-    algorithms: ['Ed25519'], issuer: input.issuer, audience: TIME_RESET_AUDIENCE,
-    currentDate: new Date(input.trustedServerTime * 1000), clockTolerance: 0,
-  });
-  const claims = verified.payload as Record<string, unknown>;
-  if (verified.protectedHeader['alg'] !== 'Ed25519' || verified.protectedHeader['typ'] !== TIME_RESET_TYP ||
-    verified.protectedHeader['kid'] !== header['kid']) throw new Error('Unexpected time reset header');
+  const verification = 'resolver' in input && input.resolver
+    ? await verifyTypedJwtWithResolver(token, {
+      resolver: input.resolver,
+      issuer: input.issuer,
+      audience: TIME_RESET_AUDIENCE,
+      typ: TIME_RESET_TYP,
+      requiredClaims: TIME_RESET_CLAIMS,
+      now: new Date(input.trustedServerTime * 1000),
+    })
+    : await verifyTypedJwtWithKey(token, {
+      publicKey: input.publicKey!,
+      keyId: input.keyId!,
+      issuer: input.issuer,
+      audience: TIME_RESET_AUDIENCE,
+      typ: TIME_RESET_TYP,
+      requiredClaims: TIME_RESET_CLAIMS,
+      now: new Date(input.trustedServerTime * 1000),
+    });
+  const claims = verification.claims;
+  if (verification.header['alg'] !== 'Ed25519' || verification.header['typ'] !== TIME_RESET_TYP ||
+    verification.header['kid'] !== header['kid']) throw new Error('Unexpected time reset header');
   assertExactClaims(claims, TIME_RESET_CLAIMS);
   const iat = assertIntegerClaim(claims, 'iat', 1);
   const nbf = assertIntegerClaim(claims, 'nbf', 1);

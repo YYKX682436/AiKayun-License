@@ -16,7 +16,8 @@
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "admin": "tsx src/admin/cli.ts",
-    "keygen": "tsx src/crypto/keygen.ts"
+    "keygen": "tsx src/crypto/keygen.ts",
+    "trust-bundle:offline": "tsx tools/offline-trust/sign.ts"
   },
   "dependencies": {
     "@fastify/helmet": "13.2.0",

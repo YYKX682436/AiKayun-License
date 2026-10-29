@@ -9,3 +9,4 @@ secrets/
 *.key
 *.log
 .vitest/
+.DS_Store

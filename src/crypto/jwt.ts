@@ -1,4 +1,5 @@
 import { SignJWT, jwtVerify } from 'jose';
+import type { CryptoKey } from 'jose';
 import type { RuntimeConfig } from '../config.js';
 import { parseStrictJsonSegment } from '../strict-json.js';
 
@@ -8,6 +9,18 @@ const LICENSE_HEADER = ['alg', 'kid', 'typ'];
 export interface VerifiedJwt {
   header: Record<string, unknown>;
   claims: Record<string, unknown>;
+}
+
+export interface TrustedSigningKeyResolver {
+  resolveKey(input: {
+    kid: string;
+    targetIssuer: string;
+    jwtTyp: string;
+    audience: string;
+    trustedTime: number;
+    issuedAt: number;
+    expiresAt: number;
+  }): Promise<{ publicKey: CryptoKey; verifyUntil: number | null }>;
 }
 
 export async function signTypedJwt(
@@ -27,6 +40,23 @@ export async function verifyTypedJwt(
   requiredClaims: string[],
   now: Date,
 ): Promise<VerifiedJwt> {
+  return verifyTypedJwtWithKey(token, {
+    publicKey: config.signingPublicKey,
+    keyId: config.signingKeyId,
+    issuer: config.issuer,
+    audience: 'aikayun-commerce',
+    typ,
+    requiredClaims,
+    now,
+  });
+}
+
+async function parseTypedJwt(
+  token: unknown,
+  typ: string,
+  requiredClaims: readonly string[],
+  expectedKid?: string,
+): Promise<{ token: string; header: Record<string, unknown>; claims: Record<string, unknown> }> {
   if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > MAX_TOKEN_BYTES) throw new Error('Invalid signed token');
   const segments = token.split('.');
   if (segments.length !== 3 || !segments.every((part) => part.length > 0)) throw new Error('Invalid compact JWS');
@@ -37,19 +67,83 @@ export async function verifyTypedJwt(
     throw new Error('Invalid compact JWS signature encoding');
   }
   if (Object.keys(header).sort().join(',') !== LICENSE_HEADER.join(',')) throw new Error('Unexpected protected JWS header');
-  if (header['alg'] !== 'Ed25519' || header['kid'] !== config.signingKeyId || header['typ'] !== typ) throw new Error('Unexpected protected JWS header');
+  if (header['alg'] !== 'Ed25519' || header['typ'] !== typ || typeof header['kid'] !== 'string' ||
+    (expectedKid !== undefined && header['kid'] !== expectedKid)) throw new Error('Unexpected protected JWS header');
   for (const name of requiredClaims) if (!(name in claims)) throw new Error('Required signed claim missing');
-  const verified = await jwtVerify(token, config.signingPublicKey, {
+  return { token, header, claims };
+}
+
+export async function verifyTypedJwtWithKey(
+  token: unknown,
+  input: {
+    publicKey: CryptoKey;
+    keyId: string;
+    issuer: string;
+    audience: string;
+    typ: string;
+    requiredClaims: readonly string[];
+    now: Date;
+  },
+): Promise<VerifiedJwt> {
+  const parsed = await parseTypedJwt(token, input.typ, input.requiredClaims, input.keyId);
+  const verified = await jwtVerify(parsed.token, input.publicKey, {
     algorithms: ['Ed25519'],
-    issuer: config.issuer,
-    audience: 'aikayun-commerce',
-    currentDate: now,
+    issuer: input.issuer,
+    audience: input.audience,
+    currentDate: input.now,
     clockTolerance: 0,
   });
-  if (verified.protectedHeader['alg'] !== 'Ed25519' || verified.protectedHeader['kid'] !== config.signingKeyId || verified.protectedHeader['typ'] !== typ) {
+  if (verified.protectedHeader['alg'] !== 'Ed25519' || verified.protectedHeader['kid'] !== input.keyId || verified.protectedHeader['typ'] !== input.typ) {
     throw new Error('Unexpected protected JWS header');
   }
-  return { header, claims };
+  return { header: parsed.header, claims: parsed.claims };
+}
+
+export async function verifyTypedJwtWithResolver(
+  token: unknown,
+  input: {
+    resolver: TrustedSigningKeyResolver;
+    issuer: string;
+    audience: string;
+    typ: string;
+    requiredClaims: readonly string[];
+    now: Date;
+  },
+): Promise<VerifiedJwt> {
+  const parsed = await parseTypedJwt(token, input.typ, input.requiredClaims);
+  if (parsed.claims['iss'] !== input.issuer || parsed.claims['aud'] !== input.audience) throw new Error('Unexpected signed token issuer or audience');
+  const issuedAt = parsed.claims['iat'];
+  const expiresAt = parsed.claims['exp'];
+  if (typeof issuedAt !== 'number' || !Number.isSafeInteger(issuedAt) || issuedAt <= 0 ||
+    typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt <= issuedAt) {
+    throw new Error('Invalid signed token key-selection time');
+  }
+  const kid = parsed.header['kid'];
+  if (typeof kid !== 'string') throw new Error('Invalid signed token key id');
+  const trustedTime = Math.floor(input.now.getTime() / 1000);
+  if (!Number.isSafeInteger(trustedTime) || trustedTime <= 0) throw new Error('Invalid trusted verification time');
+  const selected = await input.resolver.resolveKey({
+    kid,
+    targetIssuer: input.issuer,
+    jwtTyp: input.typ,
+    audience: input.audience,
+    trustedTime,
+    issuedAt,
+    expiresAt,
+  });
+  const verified = await verifyTypedJwtWithKey(token, {
+    publicKey: selected.publicKey,
+    keyId: kid,
+    issuer: input.issuer,
+    audience: input.audience,
+    typ: input.typ,
+    requiredClaims: input.requiredClaims,
+    now: input.now,
+  });
+  if (selected.verifyUntil !== null && (trustedTime >= selected.verifyUntil || expiresAt > selected.verifyUntil)) {
+    throw new Error('Signed token exceeds its trusted key verification window');
+  }
+  return verified;
 }
 
 export function assertExactClaims(claims: Record<string, unknown>, names: readonly string[]): void {
