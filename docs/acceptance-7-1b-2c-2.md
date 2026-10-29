@@ -14,6 +14,14 @@
 - 修复后，同样的用例拒绝静默删除和状态/检查点分叉；v1(A)→合法退休(A)+B→保留期结束后删除 A 可成功，退休前真实 A lease 继续验签；已吊销 A 后可在后续包省略，但墓碑持续拒绝复活。
 - 存储升级为主状态加独立单调检查点；检查点以 pending→主状态→committed 的顺序持久化，并保存足够的根签名恢复证据。旧 marker schema 不作为新安装或迁移输入。
 
+### R1 独立基线复现与当前树复核（2026-10-29）
+
+- 在临时 detached worktree `1779d909a9bbe381f689f7c8cad09684bbabdad4` 上用真实临时 Ed25519 根、A/B 密钥及根签名 bundle 复现：旧实现接受只含 B 的 v2；A 的真实未过期 lease 随后被该 v2 resolver 拒绝，错误为 `Center signing key is absent from root-authenticated trust bundle`。
+- 同一旧实现先接受 v1，再由根签名 v2 吊销 A；只把状态文件字节恢复为保存的 v1 后重启，`getAccepted()` 返回 bundle 1、吊销墓碑为空，A 的真实 lease 又通过验证。两个场景都确认了修复前缺口。
+- 当前实现的既有真实签名回归覆盖静默删除拒绝、生命周期合法退休和历史 lease 延续、检查点与状态分叉拒绝、吊销历史不可复活；不是 mock 公钥或签名验证。
+- 在当前树 `8f6570e0f4162ee30eb9d0101423dbad54762c76` 复跑 Node.js 24.22.0：48项 unit/interop 与 PostgreSQL 18/HTTPS 89项全部通过，共137项；typecheck、build、npm audit 亦通过。当前树复核不改写历史 R2 验收数据。
+- 当前树 Docker 无缓存构建通过，manifest list digest 为 `sha256:41374411517b5235e40c009ce478662b052450d606c2eb43598041e2de77c951`；最终 `/app` 不含离线签发目录/命令、私钥文件或 PEM 私钥块，运行时 package manifest 无 scripts。
+
 ## 基线与边界
 
 - 冻结基线：`d80baae43ba03c220966e26217005dc10e2c49b0`；起始 `HEAD` 与 `origin/main` 一致。

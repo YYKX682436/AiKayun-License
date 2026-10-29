@@ -42,7 +42,7 @@ payload claim 集精确为：
 verify_until >= retire_after + 604800 + propagation_budget_seconds
 ```
 
-发布传播预算必须由发行输入显式提供并随签名包记录。key 的 `not_before` 和 `retire_after` 限制 token 签发 `iat`；`retire_after` 本身不会提前使旧 lease 失效。退休前签发、当前仍未过 `exp`、且整个 token 未越过 `verify_until` 的 lease 可继续验签。`trusted_time >= verify_until`、JWT `exp > verify_until` 或 `iat > retire_after` 均不能授予新经营资格。
+发布传播预算必须由发行输入显式提供并随签名包记录。key 的 `not_before` 和 `retire_after` 限制 token 签发 `iat`；`retire_after` 是不包含的签发边界（`iat < retire_after` 才合法），但它本身不会提前使之前签发的 lease 失效。退休前签发、当前仍未过 `exp`、且整个 token 未越过 `verify_until` 的 lease 可继续验签。`trusted_time >= verify_until`、JWT `exp > verify_until` 或 `iat >= retire_after` 均不能授予新经营资格。
 
 当已接受的新包声明 `revoked_at` 后，该 key 即刻被禁止用于新的经营证据，包括尚未过期的旧 lease。吊销 kid 会写入持久化墓碑；后续包可省略该 key，但不能把墓碑 kid 作为未吊销 key 重新引入。已经提交的历史凭证可保留为历史业务证据，不能用历史验签恢复新订单权限。完全离线安装无法立即收到紧急吊销；本内核不承诺网络隔离时远程即时撤销。
 
