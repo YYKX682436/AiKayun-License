@@ -6,28 +6,29 @@
 
 ## 本地隔离运行
 
-需要 Node.js 24、npm、Docker Compose 和 OpenSSL。`.env.example` 中的数据库账号只用于本机开发。Compose 将 PostgreSQL 与 HTTPS API 端口绑定到 `127.0.0.1`，API 容器只在本地 Compose 网络监听通配地址。
+需要 Node.js 24、npm、Docker Compose 和 OpenSSL。Compose 仅提供隔离的本机 PostgreSQL 与 API 容器；数据库和 HTTPS API 端口绑定到 `127.0.0.1`，数据库首次初始化会另建 `license_center_test`。`.env.example` 中的数据库账号只用于本机开发。
+
+**当前仓库没有从空目录一键生成全部开发凭据并初始化 signer authority 的 bootstrap 命令。** `docker compose up` 不会替你生成或安装在线 keyring、离线 root 公钥、A/B 在线私钥、root-signed trust bundle，也不会在数据库中创建 signer authority；缺少任何一项时 API 不可用。不要使用旧版单密钥 keygen 步骤：`npm run keygen` 只产生孤立在线密钥，无法初始化当前数据库权威 signer。
+
+首次启动前须按需准备以下隔离开发材料，并确认都不是生产材料：
+
+- `secrets/license-tls-key.pem` 与 `secrets/license-tls-cert.pem`：`license.example.test` 的本机 HTTPS 证书/私钥；TLS 私钥权限为 `0600` 或更严。
+- `secrets/license-signing-key-a.pem`、`secrets/license-signing-key-b.pem`：两个不同的 Ed25519 PKCS#8 在线测试私钥，权限为 `0600` 或 `0400`。
+- `secrets/online-signing-keyring.json`：schema `1` 清单，`keys` 项为 `{ "kid": "<对应公钥 RFC7638 JKT>", "path": "/run/secrets/license-signing-key-a.pem" }` 等绝对容器路径；初始权威指向的 key 必须在清单中。
+- `secrets/offline-root-public.json`：严格 Ed25519 公钥 JWK `{ "kty":"OKP", "crv":"Ed25519", "x":"..." }`。其配对的临时开发根私钥仅供离线工具签 bundle，不挂载进 API 容器。
+- 由该临时根签署、issuer 为 `https://license.example.test`、包含 A/B 公钥及有效 lifecycle 的 bundle；bundle 与当前 `LICENSE_TRUST_BUNDLE_MIN_VERSION` 相容。
+
+数据库准备、测试与服务可用是三个不同步骤。以下命令只启动空的隔离开发 PostgreSQL，不表示 signer 已初始化，也不会启动可用 API：
 
 ```sh
 npm ci
 cp .env.example .env
-mkdir -p secrets
-npm run keygen -- secrets/license-signing-key.pem secrets/license-signing-public.pem
-chmod 600 secrets/license-signing-key.pem
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj '/CN=license.example.test' \
-  -addext 'subjectAltName=DNS:license.example.test' \
-  -keyout secrets/license-tls-key.pem \
-  -out secrets/license-tls-cert.pem
-chmod 600 secrets/license-tls-key.pem
-export LICENSE_CONTAINER_UID="$(id -u)"
-export LICENSE_CONTAINER_GID="$(id -g)"
-docker compose up -d --build
+docker compose up -d postgres
 ```
 
-JWT Ed25519 签名密钥与 HTTPS 服务器密钥是两把独立密钥。服务启动时必须读取两把私钥和证书；缺少文件、权限过宽或证书无法读取时会拒绝启动，不会自动生成生产密钥。`.env`、`secrets/`、私钥、证书和本地构建文件均已加入忽略规则。
+接着需由维护者按 [`docs/signing-key-rotation-7-1b-2c-3.md`](docs/signing-key-rotation-7-1b-2c-3.md) 的 root-signed bundle 格式/离线签名流程准备临时开发材料，并按照 [`docs/admin-cli.md`](docs/admin-cli.md) 配置受保护的本机 CLI 策略和独立数据库角色。用 `signer initialize` 执行两步摘要确认后，才可以启动 API。`docker compose up -d api` 使用的 A/B key 文件挂载和 `.env` 配置必须与上述 keyring 完全匹配。完整的空目录自动化启动流程尚未验证；本 README 不提供会看似成功但无法启动的完整命令。
 
-PostgreSQL 的首次初始化会创建独立的 `license_center_test` 数据库。本机真实数据库集成测试使用它，不连接业务数据库：
+PostgreSQL 的首次初始化会创建独立 `license_center_test` 数据库。本机真实数据库集成测试使用该库，不连接业务数据库：
 
 ```sh
 LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/license_center_test npm run test:integration
@@ -39,7 +40,7 @@ LICENSE_TEST_DATABASE_URL=postgres://license:license-dev-only@127.0.0.1:55432/li
 docker compose exec postgres psql -U license -d license_center -c 'CREATE DATABASE license_center_test OWNER license;'
 ```
 
-清除本机开发数据时，`docker compose down --volumes` 会删除该 Compose 项目的整个 PostgreSQL 数据卷。
+`/v1/time-anchor` 只有在 signer authority 已初始化且 API 配置有效后才可签发锚。验收测试中的临时根/key、数据库 signer 初始化和测试证书由测试夹具创建，不应复制为生产凭据。清除本机开发数据时，`docker compose down --volumes` 会删除该 Compose 项目的整个 PostgreSQL 数据卷。
 
 ## 验证
 
