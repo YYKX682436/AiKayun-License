@@ -14,6 +14,7 @@ import { signTimeAnchor, verifyTimeAnchorWithTrustBundleCandidate } from '../../
 import {
   buildTrustBundleClaims,
   compareBundleVersions,
+  MAX_TRUSTED_KEY_TOMBSTONES,
   signTrustBundle,
   verifyTrustBundleSignature,
 } from '../../src/trust/trust-bundle.js';
@@ -41,6 +42,10 @@ let centerKeyTwo: CryptoKey;
 let centerVerifyTwo: CryptoKey;
 let centerPublicTwo: Ed25519PublicJwk;
 let centerKidTwo: string;
+let centerKeyThree: CryptoKey;
+let centerVerifyThree: CryptoKey;
+let centerPublicThree: Ed25519PublicJwk;
+let centerKidThree: string;
 
 async function createEd25519Pair(): Promise<{ privateKey: CryptoKey; publicKey: CryptoKey; publicJwk: Ed25519PublicJwk; kid: string }> {
   const pair = await generateKeyPair('Ed25519', { extractable: true });
@@ -64,6 +69,11 @@ async function initKeys(): Promise<void> {
   centerVerifyTwo = two.publicKey;
   centerPublicTwo = two.publicJwk;
   centerKidTwo = two.kid;
+  const three = await createEd25519Pair();
+  centerKeyThree = three.privateKey;
+  centerVerifyThree = three.publicKey;
+  centerPublicThree = three.publicJwk;
+  centerKidThree = three.kid;
 }
 
 async function publicEntry(
@@ -343,9 +353,14 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const secondAccepted = await trust.accept(second, retireAt);
     const preRetirementLease = await lease({
       privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
-    }, retireAt - 10);
+    }, retireAt);
     await expect(verifyLicenseLeaseWithTrustedKeys(preRetirementLease.token, {
       resolver: secondAccepted.resolver, issuer: CENTER_ISSUER, now: new Date(retireAt * 1000),
+    })).resolves.toBeTruthy();
+    const duringRetentionTime = retireAt + 7 * DAY - 1;
+    const duringRetention = await trust.getAccepted(duringRetentionTime);
+    await expect(verifyLicenseLeaseWithTrustedKeys(preRetirementLease.token, {
+      resolver: duringRetention.resolver, issuer: CENTER_ISSUER, now: new Date(duringRetentionTime * 1000),
     })).resolves.toBeTruthy();
 
     const removedBeforeRetention = await bundle({
@@ -397,6 +412,184 @@ describe('offline-root trust bundle and monotonic key selection', () => {
       })],
     });
     await expect(activeStore.accept(backdated, BASE + 100)).rejects.toThrow(/backdated/i);
+  });
+
+  it('R2 regression: permanently tombstones a fully retired kid while allowing a fresh key', async () => {
+    await initKeys();
+    const trust = await store();
+    await trust.accept(await bundle({ version: '1' }), BASE);
+    const retireAt = BASE + 100;
+    const verifyUntil = retireAt + 8 * DAY;
+    const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+      not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+    });
+    await trust.accept(await bundle({
+      version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+      exp: retireAt + 30 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+    }), retireAt);
+    await trust.accept(await bundle({
+      version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+      exp: verifyUntil + 30 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+    }), verifyUntil);
+
+    const reactivatedAt = verifyUntil + 10;
+    const v4 = await bundle({
+      version: '4', time: reactivatedAt, iat: reactivatedAt - 20, nbf: reactivatedAt - 10,
+      exp: reactivatedAt + 30 * DAY,
+      keys: [await publicEntry(centerPublicOne, centerKidOne), await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await expect(trust.accept(v4, reactivatedAt)).rejects.toThrow(/permanently retired|identity/i);
+    const newLeaseByA = await lease({
+      privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
+    }, reactivatedAt);
+    await expect(verifyLicenseLeaseWithTrustedKeys(newLeaseByA.token, {
+      resolver: (await trust.getAccepted(reactivatedAt)).resolver, issuer: CENTER_ISSUER, now: new Date(reactivatedAt * 1000),
+    })).rejects.toThrow(/key|kid/i);
+    const acceptedV4 = await trust.accept(await bundle({
+      version: '4', time: reactivatedAt, iat: reactivatedAt - 20, nbf: reactivatedAt - 10,
+      exp: reactivatedAt + 30 * DAY,
+      keys: [await publicEntry(centerPublicTwo, centerKidTwo), await publicEntry(centerPublicThree, centerKidThree)],
+    }), reactivatedAt);
+    const newLeaseByC = await lease({
+      privateKey: centerKeyThree, publicKey: centerVerifyThree, publicJwk: centerPublicThree, kid: centerKidThree,
+    }, reactivatedAt);
+    await expect(verifyLicenseLeaseWithTrustedKeys(newLeaseByC.token, {
+      resolver: acceptedV4.resolver, issuer: CENTER_ISSUER, now: new Date(reactivatedAt * 1000),
+    })).resolves.toBeTruthy();
+    expect(acceptedV4.retiredKids).toContain(centerKidOne);
+  });
+
+  it('persists permanent retirement separately from revocation and detects a state-only rollback', async () => {
+    await initKeys();
+    const directory = await mkdtemp(join(tmpdir(), 'aikayun-trust-retired-checkpoint-'));
+    temporaryDirectories.push(directory);
+    const trust = await store({ directory });
+    await trust.accept(await bundle({ version: '1' }), BASE);
+    const retireAt = BASE + 100;
+    const verifyUntil = retireAt + 8 * DAY;
+    const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+      not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+    });
+    await trust.accept(await bundle({
+      version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+      exp: retireAt + 30 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+    }), retireAt);
+    const statePath = join(directory, 'trust-bundle-state.json');
+    const savedRetirementState = await readFile(statePath);
+    const v3 = await bundle({
+      version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+      exp: verifyUntil + 30 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await trust.accept(v3, verifyUntil);
+    const committedV3State = await readFile(statePath);
+
+    const restarted = await store({ directory });
+    const acceptedV3 = await restarted.getAccepted(verifyUntil);
+    expect(acceptedV3.retiredKids).toContain(centerKidOne);
+    expect(acceptedV3.revokedKids).not.toContain(centerKidOne);
+
+    await writeFile(statePath, savedRetirementState);
+    await expect((await store({ directory })).getAccepted(verifyUntil)).rejects.toThrow(/checkpoint|mismatch/i);
+    await writeFile(statePath, committedV3State);
+    const recovered = await (await store({ directory })).getAccepted(verifyUntil);
+    expect(recovered.retiredKids).toContain(centerKidOne);
+    const reuse = await bundle({
+      version: '4', time: verifyUntil + 1, iat: verifyUntil - 19, nbf: verifyUntil - 9,
+      exp: verifyUntil + 30 * DAY,
+      keys: [await publicEntry(centerPublicOne, centerKidOne), await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await expect((await store({ directory })).accept(reuse, verifyUntil + 1)).rejects.toThrow(/permanently retired/i);
+  });
+
+  it('rejects a new retirement when permanent tombstone capacity is exhausted', async () => {
+    await initKeys();
+    const directory = await mkdtemp(join(tmpdir(), 'aikayun-trust-retired-capacity-'));
+    temporaryDirectories.push(directory);
+    const trust = await store({ directory });
+    await trust.accept(await bundle({ version: '1' }), BASE);
+    const retireAt = BASE + 100;
+    const verifyUntil = retireAt + 8 * DAY;
+    const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+      not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+    });
+    await trust.accept(await bundle({
+      version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+      exp: retireAt + 30 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+    }), retireAt);
+
+    const retiredIdSet = new Set<string>();
+    while (retiredIdSet.size < MAX_TRUSTED_KEY_TOMBSTONES) {
+      const kid = randomBytes(32).toString('base64url');
+      if (kid !== centerKidOne && kid !== centerKidTwo) retiredIdSet.add(kid);
+    }
+    const retiredIds = [...retiredIdSet].sort();
+    const statePath = join(directory, 'trust-bundle-state.json');
+    const checkpointPath = join(directory, 'trust-bundle-store.marker.json');
+    const state = JSON.parse((await readFile(statePath)).toString('utf8')) as { retired_kids: string[] };
+    const checkpoint = JSON.parse((await readFile(checkpointPath)).toString('utf8')) as {
+      committed: { retired_kids: string[] };
+    };
+    state.retired_kids = retiredIds;
+    checkpoint.committed.retired_kids = retiredIds;
+    await writeFile(statePath, JSON.stringify(state));
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+    const stateAtCapacity = await readFile(statePath);
+    const checkpointAtCapacity = await readFile(checkpointPath);
+    await expect((await store({ directory })).getAccepted(retireAt)).resolves.toMatchObject({ retiredKids: retiredIds });
+
+    const removeA = await bundle({
+      version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+      exp: verifyUntil + 30 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+    });
+    await expect(trust.accept(removeA, verifyUntil)).rejects.toThrow(/retirement history is full/i);
+    expect(await readFile(statePath)).toEqual(stateAtCapacity);
+    expect(await readFile(checkpointPath)).toEqual(checkpointAtCapacity);
+  });
+
+  it('keeps permanent retirement monotonic across pending, state-ahead, and committed crash windows', async () => {
+    await initKeys();
+    const stages: Array<{ stage: TrustStoreWriteStage; committed: boolean }> = [
+      { stage: 'checkpoint_prepare_after_directory_fsync', committed: false },
+      { stage: 'state_after_directory_fsync', committed: true },
+      { stage: 'checkpoint_commit_after_directory_fsync', committed: true },
+    ];
+    for (const { stage, committed } of stages) {
+      const directory = await mkdtemp(join(tmpdir(), `aikayun-trust-permanent-${stage}-`));
+      temporaryDirectories.push(directory);
+      const trust = await store({ directory });
+      await trust.accept(await bundle({ version: '1' }), BASE);
+      const retireAt = BASE + 100;
+      const verifyUntil = retireAt + 8 * DAY;
+      const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+        not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+      });
+      await trust.accept(await bundle({
+        version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+        exp: retireAt + 30 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+      }), retireAt);
+      const v3 = await bundle({
+        version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+        exp: verifyUntil + 30 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+      });
+      const crashing = await store({ directory, faultAt: (observed) => {
+        if (observed === stage) throw new Error(`simulated retirement crash at ${stage}`);
+      } });
+      await expect(crashing.accept(v3, verifyUntil)).rejects.toThrow(/simulated retirement crash/i);
+
+      const restarted = await store({ directory });
+      let accepted = await restarted.getAccepted(verifyUntil);
+      expect(accepted.bundleVersion).toBe(committed ? '3' : '2');
+      expect(accepted.retiredKids.includes(centerKidOne)).toBe(committed);
+      if (!committed) accepted = await restarted.accept(v3, verifyUntil);
+      expect(accepted.retiredKids).toContain(centerKidOne);
+
+      const reuse = await bundle({
+        version: '4', time: verifyUntil + 1, iat: verifyUntil - 19, nbf: verifyUntil - 9,
+        exp: verifyUntil + 30 * DAY,
+        keys: [await publicEntry(centerPublicOne, centerKidOne), await publicEntry(centerPublicTwo, centerKidTwo)],
+      });
+      await expect(restarted.accept(reuse, verifyUntil + 1)).rejects.toThrow(/permanently retired/i);
+    }
   });
 
   it('rejects expired bundles without replacing the accepted last-good version', async () => {
@@ -495,6 +688,7 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const omitted = await bundle({ version: '3', keys: [await publicEntry(centerPublicTwo, centerKidTwo)] });
     const acceptedAfterOmission = await trust.accept(omitted, BASE);
     expect(acceptedAfterOmission.revokedKids).toContain(centerKidOne);
+    expect(acceptedAfterOmission.retiredKids).not.toContain(centerKidOne);
     await expect(verifyLicenseLeaseWithTrustedKeys(oldLease.token, {
       resolver: acceptedAfterOmission.resolver, issuer: CENTER_ISSUER, now: new Date(BASE * 1000),
     })).rejects.toThrow(/key|kid/i);
@@ -587,6 +781,52 @@ describe('offline-root trust bundle and monotonic key selection', () => {
       await expect(crashingRecovery.getAccepted(BASE)).rejects.toThrow(/simulated interruption/i);
       const restarted = await store({ directory });
       expect((await restarted.getAccepted(BASE)).bundleVersion).toBe('2');
+    }
+  });
+
+  it('never revives a retired kid across pending, state-ahead, or committed retirement writes', async () => {
+    await initKeys();
+    const cases: Array<{ stage: TrustStoreWriteStage; retiredAtRecovery: boolean }> = [
+      { stage: 'checkpoint_prepare_after_directory_fsync', retiredAtRecovery: false },
+      { stage: 'state_after_directory_fsync', retiredAtRecovery: true },
+      { stage: 'checkpoint_commit_after_directory_fsync', retiredAtRecovery: true },
+    ];
+    for (const { stage, retiredAtRecovery } of cases) {
+      const directory = await mkdtemp(join(tmpdir(), `aikayun-trust-retirement-${stage}-`));
+      temporaryDirectories.push(directory);
+      const trust = await store({ directory });
+      await trust.accept(await bundle({ version: '1' }), BASE);
+      const retireAt = BASE + 100;
+      const verifyUntil = retireAt + 8 * DAY;
+      const retiredA = await publicEntry(centerPublicOne, centerKidOne, {
+        not_before: BASE - 1_000, retire_after: retireAt, verify_until: verifyUntil,
+      });
+      await trust.accept(await bundle({
+        version: '2', time: retireAt, iat: retireAt - 20, nbf: retireAt - 10,
+        exp: retireAt + 30 * DAY, keys: [retiredA, await publicEntry(centerPublicTwo, centerKidTwo)],
+      }), retireAt);
+      const v3 = await bundle({
+        version: '3', time: verifyUntil, iat: verifyUntil - 20, nbf: verifyUntil - 10,
+        exp: verifyUntil + 30 * DAY, keys: [await publicEntry(centerPublicTwo, centerKidTwo)],
+      });
+      const crashing = await store({ directory, faultAt: (observed) => {
+        if (observed === stage) throw new Error(`simulated retirement interruption at ${stage}`);
+      } });
+      await expect(crashing.accept(v3, verifyUntil)).rejects.toThrow(/simulated retirement interruption/i);
+
+      const restarted = await store({ directory });
+      let accepted = await restarted.getAccepted(verifyUntil);
+      expect(accepted.retiredKids.includes(centerKidOne)).toBe(retiredAtRecovery);
+      if (!retiredAtRecovery) {
+        accepted = await restarted.accept(v3, verifyUntil);
+        expect(accepted.retiredKids).toContain(centerKidOne);
+      }
+      const forbiddenV4 = await bundle({
+        version: '4', time: verifyUntil + 1, iat: verifyUntil - 19, nbf: verifyUntil - 9,
+        exp: verifyUntil + 30 * DAY,
+        keys: [await publicEntry(centerPublicOne, centerKidOne), await publicEntry(centerPublicTwo, centerKidTwo)],
+      });
+      await expect(restarted.accept(forbiddenV4, verifyUntil + 1)).rejects.toThrow(/permanently retired/i);
     }
   });
 });

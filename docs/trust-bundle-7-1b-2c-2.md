@@ -48,6 +48,8 @@ verify_until >= retire_after + 604800 + propagation_budget_seconds
 
 生命周期是同一 key record 的单向状态转换：未退休的 key 可保持不变，或在接受新 bundle 时设置 `retire_after/verify_until`；正常退休的 `retire_after` 不能早于当次可信接受时间，且 `verify_until` 必须继续满足七天 lease 保留期加显式传播预算。退休前的 lease 在 `verify_until` 前仍可验证。退休字段一旦设置便不可修改，`not_before` 从首次接受后不可修改；因此不能抬高起效时间、回填退休时间或缩短保留期来废除旧凭证。紧急吊销是唯一可跳过正常保留期的退出路径，墓碑不可逆。未吊销 active key 不能从新包删除；退休 key 只有在可信时间到达 `verify_until` 后才能删除。已经完成保留期或已吊销的 key 可从后续包移除，墓碑仍留在持久检查点，不要求 key 列表永久增长。
 
+正常退休移除与紧急吊销使用两类独立历史墓碑：`retired_kids` 记录已完成 `verify_until` 并从当前 bundle 退出的 kid；`revoked_kids` 记录紧急吊销。正常退休墓碑只在 R1 生命周期检查允许移除的同一次版本提交中写入。key 在 `verify_until` 前仍留在 bundle，可用于验证合法历史 lease；时间到达后，其经营验证窗口已经结束，再将它移除并永久记入 `retired_kids`。墓碑一旦提交，任何后续 bundle 即使由同一离线根签名、版本更高，也不得再次包含该 kid。两类墓碑不会互相转换或互相代替。
+
 ## 离线签发
 
 专用入口位于 `tools/offline-trust/sign.ts`，并不属于 `src/` 构建入口。该命令只读取明确传入的根私钥文件，不检查中心在线签名 key 配置，也没有任何自动回退路径。根 key 文件必须是当前有效 UID 拥有的普通单链接文件，拒绝 symlink/hard link；POSIX 权限仅允许非可执行 `0400` 或 `0600`。文件大小上限8KiB，使用 `O_NOFOLLOW` 和打开后 inode/size 复核。读取缓冲区使用后清零；私钥不输出到 stdout/stderr。
@@ -80,7 +82,7 @@ Dockerfile 只把 `src/` 编译进服务镜像，不复制 `tools/`；`tsconfig.
 
 `TrustBundleStore` 是无数据库依赖的客户端中立组件。构造时必须从可信发行工件获得 `trustedRoot`、`expectedCenterIssuer` 和 `minimumBundleVersion`。不能把下载到的第一个包自动作为根或初始版本。最低版本和 bundle 版本使用独立正整数十进制字符串，与数据库 `time_epoch`、generation、entitlement revision 无关。
 
-每个私有目录有主状态 `trust-bundle-state.json` 和独立单调检查点 `trust-bundle-store.marker.json`。主状态保存当前签名 JWS、版本、工件摘要和墓碑；检查点另行保存已提交 head 的相同身份、完整 JWS、墓碑、受信发行最低版本，以及提交期间的 pending 转换证据。检查点不是发生分叉时可任选的备份副本：无 pending 时两个文件必须精确一致；状态单文件回滚、丢失、损坏或同版本摘要冲突均 fail closed。旧版仅含最低版本 marker 的结构不再兼容，不能被当作新安装或用它重置水位。目录要求 POSIX `0700` 或更严，文件 `0600` 或更严。
+每个私有目录有主状态 `trust-bundle-state.json` 和独立单调检查点 `trust-bundle-store.marker.json`。R2 的 state/checkpoint schema 为2，不兼容旧 schema。主状态保存当前签名 JWS、版本、工件摘要及分离的 `revoked_kids/retired_kids`；检查点另行保存已提交 head 的相同身份、完整 JWS、两类完整墓碑、受信发行最低版本，以及提交期间的 pending 转换证据。检查点不是发生分叉时可任选的备份副本：无 pending 时两个文件必须精确一致；状态单文件回滚、丢失、损坏或同版本摘要冲突均 fail closed。旧版仅含最低版本 marker 的结构不再兼容，不能被当作新安装或用它重置水位。目录要求 POSIX `0700` 或更严，文件 `0600` 或更严。
 
 接受版本的持久顺序是：
 
@@ -88,7 +90,9 @@ Dockerfile 只把 `src/` 编译进服务镜像，不复制 `tools/`；`tsconfig.
 2. 再原子写主状态的新 head，并对临时文件、rename 后目录执行 `fsync`。
 3. 最后将检查点原子提交为新 committed head 并清除 pending；该检查点目录 `fsync` 成功后 `accept()` 才返回成功。
 
-重启时，pending 检查点若仍对应旧主状态，说明新状态尚未安装，安全丢弃 pending 并保留旧 head；若主状态精确对应 pending 新状态，则重新验根签名、版本、生命周期连续性、接受时有效期和墓碑，再补交检查点。任何第三种组合均拒绝。检查点已提交而状态较旧时不能降级；特别是确认 v2 后单独恢复 v1 状态文件会与 v2 检查点分叉并 fail closed。检查点提交后状态文件缺失也拒绝，不从副本自动重建业务信任。每个文件的部分写入、文件 fsync、rename、目录 fsync 中断都按上述规则重试或拒绝，不会选择较低版本。
+重启时，pending 检查点若仍对应旧主状态，说明新状态尚未安装，安全丢弃 pending 并保留旧 head；若主状态精确对应 pending 新状态，则重新验根签名、版本、生命周期连续性、接受时有效期及两类墓碑，再补交检查点。退休移除形成的 `retired_kids` 在 pending、主状态和 committed 检查点中一致恢复；任何第三种组合均拒绝。检查点已提交而状态较旧时不能降级；特别是确认 v2 后单独恢复 v1 状态文件会与 v2 检查点分叉并 fail closed。检查点提交后状态文件缺失也拒绝，不从副本自动重建业务信任。每个文件的部分写入、文件 fsync、rename、目录 fsync 中断都按上述规则重试或拒绝，不会选择较低版本。
+
+两类墓碑合计最多保存256个kid，保证最大bundle和状态文件仍在持久化大小限制内。到达容量时，若新接受会新增墓碑，操作直接拒绝，不截断或覆盖任何历史；两个墓碑集合也不得重叠。发行方需在受控升级/存储容量处置前停止该次轮换；绝不以丢弃墓碑换取接受新包。
 
 单目录更新、读取和 resolver 当前性检查经进程内队列与排他文件锁串行；同机陈旧锁只在确认 PID 不存在后清理，无法解释或属于其他主机的锁状态保持拒绝。并发写入不会绕过版本比较。
 

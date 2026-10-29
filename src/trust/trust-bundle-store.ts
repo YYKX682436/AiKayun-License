@@ -14,6 +14,7 @@ import {
   getRootAuthenticatedCandidateKey,
   trustBundleKeyAudience,
   verifyTrustBundleSignature,
+  MAX_TRUSTED_KEY_TOMBSTONES,
 } from './trust-bundle.js';
 import type {
   RootAuthenticatedTrustBundleCandidate,
@@ -25,8 +26,8 @@ const STATE_FILE_NAME = 'trust-bundle-state.json';
 const CHECKPOINT_FILE_NAME = 'trust-bundle-store.marker.json';
 const MAX_STATE_BYTES = 32 * 1024;
 const MAX_CHECKPOINT_BYTES = 64 * 1024;
-const STATE_FIELDS = ['state_schema', 'bundle_version', 'artifact_sha256', 'token', 'revoked_kids'] as const;
-const RECORD_FIELDS = ['bundle_version', 'artifact_sha256', 'token', 'revoked_kids'] as const;
+const STATE_FIELDS = ['state_schema', 'bundle_version', 'artifact_sha256', 'token', 'revoked_kids', 'retired_kids'] as const;
+const RECORD_FIELDS = ['bundle_version', 'artifact_sha256', 'token', 'revoked_kids', 'retired_kids'] as const;
 const CHECKPOINT_FIELDS = [
   'checkpoint_schema', 'expected_center_issuer', 'trusted_root_kid', 'minimum_bundle_version', 'committed', 'pending',
 ] as const;
@@ -77,6 +78,7 @@ export interface AcceptedTrustBundle {
   readonly centerIssuer: string;
   readonly acceptedIdempotently: boolean;
   readonly revokedKids: readonly string[];
+  readonly retiredKids: readonly string[];
   readonly claims: RootAuthenticatedTrustBundleCandidate['claims'];
   readonly resolver: TrustedSigningKeyResolver;
 }
@@ -86,6 +88,7 @@ interface BundleRecord {
   artifact_sha256: string;
   token: string;
   revoked_kids: string[];
+  retired_kids: string[];
 }
 
 interface PendingRecord {
@@ -96,7 +99,7 @@ interface PendingRecord {
 }
 
 interface DurableCheckpoint {
-  checkpoint_schema: 1;
+  checkpoint_schema: 2;
   expected_center_issuer: string;
   trusted_root_kid: string;
   minimum_bundle_version: string;
@@ -136,7 +139,7 @@ function safeKid(value: unknown): string {
 }
 
 function safeRevocations(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length > 256) throw new Error('Trust bundle revocation history is invalid');
+  if (!Array.isArray(value) || value.length > MAX_TRUSTED_KEY_TOMBSTONES) throw new Error('Trust bundle revocation history is invalid');
   const revoked = value.map(safeKid);
   if (new Set(revoked).size !== revoked.length || [...revoked].sort().join(',') !== revoked.join(',')) {
     throw new Error('Trust bundle revocation history is not canonical');
@@ -144,11 +147,40 @@ function safeRevocations(value: unknown): string[] {
   return revoked;
 }
 
+function assertTombstoneCapacity(revokedKids: readonly string[], retiredKids: readonly string[]): void {
+  if (revokedKids.some((kid) => retiredKids.includes(kid))) {
+    throw new Error('Emergency revocation and permanent retirement tombstones must remain distinct');
+  }
+  if (revokedKids.length + retiredKids.length > MAX_TRUSTED_KEY_TOMBSTONES) {
+    throw new Error('Trust key tombstone capacity is full; refusing to discard security history');
+  }
+}
+
 function revokedKidsFor(candidate: RootAuthenticatedTrustBundleCandidate, previous: readonly string[]): string[] {
   const all = new Set(previous);
   for (const key of candidate.claims.keys) if (key.revoked_at !== null) all.add(key.kid);
-  if (all.size > 256) throw new Error('Trust bundle revocation history exceeds the supported local bound');
+  if (all.size > MAX_TRUSTED_KEY_TOMBSTONES) throw new Error('Trust bundle revocation history is full; refusing to discard revocation history');
   return [...all].sort();
+}
+
+function retiredKidsFor(
+  previous: RootAuthenticatedTrustBundleCandidate | null,
+  next: RootAuthenticatedTrustBundleCandidate,
+  previousRevoked: readonly string[],
+  previousRetired: readonly string[],
+  acceptedAt: number,
+): string[] {
+  const retired = new Set(previousRetired);
+  const nextKids = new Set(next.claims.keys.map((key) => key.kid));
+  const revoked = new Set(previousRevoked);
+  for (const key of previous?.claims.keys ?? []) {
+    if (revoked.has(key.kid) || key.revoked_at !== null || nextKids.has(key.kid)) continue;
+    if (key.retire_after !== null && key.verify_until !== null && acceptedAt >= key.verify_until) retired.add(key.kid);
+  }
+  if (retired.size > MAX_TRUSTED_KEY_TOMBSTONES) {
+    throw new Error('Permanent retirement history is full; refusing to discard retired key identities');
+  }
+  return [...retired].sort();
 }
 
 function assertNoRevocationResurrection(
@@ -158,6 +190,16 @@ function assertNoRevocationResurrection(
   const tombstones = new Set(revokedKids);
   for (const key of candidate.claims.keys) {
     if (tombstones.has(key.kid) && key.revoked_at === null) throw new Error('A previously revoked center key cannot be reactivated');
+  }
+}
+
+function assertNoRetirementResurrection(
+  candidate: RootAuthenticatedTrustBundleCandidate,
+  retiredKids: readonly string[],
+): void {
+  const tombstones = new Set(retiredKids);
+  for (const key of candidate.claims.keys) {
+    if (tombstones.has(key.kid)) throw new Error('A permanently retired center key identity cannot be reused');
   }
 }
 
@@ -203,15 +245,22 @@ function assertLifecycleTransition(
 function sameRecord(left: BundleRecord | null, right: BundleRecord | null): boolean {
   if (left === null || right === null) return left === right;
   return left.bundle_version === right.bundle_version && left.artifact_sha256 === right.artifact_sha256 &&
-    left.token === right.token && left.revoked_kids.join(',') === right.revoked_kids.join(',');
+    left.token === right.token && left.revoked_kids.join(',') === right.revoked_kids.join(',') &&
+    left.retired_kids.join(',') === right.retired_kids.join(',');
 }
 
-function recordFromCandidate(candidate: RootAuthenticatedTrustBundleCandidate, revokedKids: readonly string[]): BundleRecord {
+function recordFromCandidate(
+  candidate: RootAuthenticatedTrustBundleCandidate,
+  revokedKids: readonly string[],
+  retiredKids: readonly string[],
+): BundleRecord {
+  assertTombstoneCapacity(revokedKids, retiredKids);
   return {
     bundle_version: candidate.claims.bundle_version,
     artifact_sha256: candidate.artifactSha256,
     token: candidate.token,
     revoked_kids: [...revokedKids].sort(),
+    retired_kids: [...retiredKids].sort(),
   };
 }
 
@@ -286,7 +335,7 @@ export class TrustBundleStore {
       let checkpoint = await this.recoverCheckpoint();
       if (!checkpoint) {
         checkpoint = {
-          checkpoint_schema: 1,
+          checkpoint_schema: 2,
           expected_center_issuer: this.expectedCenterIssuer,
           trusted_root_kid: this.trustedRoot.kid,
           minimum_bundle_version: this.minimumBundleVersion,
@@ -307,14 +356,22 @@ export class TrustBundleStore {
           if (candidate.artifactSha256 !== previousRecord.artifact_sha256 || candidate.token !== previousRecord.token) {
             throw new Error('Same trust bundle version has a different signed artifact');
           }
-          return this.toAccepted(candidate, previousRecord.revoked_kids, now, true);
+          return this.toAccepted(candidate, previousRecord.revoked_kids, previousRecord.retired_kids, now, true);
         }
       }
 
       const revokedKids = revokedKidsFor(candidate, previousRecord?.revoked_kids ?? []);
       assertNoRevocationResurrection(candidate, revokedKids);
       if (previous) assertLifecycleTransition(previous.candidate, candidate, previousRecord!.revoked_kids, now);
-      const next = recordFromCandidate(candidate, revokedKids);
+      const retiredKids = retiredKidsFor(
+        previous?.candidate ?? null,
+        candidate,
+        previousRecord?.revoked_kids ?? [],
+        previousRecord?.retired_kids ?? [],
+        now,
+      );
+      assertNoRetirementResurrection(candidate, retiredKids);
+      const next = recordFromCandidate(candidate, revokedKids, retiredKids);
       const pending: PendingRecord = {
         accepted_at: now,
         previous_version: previousRecord?.bundle_version ?? null,
@@ -325,7 +382,7 @@ export class TrustBundleStore {
       await this.writeState(next, 'state');
       const committed: DurableCheckpoint = { ...checkpoint, committed: next, pending: null };
       await this.writeCheckpoint(committed, 'checkpoint_commit');
-      return this.toAccepted(candidate, revokedKids, now, false);
+      return this.toAccepted(candidate, revokedKids, retiredKids, now, false);
     });
   }
 
@@ -340,13 +397,14 @@ export class TrustBundleStore {
       }
       const loaded = await this.loadRecord(checkpoint.committed);
       assertTrustBundleValidAt(loaded.candidate, now);
-      return this.toAccepted(loaded.candidate, checkpoint.committed.revoked_kids, now, true);
+      return this.toAccepted(loaded.candidate, checkpoint.committed.revoked_kids, checkpoint.committed.retired_kids, now, true);
     });
   }
 
   private toAccepted(
     candidate: RootAuthenticatedTrustBundleCandidate,
     revokedKids: readonly string[],
+    retiredKids: readonly string[],
     trustedTime: number,
     acceptedIdempotently: boolean,
   ): AcceptedTrustBundle {
@@ -357,17 +415,23 @@ export class TrustBundleStore {
       centerIssuer: candidate.claims.sub,
       acceptedIdempotently,
       revokedKids: Object.freeze([...revokedKids]),
+      retiredKids: Object.freeze([...retiredKids]),
       claims: candidate.claims,
-      resolver: resolverFor(candidate, revokedKids, trustedTime, () => this.assertStillCurrent(candidate, revokedKids)),
+      resolver: resolverFor(candidate, revokedKids, trustedTime, () => this.assertStillCurrent(candidate, revokedKids, retiredKids)),
     });
   }
 
-  private async assertStillCurrent(candidate: RootAuthenticatedTrustBundleCandidate, revokedKids: readonly string[]): Promise<void> {
+  private async assertStillCurrent(
+    candidate: RootAuthenticatedTrustBundleCandidate,
+    revokedKids: readonly string[],
+    retiredKids: readonly string[],
+  ): Promise<void> {
     await this.withWriteLock(async () => {
       const checkpoint = await this.recoverCheckpoint();
       const current = checkpoint?.committed;
       if (!current || current.artifact_sha256 !== candidate.artifactSha256 ||
-        current.bundle_version !== candidate.claims.bundle_version || current.revoked_kids.join(',') !== revokedKids.join(',')) {
+        current.bundle_version !== candidate.claims.bundle_version || current.revoked_kids.join(',') !== revokedKids.join(',') ||
+        current.retired_kids.join(',') !== retiredKids.join(',')) {
         throw new Error('Trust key resolver is stale after a bundle or revocation update');
       }
     });
@@ -413,7 +477,18 @@ export class TrustBundleStore {
         if (expectedRevocations.join(',') !== pending.next.revoked_kids.join(',')) {
           throw new Error('Pending trust bundle revocation history is inconsistent');
         }
+        const expectedRetirements = retiredKidsFor(
+          previous?.candidate ?? null,
+          next.candidate,
+          checkpoint.committed?.revoked_kids ?? [],
+          checkpoint.committed?.retired_kids ?? [],
+          pending.accepted_at,
+        );
+        if (expectedRetirements.join(',') !== pending.next.retired_kids.join(',')) {
+          throw new Error('Pending trust bundle permanent retirement history is inconsistent');
+        }
         assertNoRevocationResurrection(next.candidate, expectedRevocations);
+        assertNoRetirementResurrection(next.candidate, expectedRetirements);
         const committed: DurableCheckpoint = { ...checkpoint, committed: pending.next, pending: null };
         await this.writeCheckpoint(committed, 'checkpoint_recovery');
         return committed;
@@ -448,7 +523,7 @@ export class TrustBundleStore {
     const row = value as Record<string, unknown>;
     exactFields(row, CHECKPOINT_FIELDS);
     const minimum = assertMinimumBundleVersion(row['minimum_bundle_version']);
-    if (row['checkpoint_schema'] !== 1 || row['expected_center_issuer'] !== this.expectedCenterIssuer ||
+    if (row['checkpoint_schema'] !== 2 || row['expected_center_issuer'] !== this.expectedCenterIssuer ||
       row['trusted_root_kid'] !== this.trustedRoot.kid ||
       !(row['committed'] === null || (row['committed'] && typeof row['committed'] === 'object' && !Array.isArray(row['committed']))) ||
       !(row['pending'] === null || (row['pending'] && typeof row['pending'] === 'object' && !Array.isArray(row['pending'])))) {
@@ -480,7 +555,7 @@ export class TrustBundleStore {
       throw new Error('Trust bundle checkpoint head is below its pinned minimum version');
     }
     return {
-      checkpoint_schema: 1,
+      checkpoint_schema: 2,
       expected_center_issuer: this.expectedCenterIssuer,
       trusted_root_kid: this.trustedRoot.kid,
       minimum_bundle_version: minimum,
@@ -504,12 +579,13 @@ export class TrustBundleStore {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Trust bundle state is malformed');
     const row = value as Record<string, unknown>;
     exactFields(row, STATE_FIELDS);
-    if (row['state_schema'] !== 1) throw new Error('Trust bundle state schema is unsupported');
+    if (row['state_schema'] !== 2) throw new Error('Trust bundle state schema is unsupported');
     const record = await this.parseRecord({
       bundle_version: row['bundle_version'],
       artifact_sha256: row['artifact_sha256'],
       token: row['token'],
       revoked_kids: row['revoked_kids'],
+      retired_kids: row['retired_kids'],
     });
     return { record, candidate: (await this.loadRecord(record)).candidate };
   }
@@ -519,11 +595,15 @@ export class TrustBundleStore {
     const version = assertMinimumBundleVersion(value['bundle_version']);
     const digest = safeDigest(value['artifact_sha256']);
     if (typeof value['token'] !== 'string' || value['token'].length === 0) throw new Error('Trust bundle durable token is malformed');
+    const revokedKids = safeRevocations(value['revoked_kids']);
+    const retiredKids = safeRevocations(value['retired_kids']);
+    assertTombstoneCapacity(revokedKids, retiredKids);
     return {
       bundle_version: version,
       artifact_sha256: digest,
       token: value['token'],
-      revoked_kids: safeRevocations(value['revoked_kids']),
+      revoked_kids: revokedKids,
+      retired_kids: retiredKids,
     };
   }
 
@@ -536,6 +616,7 @@ export class TrustBundleStore {
       throw new Error('Persisted trust bundle does not match its durable checkpoint identity');
     }
     assertNoRevocationResurrection(candidate, record.revoked_kids);
+    assertNoRetirementResurrection(candidate, record.retired_kids);
     for (const key of candidate.claims.keys) {
       if (key.revoked_at !== null && !record.revoked_kids.includes(key.kid)) {
         throw new Error('Durable checkpoint is missing a signed key revocation tombstone');
@@ -545,7 +626,7 @@ export class TrustBundleStore {
   }
 
   private async writeState(record: BundleRecord, prefix: 'state'): Promise<void> {
-    const state = { state_schema: 1 as const, ...record };
+    const state = { state_schema: 2 as const, ...record };
     await this.writeAtomicJson(STATE_FILE_NAME, state, prefix, MAX_STATE_BYTES);
   }
 

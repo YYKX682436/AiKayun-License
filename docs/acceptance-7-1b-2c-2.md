@@ -1,5 +1,12 @@
 # ⑦-1B-2C-2 验收记录
 
+## R2 修复记录
+
+- R2 基线：`5a23a4e7fb4fdb0a4587a45e295a2f6f42edd213`；仅修复正常退休 kid 在保留期结束并退出 bundle 后可复用的问题。
+- 先在该基线上运行真实 Ed25519 复现：v1 A active → v2 A 退休/B active → v3 在 `verify_until` 后删除 A → v4 重新加入同一 A。旧实现成功接受 v4，且真实中心私钥签发的新 A lease 可通过 resolver 验证，复现测试通过，确认缺口。
+- 修复后 v3 移除 A 时在主状态、独立检查点和 pending 中持久写入独立 `retired_kids`；重启后 v4 复用 A 被拒绝，新的 C 正常加入并验证真实 lease。退休保留期内的 A 历史 lease 继续有效。
+- state/checkpoint schema 升至2；紧急吊销墓碑 `revoked_kids` 与正常退休墓碑 `retired_kids` 分开保存，合计最多256项，到达容量时拒绝新写，不静默丢弃历史。
+
 ## R1 修复记录
 
 - R1 基线：`1779d909a9bbe381f689f7c8cad09684bbabdad4`（⑦-1B-2C-2 完成提交）；R1仅修复公钥生命周期连续性和状态文件单独回退检测。
@@ -22,6 +29,7 @@
 - `tools/offline-trust/sign.ts` 是显式根 key 文件输入的两步离线签发工具；严格检查 POSIX 文件类型、owner、hardlink 和权限。预览列出公钥、issuer、版本、时间窗、预算与 signing-input 摘要；签发要求相同摘要确认，JWS 以文件/目录 fsync 和原子 rename 发布。构建配置和 Dockerfile 均不把签发入口打包进服务镜像。
 - `TrustBundleStore` 使用受信发行工件提供的初始最低版本；独立检查点持久保存签名工件、最高版本、发行最低版本和吊销墓碑，主状态与检查点必须一致。低版本、同版本不同工件、无效/过期包、损坏状态、状态单文件回退和状态/检查点分叉均拒绝；同一工件幂等接受。
 - Lifecycle 连续性明确阻止 active kid 无声明删除；未退休 key 必须保持原样、进入不可回退退休状态或明确吊销。`not_before` 不可变；已设置的 `retire_after/verify_until` 不可修改；退休不能回填到可信接受时间之前；退休 key 在 `verify_until` 前不可删除。完成保留期后允许清除 key 记录，紧急吊销的墓碑仍独立保存。
+- 完成保留期并从 bundle 移除的 kid 进入永久 `retired_kids` 历史；即使新 bundle 仍由同一离线根签名，也不允许该身份再进入 key 集。`revoked_kids` 继续只表达紧急吊销，两类墓碑合计最多256项，新增将超限时拒绝提交。
 - 文件系统持久顺序为检查点 pending fsync/rename/dir-fsync → 主状态 fsync/rename/dir-fsync → 检查点 committed fsync/rename/dir-fsync。pending 时旧状态匹配则安全中止；新状态精确匹配则基于旧 head 与新根签名工件重验生命周期并补交；其余组合 fail closed。进程锁及跨进程锁串行更新，陈旧同机锁仅在 PID 确认退出后回收。
 - 引入 `TrustedSigningKeyResolver`，只按已接受包中的 kid、目标 issuer、JWT typ/audience、可信时间、签发时间和到期时间返回唯一 key。正常退休仅约束签发 `iat`，保留期覆盖最大7天 lease 加显式传播预算；新 bundle 的紧急吊销立即拒绝新经营证据，并通过墓碑拒绝复活。
 - 可信时间引导先验证根签名候选，再以候选中的中心 key 验证独立 time-anchor nonce 与不超过5秒 RTT，最后用锚时间完成整包策略及版本验证。引导候选不能直接解析经营 lease；正式 resolver 只由接受的 bundle 提供。
@@ -34,9 +42,11 @@
 | 根签名与格式 | PASS | 临时独立离线根签署并验签；中心在线 key 冒充根、错误根/kid、issuer、aud、typ、重复字段、critical/未知 header 均拒绝；格式错误的 JWK、私钥字段、未知字段、重复身份、伪造 thumbprint 和非规范 Base64URL 均拒绝。 |
 | 单调版本与完整性 | PASS | v1→v2；v2→v1 拒绝；相同版本同工件幂等；相同版本不同摘要拒绝；可信发行最低版本阻止首次旧版包；下载失败、过期包和损坏/丢失状态不覆盖 last-good。 |
 | 生命周期连续性 | PASS | v1(A)→v2(B)静默删除拒绝；active A 退休并引入 B 后，退休前真实 Ed25519 lease 仍可验证；verify_until 前删除拒绝，保留期结束后删除允许；修改同 kid 的 not_before/retire_after/verify_until 和回填退休时间均拒绝。 |
+| 永久退休身份 | PASS | 旧实现真实复现接受 v4 复用 A 且验过新 A lease；修复后 v3 移除 A 写入永久 tombstone，重启后拒绝 v4；新 C 可加入并验证，单文件状态回退不能抹除退休事实。 |
+| 墓碑容量 | PASS | 填满合计256项退休历史后，移除另一退休 key 会拒绝；状态和检查点字节保持不变，没有淘汰旧 kid。 |
 | 紧急吊销与墓碑 | PASS | 吊销 A 立即拒绝真实未过期 lease；后续包可省略 A，但检查点墓碑保留；后续重新引入 A 为未吊销 key 拒绝。 |
 | 时间引导 | PASS | 根签名候选中的真实中心 time-anchor 绑定随机 nonce、固定 issuer/typ/aud、精确 claim 和单调 RTT≤5秒；模拟客户端 wall clock 快5年仍以锚中的签名时间完成验证。 |
-| 检查点和崩溃恢复 | PASS | v2 提交后仅恢复 v1 主状态文件时拒绝，吊销历史不复活；检查点准备、主状态、检查点提交及恢复提交各阶段的部分写、写后、文件 fsync、rename 和目录 fsync 均注入故障，恢复仅保留 v1 或推进/恢复 v2，不回退；并发写者与陈旧锁测试通过。 |
+| 检查点和崩溃恢复 | PASS | v2 提交后仅恢复 v1 主状态文件时拒绝，吊销/退休历史不复活；检查点准备、主状态、检查点提交及恢复提交各阶段的部分写、写后、文件 fsync、rename 和目录 fsync 均注入故障，退休移除在 pending、state-ahead、committed 后恢复均不能复活 A；并发写者与陈旧锁测试通过。 |
 | 既有授权中心 | PASS | 原有 PostgreSQL 18/HTTPS 80项集成回归全通过，验证迁移、RFC 9421、签名回执和授权操作状态。 |
 | Docker | PASS | 完整构建最终镜像并检查导出文件清单；无 `tools/offline-trust`、根私钥/PEM 或测试工件。 |
 
@@ -49,13 +59,13 @@
 | `npm ci` | PASS；安装成功，安装阶段报告0漏洞。 |
 | `npm run typecheck` | PASS，含 `src/`、tests 与离线签发工具。 |
 | `npm run build` | PASS；生产构建只编译 `src/**/*.ts`。 |
-| `npm test -- --reporter=dot` | PASS；6个文件，42项 unit/interop。 |
+| `npm test -- --reporter=dot` | PASS；6个文件，47项 unit/interop。 |
 | `LICENSE_TEST_DATABASE_URL=… npm run test:integration -- --reporter=dot` | PASS；5个文件，80项 PostgreSQL 18/HTTPS 集成。 |
-| 合计 | PASS；122项通过，原116项完整保留，新增6项。 |
+| 合计 | PASS；127项通过，原122项完整保留，新增5项。 |
 | `npm audit --audit-level=low` | PASS；0 vulnerabilities。 |
 | `git diff --check` | PASS。 |
 | `git diff --quiet -- src/db/migrations` | PASS；001～006没有差异。 |
-| 最终 Docker 构建与镜像清单检查 | PASS；R1 无缓存构建完成，OCI manifest list digest `sha256:0afcb31103b127d88bcbb166c36f7da025b26eb401e5aa3bbe3e190cb46ad50d`。最终镜像 `/app` 不含 `tools/offline-trust` 或离线签发入口；文件系统未发现离线根/签名 key/PEM 私钥，运行时 `package.json` 不含 `scripts` 与 `devDependencies`。 |
+| 最终 Docker 构建与镜像清单检查 | PASS；R2 无缓存构建完成，OCI manifest list digest `sha256:43a67ffad312064e051f72e64aba8e94b8599ffcae6802da0ba7e03be6176889`。最终镜像 `/app` 不含 `tools/offline-trust` 或离线签发入口；文件系统未发现离线根/签名 key/PEM 私钥，运行时 `package.json` 不含 `scripts` 与 `devDependencies`。 |
 
 本机 Docker/PostgreSQL 测试容器、最终检查镜像和所有临时 Ed25519 根/中心 key 文件均已移除。`.DS_Store` 已从本仓库移除并加入 `.gitignore`。
 
