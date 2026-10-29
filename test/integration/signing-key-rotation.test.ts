@@ -121,7 +121,8 @@ describe('database-authoritative Ed25519 signing rotation', () => {
     expect(originalOperation.response_jws).toBe(originalLease);
     expect(decodeProtectedHeader(originalLease)['kid']).toBe(runtimeA.onlineKey.kid);
 
-    const beforeRotationContext = (await loadTrustedSigningContext(db, runtimeA.config)).context;
+    const beforeRotationTrust = await loadTrustedSigningContext(db, runtimeA.config);
+    const beforeRotationContext = beforeRotationTrust.context;
     const beforeRotationNow = new Date(beforeRotationContext.trustedTime * 1000);
     const historicalAnchorNonce = digest();
     const historicalTimeAnchorA = await signTimeAnchor(runtimeA.signer, historicalAnchorNonce, beforeRotationNow);
@@ -351,7 +352,9 @@ describe('database-authoritative Ed25519 signing rotation', () => {
     const queryContext = queryAuthority.context;
     const queryVerificationNow = new Date(queryContext.trustedTime * 1000);
     await verifyTimeAnchorWithTrustBundleCandidate(historicalTimeAnchorA, {
-      candidate: queryAuthority.candidate,
+      // Verify an anchor against the root-signed bundle that was current when
+      // it was issued; a later bundle may have an iat after this historical time.
+      candidate: beforeRotationTrust.candidate,
       clientNonce: historicalAnchorNonce,
       roundTripMs: 10,
     });

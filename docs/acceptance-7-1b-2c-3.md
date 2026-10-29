@@ -64,6 +64,7 @@ R1 专项集成结果：
 - RFC 9421 签名窗口跨过后返回 401 `HTTP_SIGNATURE_INVALID`，没有 nonce 或 operation 写入；未超窗的短 signer 锁等待返回 HTTP 201，JWT `iat/exp` 与 nonce `created_at/expires_at` 一致。
 - 单元测试验证 `iat=retire_after-1` 可验证，`iat=retire_after` 被拒绝。
 - 修复前两条真实锁等待记录保留在专项设计文档；临时复现测试文件已替换为稳定回归测试。
+- GitHub Actions 首轮发现既有轮换测试用“签发后才产生”的新 bundle 验证更早的历史 time-anchor，bundle `iat` 跨秒时不满足 anchor `server_time`；测试已改为使用 anchor 签发时有效的原 root-signed bundle，保持验证规则不变并消除竞态。
 
 ### R1 命令结果
 
@@ -81,4 +82,4 @@ R1 专项集成结果：
 
 R1 Dockerfile 镜像构建通过。导出 rootfs 并扫描 6,147 个普通文件：没有完整 PEM 私钥块，`/app` 下没有 `.pem`、`.key` 或 `.jwk` 私钥材料；不存在 admin CLI、keygen 或离线签名目录。临时镜像、扫描容器和 rootfs 目录已删除。Docker build 的共享缓存未做全局 prune，以免清除其他项目缓存。
 
-最终提交 SHA、`origin/main` 一致性及 GitHub Actions 对应精确 SHA 的状态将在推送后补录。
+最终 `HEAD` 与 `origin/main` 一致性、干净工作区和 GitHub Actions 对应精确 SHA 的结果在推送后核验，并在任务交付时报告。
