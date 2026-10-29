@@ -65,6 +65,25 @@ export async function waitForAdvisoryLockWaiters(db: Kysely<Database>, count: nu
   }, count, 'PostgreSQL advisory-lock waiters');
 }
 
+export async function waitForAdvisoryLockWaiterPids(db: Kysely<Database>, count: number): Promise<number[]> {
+  let pids: number[] = [];
+  await waitUntil(db, async () => {
+    const result = await sql<{ pid: number }>`
+      SELECT a.pid
+      FROM pg_locks l
+      JOIN pg_stat_activity a USING (pid)
+      WHERE a.application_name = 'aikayun-license-center'
+        AND l.locktype = 'advisory'
+        AND NOT l.granted
+        AND a.pid <> pg_backend_pid()
+      ORDER BY a.pid
+    `.execute(db);
+    pids = result.rows.map(({ pid }) => pid);
+    return pids.length;
+  }, count, 'PostgreSQL advisory-lock waiter process IDs');
+  return pids;
+}
+
 export async function waitForNoLockWaiters(db: Kysely<Database>): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {

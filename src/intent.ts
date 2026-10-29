@@ -7,6 +7,39 @@ function digestCanonical(value: Record<string, unknown>): string {
   return sha256Base64url(canonical);
 }
 
+export function timeResetIntentDigest(input: {
+  operationId: string;
+  approvalId: string;
+  licenseId: string;
+  databaseId: string;
+  instanceId: string;
+  identityJkt: string;
+  activationId: string;
+  activationGeneration: string;
+  expectedRevision: string;
+  entitlementRevision: string;
+  expectedTimeEpoch: string;
+  oldWatermarkDigest: string;
+}): string {
+  return digestCanonical({
+    v: 1,
+    kind: 'time_reset',
+    operation_id: input.operationId,
+    approval_id: input.approvalId,
+    license_id: input.licenseId,
+    database_id: input.databaseId,
+    instance_id: input.instanceId,
+    identity_jkt: input.identityJkt,
+    activation_id: input.activationId,
+    activation_generation: input.activationGeneration,
+    expected_revision: input.expectedRevision,
+    entitlement_revision: input.entitlementRevision,
+    expected_time_epoch: input.expectedTimeEpoch,
+    new_time_epoch: (BigInt(input.expectedTimeEpoch) + 1n).toString(),
+    old_watermark_digest: input.oldWatermarkDigest,
+  });
+}
+
 export function activationIntentDigest(input: {
   licenseId: string;
   activationCode: string;

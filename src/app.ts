@@ -5,6 +5,7 @@ import type { Kysely } from 'kysely';
 import type { RuntimeConfig } from './config.js';
 import type { Database } from './db/types.js';
 import { LicenseApiError } from './errors.js';
+import { performance } from 'node:perf_hooks';
 import { sha256Base64url } from './crypto/identity.js';
 import {
   activationIntentDigest,
@@ -13,9 +14,17 @@ import {
   renewalIntentDigest,
   transferCommitIntentDigest,
   transferPrepareIntentDigest,
+  timeResetIntentDigest,
 } from './intent.js';
 import { parseStrictJson } from './strict-json.js';
-import { authenticateChallengeRequest, authenticateOperationRequest, databaseNow, issueChallenge } from './services/common.js';
+import {
+  assertCenterTimeSourceHealthy,
+  authenticateChallengeRequest,
+  authenticateOperationRequest,
+  databaseNow,
+  issueChallenge,
+  validateNonce,
+} from './services/common.js';
 import {
   continueOperation,
   processActivation,
@@ -24,6 +33,7 @@ import {
   processRenewal,
   processTransferCommit,
   processTransferPrepare,
+  processTimeReset,
   queryOperation,
   type ActivationInput,
   type DisasterTransferCommitInput,
@@ -33,7 +43,9 @@ import {
   type RenewalInput,
   type TransferCommitInput,
   type TransferPrepareInput,
+  type TimeResetInput,
 } from './services/operations.js';
+import { signTimeAnchor } from './crypto/time-reset.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -180,11 +192,33 @@ const disasterTransferCommitSchema = {
   },
 };
 
+const timeAnchorSchema = {
+  type: 'object', additionalProperties: false,
+  required: ['client_nonce'],
+  properties: { client_nonce: { type: 'string', pattern: nonce } },
+};
+
+const timeResetSchema = {
+  type: 'object', additionalProperties: false,
+  required: [...Object.keys(commonMutationProperties), 'activation_id', 'approval_id', 'expected_generation', 'expected_revision',
+    'expected_entitlement_revision', 'expected_time_epoch', 'old_watermark_digest'],
+  properties: {
+    ...commonMutationProperties,
+    activation_id: { type: 'string', pattern: uuid },
+    approval_id: { type: 'string', pattern: uuid },
+    expected_generation: { type: 'string', pattern: '^[1-9][0-9]{0,18}$' },
+    expected_revision: { type: 'string', pattern: '^[1-9][0-9]{0,18}$' },
+    expected_entitlement_revision: { type: 'string', pattern: '^[1-9][0-9]{0,18}$' },
+    expected_time_epoch: { type: 'string', pattern: '^(0|[1-9][0-9]{0,18})$' },
+    old_watermark_digest: { type: 'string', pattern: digest },
+  },
+};
+
 const challengeSchema = {
   type: 'object', additionalProperties: false,
   required: ['operation', 'operation_id', 'intent_digest', 'instance_id', 'public_jwk', 'client_nonce'],
   properties: {
-    operation: { type: 'string', enum: ['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit', 'disaster_transfer_prepare', 'disaster_transfer_commit'] },
+    operation: { type: 'string', enum: ['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit', 'disaster_transfer_prepare', 'disaster_transfer_commit', 'time_reset'] },
     operation_id: { type: 'string', pattern: uuid },
     intent_digest: { type: 'string', pattern: digest },
     instance_id: { type: 'string', pattern: uuid },
@@ -220,6 +254,7 @@ function operationResponse(result: MutationResult, reply: FastifyReply) {
   const statusCode = result.state === 'rejected' ? 409 : 200;
   if (result.responseType === 'license') return reply.code(statusCode).send({ license: result.token });
   if (result.responseType === 'status') return reply.code(statusCode).send({ status_receipt: result.token });
+  if (result.responseType === 'time_reset') return reply.code(statusCode).send({ time_reset_receipt: result.token });
   return reply.code(statusCode).send({ operation_receipt: result.token });
 }
 
@@ -291,14 +326,41 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     errorResponseBuilder: () => ({ error: { code: 'RATE_LIMITED' } }),
   });
 
+  const anchorRateBuckets = new Map<string, { count: number; resetAt: number }>();
+  app.post('/v1/time-anchor', {
+    bodyLimit: 512,
+    schema: { body: timeAnchorSchema },
+    onRequest: async (request) => {
+      const monotonicNow = performance.now();
+      for (const [key, bucket] of anchorRateBuckets) {
+        if (bucket.resetAt <= monotonicNow) anchorRateBuckets.delete(key);
+      }
+      let bucket = anchorRateBuckets.get(request.ip);
+      if (!bucket || bucket.resetAt <= monotonicNow) {
+        bucket = { count: 0, resetAt: monotonicNow + 60_000 };
+        anchorRateBuckets.set(request.ip, bucket);
+      }
+      if (bucket.count >= 12) throw new LicenseApiError(429, 'RATE_LIMITED');
+      bucket.count += 1;
+    },
+  }, async (request, reply) => {
+    const body = request.body as { client_nonce: string };
+    if (!validateNonce(body.client_nonce)) throw new LicenseApiError(400, 'INVALID_TIME_ANCHOR_REQUEST');
+    const centerTime = await readNow();
+    assertCenterTimeSourceHealthy(centerTime);
+    const token = await signTimeAnchor(config, body.client_nonce, centerTime);
+    return reply.code(200).send({ time_anchor: token });
+  });
+
   app.post('/v1/challenges', { schema: { body: challengeSchema } }, async (request, reply) => {
     const body = request.body as {
-      operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
+      operation: 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset';
       operation_id: string; intent_digest: string; instance_id: string; public_jwk: unknown; client_nonce: string;
     };
     const now = await readNow();
     const signature = await authenticateChallengeRequest(requestSignatureInput(request), body, config, now);
-    const token = await issueChallenge(db, config, body, signature, await readChallengeNow());
+    const challengeNow = await readChallengeNow();
+    const token = await issueChallenge(db, config, body, signature, challengeNow);
     return reply.code(201).send({ challenge: token });
   });
 
@@ -419,7 +481,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
       ticketDigest: sha256Base64url(body.transfer_ticket),
     });
     if (expectedIntent !== body.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
-    return transferResponse(await processTransferCommit(db, config, auth, body), reply);
+    return transferResponse(await processTransferCommit(db, config, auth, body, readNow), reply);
   });
 
   app.post('/v1/disaster-transfers/prepare', { schema: { body: disasterTransferPrepareSchema } }, async (request, reply) => {
@@ -457,7 +519,28 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
       disasterTicketDigest: sha256Base64url(body.disaster_ticket),
     });
     if (expectedIntent !== body.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
-    return disasterTransferResponse(await processDisasterTransferCommit(db, config, auth, body), reply);
+    return disasterTransferResponse(await processDisasterTransferCommit(db, config, auth, body, readNow), reply);
+  });
+
+  app.post('/v1/time-resets/commit', { schema: { body: timeResetSchema } }, async (request, reply) => {
+    const body = request.body as TimeResetInput;
+    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'time_reset');
+    const expectedIntent = timeResetIntentDigest({
+      operationId: body.operation_id,
+      approvalId: body.approval_id,
+      licenseId: body.license_id,
+      databaseId: body.database_id,
+      instanceId: body.instance_id,
+      identityJkt: body.identity_jkt,
+      activationId: body.activation_id,
+      activationGeneration: body.expected_generation,
+      expectedRevision: body.expected_revision,
+      entitlementRevision: body.expected_entitlement_revision,
+      expectedTimeEpoch: body.expected_time_epoch,
+      oldWatermarkDigest: body.old_watermark_digest,
+    });
+    if (expectedIntent !== body.intent_digest) throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
+    return operationResponse(await processTimeReset(db, config, auth, body), reply);
   });
 
   return app;

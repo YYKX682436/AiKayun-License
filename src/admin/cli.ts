@@ -2,6 +2,7 @@ import { AdminOperationError, createAdminService, createLicenseRequestDigest, is
   renewLicenseRequestDigest, changeLicenseStatusRequestDigest, approveTransferRequestDigest,
   revokeTransferApprovalRequestDigest,
   approveDisasterTransferRequestDigest, revokeDisasterTransferApprovalRequestDigest,
+  approveTimeResetRequestDigest, revokeTimeResetApprovalRequestDigest,
   type AdminOperationResult } from './service.js';
 import { AdminAccessError } from './policy.js';
 import { resolve } from 'node:path';
@@ -24,6 +25,8 @@ const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控
   license revoke-transfer-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license approve-disaster-transfer --operation-id UUID --license-id UUID --expected-revision N --account-reference REF --source-activation-id UUID --database-id UUID --source-instance-id UUID --source-identity-jkt JKT --source-generation N --target-instance-id UUID --target-instance-mode preserve|replace --target-identity-jkt JKT --expected-binding-revision N --incident-type TYPE --recovery-reason TEXT --verification-record-ref case:REF --backup-check-result VALUE --old-server-isolation VALUE --reason TEXT [--expires-in-hours 24] [--confirm-digest DIGEST]
   license revoke-disaster-transfer-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
+  license approve-time-reset --operation-id UUID --license-id UUID --expected-revision N --activation-id UUID --database-id UUID --instance-id UUID --identity-jkt JKT --activation-generation N --entitlement-revision N --expected-time-epoch N --reset-operation-id UUID --intent-digest DIGEST --old-watermark-digest DIGEST --reason TEXT [--expires-in-hours 24] [--confirm-digest DIGEST]
+  license revoke-time-reset-approval --operation-id UUID --license-id UUID --approval-id UUID --expected-revision N --reason TEXT [--confirm-digest DIGEST]
   license get --license-id UUID
   operation get --operation-id UUID
   audit list --license-id UUID [--limit 50]
@@ -233,6 +236,49 @@ async function runMutation(argv: string[], stdout: OutputStream): Promise<number
     digest = revokeDisasterTransferApprovalRequestDigest(request);
     fields = request;
     invoke = (service) => service.revokeDisasterTransferApproval({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'approve-time-reset') {
+    assertAllowedOptions(options, [
+      'operation-id', 'license-id', 'expected-revision', 'activation-id', 'database-id', 'instance-id', 'identity-jkt',
+      'activation-generation', 'entitlement-revision', 'expected-time-epoch', 'reset-operation-id', 'intent-digest',
+      'old-watermark-digest', 'reason', 'expires-in-hours', 'confirm-digest',
+    ]);
+    const expiryText = optionalOption(options, 'expires-in-hours');
+    const expiresInHours = expiryText === undefined ? 24 : Number(expiryText);
+    if (!Number.isInteger(expiresInHours)) fail('ADMIN_TIME_RESET_APPROVAL_EXPIRY_INVALID');
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      activationId: option(options, 'activation-id'),
+      databaseId: option(options, 'database-id'),
+      instanceId: option(options, 'instance-id'),
+      identityJkt: option(options, 'identity-jkt'),
+      activationGeneration: option(options, 'activation-generation'),
+      entitlementRevision: option(options, 'entitlement-revision'),
+      expectedTimeEpoch: option(options, 'expected-time-epoch'),
+      resetOperationId: option(options, 'reset-operation-id'),
+      intentDigest: option(options, 'intent-digest'),
+      oldWatermarkDigest: option(options, 'old-watermark-digest'),
+      expiresInHours,
+      reason: option(options, 'reason'),
+    };
+    action = 'time_reset_approve';
+    digest = approveTimeResetRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.approveTimeReset({ ...request, confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'revoke-time-reset-approval') {
+    assertAllowedOptions(options, ['operation-id', 'license-id', 'approval-id', 'expected-revision', 'reason', 'confirm-digest']);
+    const request = {
+      operationId: option(options, 'operation-id'),
+      licenseId: option(options, 'license-id'),
+      approvalId: option(options, 'approval-id'),
+      expectedRevision: option(options, 'expected-revision'),
+      reason: option(options, 'reason'),
+    };
+    action = 'time_reset_revoke';
+    digest = revokeTimeResetApprovalRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.revokeTimeResetApproval({ ...request, confirmedRequestDigest: confirm ?? '' });
   } else {
     fail('ADMIN_COMMAND_INVALID');
   }
@@ -304,7 +350,8 @@ export async function runAdminCli(
   }
   try {
     if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer', 'revoke-transfer-approval',
-      'approve-disaster-transfer', 'revoke-disaster-transfer-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {
+      'approve-disaster-transfer', 'revoke-disaster-transfer-approval', 'approve-time-reset',
+      'revoke-time-reset-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {
       return await runMutation(argv, stdout);
     }
     return await runRead(argv, stdout);

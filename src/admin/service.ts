@@ -1,10 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import canonicalize from 'canonicalize';
-import { sql, type Transaction } from 'kysely';
+import { sql, type Kysely, type Transaction } from 'kysely';
 import type { LicenseAdminOperationRow, LicenseRow, Database } from '../db/types.js';
 import { databaseNow } from '../services/common.js';
 import { addCalendarPeriod, type BillingPlan } from '../entitlements/calendar.js';
 import { sha256Base64url } from '../crypto/identity.js';
+import { timeResetIntentDigest } from '../intent.js';
 import { applyConfirmedRenewalToLockedLicense, lockEntitlementEvent } from '../services/entitlements.js';
 import { AdminAccessError, openAdminSession, type AdminActor, type AdminSession } from './policy.js';
 
@@ -97,6 +98,24 @@ export interface RevokeDisasterTransferApprovalRequest extends BaseRequest {
   approvalId: string;
 }
 
+export interface ApproveTimeResetRequest extends BaseRequest {
+  activationId: string;
+  databaseId: string;
+  instanceId: string;
+  identityJkt: string;
+  activationGeneration: string;
+  entitlementRevision: string;
+  expectedTimeEpoch: string;
+  resetOperationId: string;
+  intentDigest: string;
+  oldWatermarkDigest: string;
+  expiresInHours?: number;
+}
+
+export interface RevokeTimeResetApprovalRequest extends BaseRequest {
+  approvalId: string;
+}
+
 export type LicenseStatusView = {
   license: {
     id: string;
@@ -123,6 +142,7 @@ export type LicenseStatusView = {
     retired_at: string | null;
     last_seen_at: string;
     origin_display: string | null;
+    time_epoch: string;
   }>;
   activationCodes: Array<{
     id: string;
@@ -133,11 +153,18 @@ export type LicenseStatusView = {
     status: 'issued' | 'expired' | 'consumed' | 'revoked';
   }>;
   disasterTransferApprovals: Array<Record<string, unknown>>;
+  timeResetApprovals: Array<Record<string, unknown>>;
 };
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const revisionPattern = /^(0|[1-9][0-9]{0,18})$/;
 const int64Max = 9_223_372_036_854_775_807n;
+const controlledAdminClocks = new WeakMap<AdminSession, () => Promise<Date>>();
+
+function adminNow(session: AdminSession, db: Kysely<Database> | AdminTransaction): Promise<Date> {
+  const clock = controlledAdminClocks.get(session);
+  return clock ? clock() : databaseNow(db);
+}
 
 function ensureUuid(value: string, code: string): void {
   if (!uuidPattern.test(value)) throw new AdminOperationError(code);
@@ -161,6 +188,12 @@ function ensureText(value: string, code: string, maxLength: number): string {
   const text = value.trim();
   if (text.length < 1 || text.length > maxLength || /[\u0000-\u001f\u007f]/.test(text)) throw new AdminOperationError(code);
   return text;
+}
+
+function isSha256Base64url(value: string): boolean {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
+  const bytes = Buffer.from(value, 'base64url');
+  return bytes.byteLength === 32 && bytes.toString('base64url') === value;
 }
 
 function digestRequest(action: AdminAction, request: Record<string, unknown>): string {
@@ -538,6 +571,74 @@ export function revokeDisasterTransferApprovalRequestDigest(input: Omit<RevokeDi
   });
 }
 
+export function approveTimeResetRequestDigest(input: Omit<ApproveTimeResetRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.activationId, 'ADMIN_TIME_RESET_ACTIVATION_INVALID');
+  ensureUuid(input.databaseId, 'ADMIN_DATABASE_ID_INVALID');
+  ensureUuid(input.instanceId, 'ADMIN_INSTANCE_ID_INVALID');
+  ensureUuid(input.resetOperationId, 'ADMIN_TIME_RESET_OPERATION_ID_INVALID');
+  if (input.operationId === input.resetOperationId) throw new AdminOperationError('ADMIN_TIME_RESET_OPERATION_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  ensureRevision(input.activationGeneration);
+  ensureRevision(input.entitlementRevision);
+  ensureRevision(input.expectedTimeEpoch, true);
+  if (!isSha256Base64url(input.identityJkt) || !isSha256Base64url(input.intentDigest) ||
+    !isSha256Base64url(input.oldWatermarkDigest)) throw new AdminOperationError('ADMIN_TIME_RESET_BINDING_INVALID');
+  const expiresInHours = input.expiresInHours ?? 24;
+  if (!Number.isInteger(expiresInHours) || expiresInHours < 1 || expiresInHours > 72) {
+    throw new AdminOperationError('ADMIN_TIME_RESET_APPROVAL_EXPIRY_INVALID');
+  }
+  const expectedIntent = timeResetIntentDigest({
+    operationId: input.resetOperationId,
+    approvalId: input.operationId,
+    licenseId: input.licenseId,
+    databaseId: input.databaseId,
+    instanceId: input.instanceId,
+    identityJkt: input.identityJkt,
+    activationId: input.activationId,
+    activationGeneration: input.activationGeneration,
+    expectedRevision: input.expectedRevision,
+    entitlementRevision: input.entitlementRevision,
+    expectedTimeEpoch: input.expectedTimeEpoch,
+    oldWatermarkDigest: input.oldWatermarkDigest,
+  });
+  if (expectedIntent !== input.intentDigest) throw new AdminOperationError('ADMIN_TIME_RESET_INTENT_MISMATCH');
+  return digestRequest('time_reset_approve', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    activation_id: input.activationId,
+    database_id: input.databaseId,
+    instance_id: input.instanceId,
+    identity_jkt: input.identityJkt,
+    activation_generation: input.activationGeneration,
+    entitlement_revision: input.entitlementRevision,
+    expected_time_epoch: input.expectedTimeEpoch,
+    new_time_epoch: (BigInt(input.expectedTimeEpoch) + 1n).toString(),
+    reset_operation_id: input.resetOperationId,
+    intent_digest: input.intentDigest,
+    old_watermark_digest: input.oldWatermarkDigest,
+    expires_in_hours: expiresInHours,
+    reason: ensureReason(input.reason),
+  });
+}
+
+export function revokeTimeResetApprovalRequestDigest(input: Omit<RevokeTimeResetApprovalRequest, 'confirmedRequestDigest'>): string {
+  ensureUuid(input.operationId, 'ADMIN_OPERATION_ID_INVALID');
+  ensureUuid(input.licenseId, 'ADMIN_LICENSE_ID_INVALID');
+  ensureUuid(input.approvalId, 'ADMIN_TIME_RESET_APPROVAL_ID_INVALID');
+  if (input.operationId === input.approvalId) throw new AdminOperationError('ADMIN_OPERATION_ID_INVALID');
+  ensureRevision(input.expectedRevision);
+  return digestRequest('time_reset_revoke', {
+    operation_id: input.operationId,
+    license_id: input.licenseId,
+    expected_revision: input.expectedRevision,
+    approval_id: input.approvalId,
+    reason: ensureReason(input.reason),
+  });
+}
+
 async function revokeTransferApproval(session: AdminSession, input: RevokeTransferApprovalRequest): Promise<AdminOperationResult> {
   const reason = ensureReason(input.reason);
   const requestDigest = revokeTransferApprovalRequestDigest({ ...input, reason });
@@ -600,7 +701,7 @@ async function approveTransfer(session: AdminSession, input: ApproveTransferRequ
     confirmedRequestDigest: input.confirmedRequestDigest,
   }, async (trx) => {
     const license = await lockLicense(trx, input.licenseId);
-    const now = await databaseNow(trx);
+    const now = await adminNow(session, trx);
     if (!license) return {
       state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now,
       result: { license_id: input.licenseId },
@@ -719,7 +820,7 @@ async function approveDisasterTransfer(session: AdminSession, input: ApproveDisa
     expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
   }, async (trx) => {
     const license = await lockLicense(trx, input.licenseId);
-    const now = await databaseNow(trx);
+    const now = await adminNow(session, trx);
     if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
     const revision = license.revision.toString();
     if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
@@ -865,6 +966,130 @@ async function revokeDisasterTransferApproval(session: AdminSession, input: Revo
       actor: actorLabel(session.actor), safe_details: { revocation_operation_id: input.operationId, reason }, created_at: now,
     }).execute();
     return { state: 'succeeded', outcomeCode: 'DISASTER_TRANSFER_APPROVAL_REVOKED', resultRevision: revision, now, result };
+  });
+}
+
+async function approveTimeReset(session: AdminSession, input: ApproveTimeResetRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const normalized = { ...input, reason, expiresInHours: input.expiresInHours ?? 24 };
+  const requestDigest = approveTimeResetRequestDigest(normalized);
+  return executeMutation(session, {
+    operationId: input.operationId, requestDigest, action: 'time_reset_approve', licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await adminNow(session, trx);
+    if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { expected_revision: input.expectedRevision, observed_revision: revision } };
+    const activation = await trx.selectFrom('license_activations').selectAll()
+      .where('id', '=', input.activationId).where('license_id', '=', license.id).where('state', '=', 'active')
+      .forUpdate().executeTakeFirst();
+    if (!activation || activation.database_id !== input.databaseId || activation.instance_id !== input.instanceId ||
+      activation.identity_jkt !== input.identityJkt || activation.generation.toString() !== input.activationGeneration ||
+      activation.generation.toString() !== license.current_generation.toString()) {
+      return { state: 'rejected', outcomeCode: 'TIME_RESET_ACTIVATION_BINDING_MISMATCH', resultRevision: revision, now,
+        result: { activation_id: input.activationId, current_generation: license.current_generation.toString() } };
+    }
+    if (license.entitlement_revision.toString() !== input.entitlementRevision ||
+      activation.time_epoch.toString() !== input.expectedTimeEpoch) {
+      return { state: 'rejected', outcomeCode: 'TIME_RESET_WATERMARK_CONFLICT', resultRevision: revision, now,
+        result: { expected_time_epoch: input.expectedTimeEpoch, observed_time_epoch: activation.time_epoch.toString(),
+          expected_entitlement_revision: input.entitlementRevision, observed_entitlement_revision: license.entitlement_revision.toString() } };
+    }
+    const existingReset = await trx.selectFrom('license_time_reset_approvals').select('approval_id')
+      .where('reset_operation_id', '=', input.resetOperationId).executeTakeFirst();
+    if (existingReset) return { state: 'rejected', outcomeCode: 'TIME_RESET_OPERATION_ALREADY_APPROVED', resultRevision: revision, now,
+      result: { reset_operation_id: input.resetOperationId, approval_id: existingReset.approval_id } };
+    const newTimeEpoch = (BigInt(input.expectedTimeEpoch) + 1n).toString();
+    if (BigInt(newTimeEpoch) > int64Max) return { state: 'rejected', outcomeCode: 'TIME_RESET_EPOCH_EXHAUSTED', resultRevision: revision, now,
+      result: { expected_time_epoch: input.expectedTimeEpoch } };
+    const expiresAt = new Date(now.getTime() + normalized.expiresInHours * 60 * 60 * 1000);
+    const snapshot = {
+      approval_id: input.operationId, license_id: license.id, activation_id: activation.id,
+      database_id: activation.database_id, instance_id: activation.instance_id, identity_jkt: activation.identity_jkt,
+      activation_generation: activation.generation.toString(), expected_revision: revision,
+      entitlement_revision: license.entitlement_revision.toString(), expected_time_epoch: activation.time_epoch.toString(),
+      new_time_epoch: newTimeEpoch, reset_operation_id: input.resetOperationId, intent_digest: input.intentDigest,
+      old_watermark_digest: input.oldWatermarkDigest, approved_at: now.toISOString(), expires_at: expiresAt.toISOString(),
+      actor_os_uid: session.actor.osUid, actor_os_username: session.actor.osUsername,
+      actor_database_role: session.actor.databaseRole, reason,
+    };
+    await trx.insertInto('license_time_reset_approvals').values({
+      approval_id: input.operationId, request_digest: requestDigest, license_id: license.id, activation_id: activation.id,
+      database_id: activation.database_id, instance_id: activation.instance_id, identity_jkt: activation.identity_jkt,
+      activation_generation: activation.generation.toString(), expected_revision: revision,
+      entitlement_revision: license.entitlement_revision.toString(), expected_time_epoch: activation.time_epoch.toString(),
+      new_time_epoch: newTimeEpoch, reset_operation_id: input.resetOperationId, intent_digest: input.intentDigest,
+      old_watermark_digest: input.oldWatermarkDigest, actor_os_uid: session.actor.osUid,
+      actor_os_username: session.actor.osUsername, actor_database_role: session.actor.databaseRole,
+      reason, approved_at: now, expires_at: expiresAt,
+    }).execute();
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: license.id, operationId: input.operationId, kind: 'admin_time_reset_approved', reason,
+      details: { ...snapshot, request_digest: requestDigest }, now,
+    });
+    await trx.insertInto('license_time_reset_events').values({
+      event_id: randomUUID(), license_id: license.id, approval_id: input.operationId,
+      operation_id: input.resetOperationId, kind: 'approved', actor: actorLabel(session.actor),
+      safe_details: { request_digest: requestDigest, reset_operation_id: input.resetOperationId,
+        expected_time_epoch: input.expectedTimeEpoch, new_time_epoch: newTimeEpoch, old_watermark_digest: input.oldWatermarkDigest },
+      created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'TIME_RESET_APPROVED', result: snapshot, resultRevision: revision, now };
+  });
+}
+
+async function revokeTimeResetApproval(session: AdminSession, input: RevokeTimeResetApprovalRequest): Promise<AdminOperationResult> {
+  const reason = ensureReason(input.reason);
+  const requestDigest = revokeTimeResetApprovalRequestDigest({ ...input, reason });
+  return executeMutation(session, {
+    operationId: input.operationId, requestDigest, action: 'time_reset_revoke', licenseId: input.licenseId,
+    expectedRevision: input.expectedRevision, reason, confirmedRequestDigest: input.confirmedRequestDigest,
+  }, async (trx) => {
+    const license = await lockLicense(trx, input.licenseId);
+    const now = await databaseNow(trx);
+    if (!license) return { state: 'rejected', outcomeCode: 'LICENSE_NOT_FOUND', resultRevision: null, now, result: { license_id: input.licenseId } };
+    const revision = license.revision.toString();
+    if (revision !== input.expectedRevision) return { state: 'rejected', outcomeCode: 'EXPECTED_REVISION_MISMATCH', resultRevision: revision, now,
+      result: { expected_revision: input.expectedRevision, observed_revision: revision } };
+    const approval = await trx.selectFrom('license_time_reset_approvals').selectAll()
+      .where('approval_id', '=', input.approvalId).forUpdate().executeTakeFirst();
+    const adminApproval = await trx.selectFrom('license_admin_operations').selectAll()
+      .where('operation_id', '=', input.approvalId).executeTakeFirst();
+    if (!approval || !adminApproval || approval.license_id !== license.id ||
+      adminApproval.action !== 'time_reset_approve' || adminApproval.state !== 'succeeded' ||
+      adminApproval.request_digest !== approval.request_digest) {
+      return { state: 'rejected', outcomeCode: 'TIME_RESET_APPROVAL_NOT_FOUND', resultRevision: revision, now,
+        result: { approval_id: input.approvalId } };
+    }
+    const existing = await trx.selectFrom('license_time_reset_revocations').selectAll()
+      .where('approval_id', '=', input.approvalId).executeTakeFirst();
+    if (existing) return { state: 'rejected', outcomeCode: 'TIME_RESET_APPROVAL_ALREADY_REVOKED', resultRevision: revision, now,
+      result: { approval_id: input.approvalId, revocation_operation_id: existing.revocation_operation_id } };
+    const committed = await trx.selectFrom('license_operations').select('operation_id')
+      .where('operation_id', '=', approval.reset_operation_id).where('kind', '=', 'time_reset')
+      .where('state', '=', 'committed').executeTakeFirst();
+    if (committed) return { state: 'rejected', outcomeCode: 'TIME_RESET_ALREADY_COMMITTED', resultRevision: revision, now,
+      result: { approval_id: input.approvalId, reset_operation_id: approval.reset_operation_id } };
+    await trx.insertInto('license_time_reset_revocations').values({
+      revocation_operation_id: input.operationId, approval_id: input.approvalId, license_id: license.id,
+      request_digest: requestDigest, expected_revision: revision, actor_os_uid: session.actor.osUid,
+      actor_os_username: session.actor.osUsername, actor_database_role: session.actor.databaseRole,
+      reason, revoked_at: now,
+    }).execute();
+    const result = { approval_id: input.approvalId, reset_operation_id: approval.reset_operation_id,
+      revoked_at: now.toISOString(), old_time_epoch: approval.expected_time_epoch.toString() };
+    await appendCoreAudit(trx, session.actor, {
+      licenseId: license.id, operationId: input.operationId, kind: 'admin_time_reset_approval_revoked', reason, details: result, now,
+    });
+    await trx.insertInto('license_time_reset_events').values({
+      event_id: randomUUID(), license_id: license.id, approval_id: input.approvalId,
+      operation_id: approval.reset_operation_id, kind: 'approval_revoked', actor: actorLabel(session.actor),
+      safe_details: { revocation_operation_id: input.operationId, reason }, created_at: now,
+    }).execute();
+    return { state: 'succeeded', outcomeCode: 'TIME_RESET_APPROVAL_REVOKED', resultRevision: revision, now, result };
   });
 }
 
@@ -1145,14 +1370,17 @@ export interface AdminService {
   revokeTransferApproval(input: RevokeTransferApprovalRequest): Promise<AdminOperationResult>;
   approveDisasterTransfer(input: ApproveDisasterTransferRequest): Promise<AdminOperationResult>;
   revokeDisasterTransferApproval(input: RevokeDisasterTransferApprovalRequest): Promise<AdminOperationResult>;
+  approveTimeReset(input: ApproveTimeResetRequest): Promise<AdminOperationResult>;
+  revokeTimeResetApproval(input: RevokeTimeResetApprovalRequest): Promise<AdminOperationResult>;
   getLicense(licenseId: string): Promise<LicenseStatusView | undefined>;
   getOperation(operationId: string): Promise<Record<string, unknown> | undefined>;
   listAudit(licenseId: string, limit?: number): Promise<Array<Record<string, unknown>>>;
   close(): Promise<void>;
 }
 
-export async function createAdminService(policyFile?: string): Promise<AdminService> {
+export async function createAdminService(policyFile?: string, options: { controlledTestNow?: () => Promise<Date> } = {}): Promise<AdminService> {
   const session = await openAdminSession(policyFile);
+  if (options.controlledTestNow) controlledAdminClocks.set(session, options.controlledTestNow);
   return {
     createLicense: (input) => insertFinalLicenseOperation(session, input),
     issueActivationCode: (input) => issueActivationCode(session, input),
@@ -1163,6 +1391,8 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
     revokeTransferApproval: (input) => revokeTransferApproval(session, input),
     approveDisasterTransfer: (input) => approveDisasterTransfer(session, input),
     revokeDisasterTransferApproval: (input) => revokeDisasterTransferApproval(session, input),
+    approveTimeReset: (input) => approveTimeReset(session, input),
+    revokeTimeResetApproval: (input) => revokeTimeResetApproval(session, input),
     async getLicense(licenseId) {
       ensureUuid(licenseId, 'ADMIN_LICENSE_ID_INVALID');
       const license = await session.db.selectFrom('licenses').selectAll().where('id', '=', licenseId).executeTakeFirst();
@@ -1181,6 +1411,17 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
           'approvals.source_generation', 'approvals.expected_binding_revision', 'approvals.expected_revision',
           'approvals.entitlement_revision', 'approvals.actor_os_uid', 'approvals.actor_os_username',
           'approvals.actor_database_role', 'approvals.recovery_reason', 'approvals.approved_at', 'approvals.expires_at',
+          'revocations.revocation_operation_id', 'revocations.revoked_at',
+        ]).where('approvals.license_id', '=', licenseId).orderBy('approvals.approved_at', 'desc').execute();
+      const timeResetApprovals = await session.db.selectFrom('license_time_reset_approvals as approvals')
+        .leftJoin('license_time_reset_revocations as revocations', 'revocations.approval_id', 'approvals.approval_id')
+        .select([
+          'approvals.approval_id', 'approvals.activation_id', 'approvals.database_id', 'approvals.instance_id',
+          'approvals.identity_jkt', 'approvals.activation_generation', 'approvals.expected_revision',
+          'approvals.entitlement_revision', 'approvals.expected_time_epoch', 'approvals.new_time_epoch',
+          'approvals.reset_operation_id', 'approvals.intent_digest', 'approvals.old_watermark_digest',
+          'approvals.actor_os_uid', 'approvals.actor_os_username', 'approvals.actor_database_role',
+          'approvals.reason', 'approvals.approved_at', 'approvals.expires_at',
           'revocations.revocation_operation_id', 'revocations.revoked_at',
         ]).where('approvals.license_id', '=', licenseId).orderBy('approvals.approved_at', 'desc').execute();
       const now = await databaseNow(session.db);
@@ -1210,6 +1451,7 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
           retired_at: activation.retired_at?.toISOString() ?? null,
           last_seen_at: activation.last_seen_at.toISOString(),
           origin_display: activation.origin_display,
+          time_epoch: activation.time_epoch.toString(),
         })),
         activationCodes: codes.map((code) => ({
           id: code.id,
@@ -1220,6 +1462,9 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
           status: code.consumed_at ? 'consumed' as const : code.revoked_at ? 'revoked' as const : code.expires_at.getTime() <= now.getTime() ? 'expired' as const : 'issued' as const,
         })),
         disasterTransferApprovals: disasterApprovals.map((row) => ({ ...row,
+          status: row.revocation_operation_id ? 'revoked' : row.expires_at.getTime() <= now.getTime() ? 'expired' : 'approved',
+        })),
+        timeResetApprovals: timeResetApprovals.map((row) => ({ ...row,
           status: row.revocation_operation_id ? 'revoked' : row.expires_at.getTime() <= now.getTime() ? 'expired' : 'approved',
         })),
       };
@@ -1266,6 +1511,17 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
           eb('approval_id', '=', operationId), eb('revocation_operation_id', '=', operationId),
         ])).execute(),
       ]);
+      const [timeResetApprovals, timeResetRevocations, timeResetEvents] = await Promise.all([
+        session.db.selectFrom('license_time_reset_approvals').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('reset_operation_id', '=', operationId),
+        ])).execute(),
+        session.db.selectFrom('license_time_reset_revocations').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('revocation_operation_id', '=', operationId),
+        ])).execute(),
+        session.db.selectFrom('license_time_reset_events').selectAll().where((eb) => eb.or([
+          eb('approval_id', '=', operationId), eb('operation_id', '=', operationId),
+        ])).orderBy('created_at', 'asc').execute(),
+      ]);
       return {
         operation: mapOperation(operation, false),
         actor: { os_uid: operation.actor_os_uid, os_username: operation.actor_os_username, database_role: operation.actor_database_role },
@@ -1284,6 +1540,9 @@ export async function createAdminService(policyFile?: string): Promise<AdminServ
         disaster_transfer_plans: disasterPlans,
         disaster_transfer_events: disasterEvents,
         disaster_transfer_revocations: disasterRevocation,
+        time_reset_approvals: timeResetApprovals,
+        time_reset_revocations: timeResetRevocations,
+        time_reset_events: timeResetEvents,
       };
     },
     async listAudit(licenseId, limit = 50) {

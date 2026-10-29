@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runAdminCli } from '../../src/admin/cli.js';
 import { openAdminSession } from '../../src/admin/policy.js';
-import { approveTransferRequestDigest, createLicenseRequestDigest, issueActivationCodeRequestDigest } from '../../src/admin/service.js';
+import {
+  approveTimeResetRequestDigest, approveTransferRequestDigest, createLicenseRequestDigest,
+  issueActivationCodeRequestDigest, revokeTimeResetApprovalRequestDigest,
+} from '../../src/admin/service.js';
+import { timeResetIntentDigest } from '../../src/intent.js';
 
 function fakeStream(isTTY = false) {
   let contents = '';
@@ -127,6 +131,75 @@ describe('local admin CLI boundary', () => {
     expect(status).toBe(0);
     expect(stderr.text()).toBe('');
     expect(JSON.parse(stdout.text())).toMatchObject({ review_required: true, action: 'transfer_approve', request_digest: digest });
+  });
+
+  it('requires the full generation, epoch, approval and watermark binding in time-reset CLI review', async () => {
+    const request = {
+      operationId: '00000000-0000-4000-8000-000000000001',
+      licenseId: '00000000-0000-4000-8000-000000000002',
+      expectedRevision: '3',
+      activationId: '00000000-0000-4000-8000-000000000003',
+      databaseId: '00000000-0000-4000-8000-000000000004',
+      instanceId: '00000000-0000-4000-8000-000000000005',
+      identityJkt: 'A'.repeat(43),
+      activationGeneration: '2',
+      entitlementRevision: '4',
+      expectedTimeEpoch: '7',
+      resetOperationId: '00000000-0000-4000-8000-000000000006',
+      oldWatermarkDigest: 'A'.repeat(43),
+      reason: 'manual review of local clock rollback',
+    };
+    const intentDigest = timeResetIntentDigest({
+      operationId: request.resetOperationId,
+      approvalId: request.operationId,
+      licenseId: request.licenseId,
+      databaseId: request.databaseId,
+      instanceId: request.instanceId,
+      identityJkt: request.identityJkt,
+      activationId: request.activationId,
+      activationGeneration: request.activationGeneration,
+      expectedRevision: request.expectedRevision,
+      entitlementRevision: request.entitlementRevision,
+      expectedTimeEpoch: request.expectedTimeEpoch,
+      oldWatermarkDigest: request.oldWatermarkDigest,
+    });
+    const approval = { ...request, intentDigest };
+    const digest = approveTimeResetRequestDigest(approval);
+    const stdout = fakeStream();
+    const stderr = fakeStream();
+    const status = await runAdminCli([
+      'license', 'approve-time-reset', '--operation-id', approval.operationId,
+      '--license-id', approval.licenseId, '--expected-revision', approval.expectedRevision,
+      '--activation-id', approval.activationId, '--database-id', approval.databaseId,
+      '--instance-id', approval.instanceId, '--identity-jkt', approval.identityJkt,
+      '--activation-generation', approval.activationGeneration,
+      '--entitlement-revision', approval.entitlementRevision,
+      '--expected-time-epoch', approval.expectedTimeEpoch,
+      '--reset-operation-id', approval.resetOperationId, '--intent-digest', approval.intentDigest,
+      '--old-watermark-digest', approval.oldWatermarkDigest, '--reason', approval.reason,
+    ], stdout.stream, stderr.stream);
+    expect(status).toBe(0);
+    expect(stderr.text()).toBe('');
+    expect(JSON.parse(stdout.text())).toMatchObject({ review_required: true, action: 'time_reset_approve', request_digest: digest });
+
+    const revoke = {
+      operationId: '00000000-0000-4000-8000-000000000007',
+      licenseId: approval.licenseId,
+      expectedRevision: approval.expectedRevision,
+      approvalId: approval.operationId,
+      reason: 'manual revoke of reset approval',
+    };
+    const revokeDigest = revokeTimeResetApprovalRequestDigest(revoke);
+    const revokeOut = fakeStream();
+    const revokeErr = fakeStream();
+    const revokeStatus = await runAdminCli([
+      'license', 'revoke-time-reset-approval', '--operation-id', revoke.operationId,
+      '--license-id', revoke.licenseId, '--approval-id', revoke.approvalId,
+      '--expected-revision', revoke.expectedRevision, '--reason', revoke.reason,
+    ], revokeOut.stream, revokeErr.stream);
+    expect(revokeStatus).toBe(0);
+    expect(revokeErr.text()).toBe('');
+    expect(JSON.parse(revokeOut.text())).toMatchObject({ review_required: true, action: 'time_reset_revoke', request_digest: revokeDigest });
   });
 
   it('refuses to open the admin service in production mode', async () => {

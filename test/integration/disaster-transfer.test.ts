@@ -1512,6 +1512,49 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     expect(await db.selectFrom('license_disaster_transfer_approvals').selectAll()
       .where('license_id', '=', active.licenseId).execute()).toHaveLength(0);
   });
+
+  it('rejects a disaster-transfer Commit after approval expiry while its prepared ticket remains fresh', async () => {
+    const active = await activate();
+    const target = await createIdentity();
+    const base = await getDbNow(db);
+    const historicalApprovalTime = new Date(base.getTime() - 59 * 60 * 1000 - 50 * 1000);
+    const request = await disasterApprovalRequest(active, target, { expiresInHours: 1 });
+    const historicalAdmin = await createAdminService(policyFile, { controlledTestNow: async () => historicalApprovalTime });
+    let expiryServer: RunningTestServer | undefined;
+    try {
+      const approval = await historicalAdmin.approveDisasterTransfer({ ...request,
+        confirmedRequestDigest: approveDisasterTransferRequestDigest(request) });
+      expect(approval.state).toBe('succeeded');
+      const approvalRow = await db.selectFrom('license_disaster_transfer_approvals').selectAll()
+        .where('approval_id', '=', approval.operationId).executeTakeFirstOrThrow();
+      expect(approvalRow.expires_at.getTime()).toBe(base.getTime() + 10 * 1000);
+      const approved: ApprovedDisaster = { active, target, request, approval };
+      const prepared = await prepare(approved);
+      const commitTime = new Date(base.getTime() + 20 * 1000);
+      expiryServer = await startAppServer(createApp({ config: runtime.config, db, now: async () => commitTime }));
+      const rejectedCommit = await commit(prepared, { challengePort: expiryServer.port }, expiryServer.port);
+      expect(rejectedCommit.response.status).toBe(409);
+      expect(typeof rejectedCommit.response.json['operation_receipt']).toBe('string');
+      expect(rejectedCommit.response.json).not.toHaveProperty('transfer_receipt');
+      expect(rejectedCommit.response.json).not.toHaveProperty('binding_receipt');
+      expect(rejectedCommit.response.json).not.toHaveProperty('disaster_transfer_ticket');
+      const rejected = await jwtVerify(rejectedCommit.response.json['operation_receipt'] as string, runtime.config.signingPublicKey, {
+        algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce', currentDate: commitTime,
+      });
+      expect(rejected.payload).toMatchObject({ state: 'rejected', outcome_code: 'DISASTER_APPROVAL_INVALID' });
+      const plan = await db.selectFrom('license_disaster_transfer_plans').selectAll()
+        .where('approval_id', '=', approval.operationId).executeTakeFirstOrThrow();
+      expect(plan.state).toBe('invalidated');
+      expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('1');
+      expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').execute()).toMatchObject([expect.objectContaining({ identity_jkt: active.source.jkt })]);
+      expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('identity_jkt', '=', target.jkt).execute()).toHaveLength(0);
+    } finally {
+      await expiryServer?.stop();
+      await historicalAdmin.close();
+    }
+  });
 });
 
 function deferred<T>() {

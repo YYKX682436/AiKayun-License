@@ -34,6 +34,7 @@ export interface LicenseActivationsTable {
   retired_at: Timestamp | null;
   last_seen_at: Timestamp;
   origin_display: string | null;
+  time_epoch: DefaultedBigint;
 }
 
 export interface ActivationCodesTable {
@@ -64,12 +65,12 @@ export interface LicenseOperationsTable {
   operation_id: string;
   actor_jkt: string;
   intent_digest: string;
-  kind: 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
+  kind: 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset';
   license_id: string;
   database_id: string;
   state: 'committed' | 'rejected' | 'cancelled';
   outcome_code: string;
-  response_type: 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding';
+  response_type: 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding' | 'time_reset';
   result_generation: Bigint | null;
   result_revision: Bigint | null;
   response_jws: string;
@@ -118,7 +119,7 @@ export interface LicenseAuditEventsTable {
 export interface LicenseAdminOperationsTable {
   operation_id: string;
   request_digest: string;
-  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve' | 'transfer_revoke' | 'disaster_transfer_approve' | 'disaster_transfer_revoke';
+  action: 'license_create' | 'activation_code_issue' | 'license_renew' | 'license_revoke' | 'license_restore' | 'transfer_approve' | 'transfer_revoke' | 'disaster_transfer_approve' | 'disaster_transfer_revoke' | 'time_reset_approve' | 'time_reset_revoke';
   license_id: string;
   expected_revision: Bigint;
   actor_os_uid: number;
@@ -259,6 +260,54 @@ export interface LicenseDisasterTransferEventsTable {
   created_at: Timestamp;
 }
 
+export interface LicenseTimeResetApprovalsTable {
+  approval_id: string;
+  request_digest: string;
+  license_id: string;
+  activation_id: string;
+  database_id: string;
+  instance_id: string;
+  identity_jkt: string;
+  activation_generation: Bigint;
+  expected_revision: Bigint;
+  entitlement_revision: Bigint;
+  expected_time_epoch: Bigint;
+  new_time_epoch: Bigint;
+  reset_operation_id: string;
+  intent_digest: string;
+  old_watermark_digest: string;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  approved_at: Timestamp;
+  expires_at: Timestamp;
+}
+
+export interface LicenseTimeResetRevocationsTable {
+  revocation_operation_id: string;
+  approval_id: string;
+  license_id: string;
+  request_digest: string;
+  expected_revision: Bigint;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  reason: string;
+  revoked_at: Timestamp;
+}
+
+export interface LicenseTimeResetEventsTable {
+  event_id: string;
+  license_id: string;
+  approval_id: string;
+  operation_id: string;
+  kind: 'approved' | 'approval_revoked' | 'committed';
+  actor: string;
+  safe_details: Json;
+  created_at: Timestamp;
+}
+
 export interface LicenseTransferApprovalsTable {
   approval_id: string;
   request_digest: string;
@@ -353,6 +402,9 @@ export interface Database {
   license_disaster_transfer_revocations: LicenseDisasterTransferRevocationsTable;
   license_disaster_transfer_plans: LicenseDisasterTransferPlansTable;
   license_disaster_transfer_events: LicenseDisasterTransferEventsTable;
+  license_time_reset_approvals: LicenseTimeResetApprovalsTable;
+  license_time_reset_revocations: LicenseTimeResetRevocationsTable;
+  license_time_reset_events: LicenseTimeResetEventsTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;

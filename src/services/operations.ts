@@ -12,17 +12,19 @@ import type {
   LicenseTransferPlanRow,
   OperationRow,
   RequestNonceRow,
+  LicenseTimeResetApprovalsTable,
 } from '../db/types.js';
 import { LicenseApiError } from '../errors.js';
 import { sha256Base64url, validateIdentityJwk } from '../crypto/identity.js';
-import { databaseNow, challengeClaimsMatchRow, sha256, type AuthenticatedRequest } from './common.js';
+import { assertCenterTimeSourceHealthy, databaseNow, challengeClaimsMatchRow, sha256, type AuthenticatedRequest } from './common.js';
 import {
   signDisasterTransferResult, signDisasterTransferTicket, signLicenseLease, signOperationReceipt, signStatusReceipt,
   signTransferReceipt, signTransferTicket, verifyDisasterTransferTicket, verifyTransferTicket,
   type OperationState,
 } from '../receipts.js';
+import { signTimeResetReceipt } from '../crypto/time-reset.js';
 
-export type MutationKind = 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
+export type MutationKind = 'activation' | 'renewal' | 'recovery' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset';
 export interface ActivationInput {
   operation_id: string;
   intent_digest: string;
@@ -136,7 +138,26 @@ export interface DisasterTransferCommitInput {
   disaster_ticket: string;
 }
 
-export type MutationResponseType = 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding';
+export interface TimeResetInput {
+  operation_id: string;
+  intent_digest: string;
+  attempt_no: number;
+  license_id: string;
+  database_id: string;
+  instance_id: string;
+  identity_jkt: string;
+  public_jwk: unknown;
+  challenge: string;
+  activation_id: string;
+  approval_id: string;
+  expected_generation: string;
+  expected_revision: string;
+  expected_entitlement_revision: string;
+  expected_time_epoch: string;
+  old_watermark_digest: string;
+}
+
+export type MutationResponseType = 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding' | 'time_reset';
 export type MutationResult =
   | { kind: 'retryable'; code: string }
   | { kind: 'response'; responseType: MutationResponseType; token: string; state: 'committed' | 'rejected' | 'cancelled'; outcomeCode: string };
@@ -715,6 +736,163 @@ export async function processRenewal(
   });
 }
 
+export async function processTimeReset(
+  db: Kysely<Database>,
+  config: RuntimeConfig,
+  auth: AuthenticatedRequest,
+  input: TimeResetInput,
+): Promise<MutationResult> {
+  bindAttemptNumber(auth, input.attempt_no);
+  const identity = await validateIdentityJwk(input.public_jwk);
+  if (input.identity_jkt !== auth.signature.identityJkt || identity.jkt !== auth.signature.identityJkt ||
+    input.operation_id !== auth.challenge.operationId || input.intent_digest !== auth.challenge.intentDigest ||
+    input.instance_id !== auth.challenge.instanceId) throw new LicenseApiError(401, 'TIME_RESET_IDENTITY_PROOF_INVALID');
+
+  return db.transaction().execute(async (trx) => {
+    await acquireOperationLock(trx, input.operation_id);
+    const license = await lockLicense(trx, input.license_id);
+    const existing = await findOperation(trx, input.operation_id);
+    if (existing) {
+      assertSameOperation(existing, auth, 'time_reset', input.license_id, input.database_id);
+      const activeGeneration = await trx.selectFrom('license_activations').selectAll()
+        .where('id', '=', input.activation_id).where('license_id', '=', input.license_id)
+        .where('database_id', '=', input.database_id).where('instance_id', '=', input.instance_id)
+        .where('identity_jkt', '=', auth.signature.identityJkt).where('state', '=', 'active')
+        .forUpdate().executeTakeFirst();
+      if (!activeGeneration || activeGeneration.generation.toString() !== existing.result_generation ||
+        activeGeneration.generation.toString() !== license.current_generation.toString() ||
+        BigInt(activeGeneration.time_epoch) <= BigInt(input.expected_time_epoch)) {
+        throw new LicenseApiError(403, 'TIME_RESET_INSTANCE_BINDING_MISMATCH');
+      }
+      const replayNow = await databaseNow(trx);
+      assertCenterTimeSourceHealthy(replayNow);
+      return replayExistingOperation(trx, config, auth, existing, replayNow);
+    }
+
+    const activation = await trx.selectFrom('license_activations').selectAll()
+      .where('id', '=', input.activation_id).where('license_id', '=', input.license_id)
+      .where('state', '=', 'active').forUpdate().executeTakeFirst();
+    const now = await databaseNow(trx);
+    assertCenterTimeSourceHealthy(now);
+    if (!activation || activation.instance_id !== input.instance_id || activation.database_id !== input.database_id ||
+      activation.identity_jkt !== auth.signature.identityJkt || activation.generation.toString() !== input.expected_generation ||
+      activation.generation.toString() !== license.current_generation.toString() ||
+      activation.identity_jwk_public['kty'] !== identity.jwk.kty || activation.identity_jwk_public['crv'] !== identity.jwk.crv ||
+      activation.identity_jwk_public['x'] !== identity.jwk.x) {
+      throw new LicenseApiError(403, 'TIME_RESET_INSTANCE_BINDING_MISMATCH');
+    }
+    if (license.revision.toString() !== input.expected_revision ||
+      license.entitlement_revision.toString() !== input.expected_entitlement_revision ||
+      activation.time_epoch.toString() !== input.expected_time_epoch) {
+      throw new LicenseApiError(409, 'TIME_RESET_WATERMARK_CONFLICT');
+    }
+
+    const approval = await trx.selectFrom('license_time_reset_approvals').selectAll()
+      .where('approval_id', '=', input.approval_id).forUpdate().executeTakeFirst();
+    const adminOperation = await trx.selectFrom('license_admin_operations').selectAll()
+      .where('operation_id', '=', input.approval_id).executeTakeFirst();
+    const adminAudit = await trx.selectFrom('license_admin_audit_events').selectAll()
+      .where('operation_id', '=', input.approval_id).where('action', '=', 'time_reset_approve')
+      .executeTakeFirst();
+    const revoked = await trx.selectFrom('license_time_reset_revocations').select('approval_id')
+      .where('approval_id', '=', input.approval_id).executeTakeFirst();
+    const approvalMatches = approval !== undefined && !revoked && adminOperation !== undefined && adminAudit !== undefined &&
+      adminOperation.action === 'time_reset_approve' && adminOperation.state === 'succeeded' &&
+      adminOperation.outcome_code === 'TIME_RESET_APPROVED' && adminOperation.license_id === license.id &&
+      adminOperation.expected_revision.toString() === input.expected_revision && adminOperation.reason === approval.reason &&
+      adminAudit.action === 'time_reset_approve' && adminAudit.license_id === license.id &&
+      adminAudit.state === 'succeeded' && adminAudit.request_digest === approval.request_digest &&
+      adminAudit.expected_revision.toString() === input.expected_revision && adminAudit.reason === approval.reason &&
+      adminOperation.request_digest === approval.request_digest && adminAudit.actor_os_uid === approval.actor_os_uid &&
+      adminAudit.actor_os_username === approval.actor_os_username && adminAudit.actor_database_role === approval.actor_database_role &&
+      approval.license_id === license.id && approval.activation_id === activation.id &&
+      approval.database_id === input.database_id && approval.instance_id === input.instance_id &&
+      approval.identity_jkt === auth.signature.identityJkt && approval.activation_generation.toString() === input.expected_generation &&
+      approval.expected_revision.toString() === input.expected_revision &&
+      approval.entitlement_revision.toString() === input.expected_entitlement_revision &&
+      approval.expected_time_epoch.toString() === input.expected_time_epoch &&
+      approval.new_time_epoch.toString() === (BigInt(input.expected_time_epoch) + 1n).toString() &&
+      approval.reset_operation_id === input.operation_id && approval.intent_digest === input.intent_digest &&
+      approval.old_watermark_digest === input.old_watermark_digest && approval.expires_at.getTime() > now.getTime();
+    if (!approvalMatches || !approval || !adminOperation || !adminAudit) {
+      throw new LicenseApiError(403, revoked ? 'TIME_RESET_APPROVAL_REVOKED' : 'TIME_RESET_APPROVAL_INVALID');
+    }
+
+    const nonce = await loadAndConsumeNonce(trx, auth, now);
+    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
+
+    const oldEpoch = activation.time_epoch.toString();
+    const newEpoch = (BigInt(oldEpoch) + 1n).toString();
+    if (BigInt(newEpoch) > MAX_DATABASE_INTEGER) throw new LicenseApiError(409, 'TIME_RESET_EPOCH_EXHAUSTED');
+    const epochUpdate = await trx.updateTable('license_activations').set({ time_epoch: newEpoch, last_seen_at: now })
+      .where('id', '=', activation.id).where('state', '=', 'active').where('time_epoch', '=', oldEpoch)
+      .returning('id').executeTakeFirst();
+    if (!epochUpdate) throw new LicenseApiError(409, 'TIME_RESET_WATERMARK_CONFLICT');
+
+    const eventId = randomUUID();
+    const token = await signTimeResetReceipt(config, {
+      license_id: license.id,
+      database_id: activation.database_id,
+      instance_id: activation.instance_id,
+      identity_jkt: activation.identity_jkt,
+      activation_generation: activation.generation.toString(),
+      management_revision: license.revision.toString(),
+      entitlement_revision: license.entitlement_revision.toString(),
+      old_time_epoch: oldEpoch,
+      new_time_epoch: newEpoch,
+      old_watermark_digest: input.old_watermark_digest,
+      operation_id: input.operation_id,
+      intent_digest: input.intent_digest,
+      request_nonce: auth.challenge.serverNonce,
+      client_nonce: auth.challenge.clientNonce,
+      request_digest: auth.requestDigest,
+      admin_approval_id: approval.approval_id,
+      admin_operation_id: adminOperation.operation_id,
+      admin_approval_digest: approval.request_digest,
+      admin_os_uid: approval.actor_os_uid,
+      admin_os_username: approval.actor_os_username,
+      admin_database_role: approval.actor_database_role,
+      admin_reason: approval.reason,
+      admin_audit_reference: `license_admin_audit_events:${approval.approval_id}`,
+    }, now);
+
+    await insertOperation(trx, {
+      operationId: input.operation_id,
+      identityJkt: auth.signature.identityJkt,
+      intentDigest: input.intent_digest,
+      kind: 'time_reset',
+      licenseId: license.id,
+      databaseId: input.database_id,
+      state: 'committed',
+      outcomeCode: 'TIME_RESET_COMMITTED',
+      responseType: 'time_reset',
+      resultGeneration: activation.generation.toString(),
+      resultRevision: license.revision.toString(),
+      responseJws: token,
+      now,
+    });
+    await appendAttempt(trx, auth, {
+      operationId: input.operation_id, attemptNo: input.attempt_no, intentDigest: input.intent_digest,
+      outcome: 'accepted', serverNonceHash: auth.challenge.nonceHash,
+    }, now);
+    await appendAudit(trx, license.id, input.operation_id, 'time_reset_committed', auth.signature.identityJkt, {
+      activation_id: activation.id, generation: activation.generation.toString(), old_time_epoch: oldEpoch,
+      new_time_epoch: newEpoch, expected_revision: license.revision.toString(),
+      entitlement_revision: license.entitlement_revision.toString(), approval_id: approval.approval_id,
+      old_watermark_digest: input.old_watermark_digest, client_nonce_hash: sha256(auth.challenge.clientNonce),
+      request_nonce_hash: auth.challenge.nonceHash, request_digest: auth.requestDigest, event_id: eventId,
+    }, now);
+    await trx.insertInto('license_time_reset_events').values({
+      event_id: eventId, license_id: license.id, approval_id: approval.approval_id,
+      operation_id: input.operation_id, kind: 'committed', actor: auth.signature.identityJkt,
+      safe_details: { old_time_epoch: oldEpoch, new_time_epoch: newEpoch, request_digest: auth.requestDigest,
+        old_watermark_digest: input.old_watermark_digest, admin_audit_reference: `license_admin_audit_events:${approval.approval_id}` },
+      created_at: now,
+    }).execute();
+    return { kind: 'response', responseType: 'time_reset', token, state: 'committed', outcomeCode: 'TIME_RESET_COMMITTED' };
+  });
+}
+
 export async function queryOperation(
   db: Kysely<Database>,
   config: RuntimeConfig,
@@ -1112,6 +1290,7 @@ function ticketString(claims: Record<string, unknown>, name: string): string {
 
 export async function processTransferCommit(
   db: Kysely<Database>, config: RuntimeConfig, auth: AuthenticatedRequest, input: TransferCommitInput,
+  controlledNow?: () => Promise<Date>,
 ): Promise<MutationResult> {
   bindAttemptNumber(auth, input.attempt_no);
   let ticket: Awaited<ReturnType<typeof verifyTransferTicket>>;
@@ -1138,13 +1317,13 @@ export async function processTransferCommit(
     const existing = await findOperation(trx, input.operation_id);
     if (existing) {
       assertSameOperation(existing, auth, 'transfer_commit', input.license_id, input.database_id);
-      const now = await databaseNow(trx);
+      const now = controlledNow ? await controlledNow() : await databaseNow(trx);
       return replayExistingOperation(trx, config, auth, existing, now);
     }
     await acquireInstanceLock(trx, input.instance_id);
     const planId = ticketString(claims, 'plan_id');
     const plan = await trx.selectFrom('license_transfer_plans').selectAll().where('plan_id', '=', planId).forUpdate().executeTakeFirst();
-    const now = await databaseNow(trx);
+    const now = controlledNow ? await controlledNow() : await databaseNow(trx);
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
 
@@ -1209,9 +1388,11 @@ export async function processTransferCommit(
       source.instance_id !== plan.source_instance_id || source.identity_jkt !== plan.source_identity_jkt ||
       source.generation.toString() !== plan.source_generation.toString()) {
       await expireOrInvalidatePlan(trx, plan, 'invalidated', transferEventActor(auth.signature.identityJkt), 'approval_or_source_no_longer_current', now);
-      const code = license.status !== 'active' ? 'LICENSE_REVOKED' : license.confirmed_subscription_end.getTime() <= now.getTime()
-        ? 'SUBSCRIPTION_EXPIRED' : license.revision.toString() !== plan.expected_revision.toString()
-          ? 'TRANSFER_REVISION_CONFLICT' : 'TRANSFER_SOURCE_SUPERSEDED';
+      const code = approvalRevoked ? 'TRANSFER_APPROVAL_REVOKED' : !approval || !adminApproval ? 'TRANSFER_APPROVAL_INVALID'
+        : approval.expires_at.getTime() <= now.getTime() ? 'TRANSFER_APPROVAL_EXPIRED'
+          : license.status !== 'active' ? 'LICENSE_REVOKED' : license.confirmed_subscription_end.getTime() <= now.getTime()
+            ? 'SUBSCRIPTION_EXPIRED' : license.revision.toString() !== plan.expected_revision.toString()
+              ? 'TRANSFER_REVISION_CONFLICT' : 'TRANSFER_SOURCE_SUPERSEDED';
       return reject(code);
     }
     const databaseInteger = BigInt(license.current_generation) + 1n;
@@ -1522,6 +1703,7 @@ export async function processDisasterTransferPrepare(
 
 export async function processDisasterTransferCommit(
   db: Kysely<Database>, config: RuntimeConfig, auth: AuthenticatedRequest, input: DisasterTransferCommitInput,
+  controlledNow?: () => Promise<Date>,
 ): Promise<MutationResult> {
   bindAttemptNumber(auth, input.attempt_no);
   let verifiedTicket: Awaited<ReturnType<typeof verifyDisasterTransferTicket>>;
@@ -1545,12 +1727,12 @@ export async function processDisasterTransferCommit(
     const existing = await findOperation(trx, input.operation_id);
     if (existing) {
       assertSameOperation(existing, auth, 'disaster_transfer_commit', input.license_id, input.database_id);
-      return replayExistingOperation(trx, config, auth, existing, await databaseNow(trx));
+      return replayExistingOperation(trx, config, auth, existing, controlledNow ? await controlledNow() : await databaseNow(trx));
     }
     await acquireInstanceLock(trx, input.instance_id);
     const plan = await trx.selectFrom('license_disaster_transfer_plans').selectAll()
       .where('plan_id', '=', disasterTicketString(claims, 'plan_id')).forUpdate().executeTakeFirst();
-    const now = await databaseNow(trx);
+    const now = controlledNow ? await controlledNow() : await databaseNow(trx);
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
 

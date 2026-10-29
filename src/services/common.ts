@@ -8,7 +8,7 @@ import { verifyTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClai
 import { validateIdentityJwk } from '../crypto/identity.js';
 import { verifyHttpMessage, type VerifiedHttpSignature } from '../crypto/http-signature.js';
 
-export type ChallengeOperation = 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit';
+export type ChallengeOperation = 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset';
 export interface ChallengeRequestBody {
   operation: ChallengeOperation;
   operation_id: string;
@@ -72,6 +72,14 @@ export function validateDigest(value: unknown): value is string {
 export async function databaseNow(db: Kysely<Database> | Transaction<Database>): Promise<Date> {
   const result = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(db);
   return result.rows[0]!.now;
+}
+
+/** Reject a center clock that diverges materially from the process time source. External time-source monitoring remains an operational requirement. */
+export function assertCenterTimeSourceHealthy(databaseTime: Date, processTime = new Date()): void {
+  if (!Number.isFinite(databaseTime.getTime()) || !Number.isFinite(processTime.getTime()) ||
+    Math.abs(databaseTime.getTime() - processTime.getTime()) > 60_000) {
+    throw new LicenseApiError(503, 'TIME_SOURCE_UNHEALTHY');
+  }
 }
 
 export async function issueChallenge(
@@ -152,7 +160,7 @@ async function verifyChallengeToken(token: string, config: RuntimeConfig, now: D
   const nbf = assertIntegerClaim(claims, 'nbf');
   const exp = assertIntegerClaim(claims, 'exp');
   const operation = assertStringClaim(claims, 'operation', 32) as ChallengeOperation;
-  if (!['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit', 'disaster_transfer_prepare', 'disaster_transfer_commit'].includes(operation) || nbf !== iat || exp <= iat || exp > iat + 300) {
+  if (!['activation', 'renewal', 'recovery', 'query', 'continue', 'transfer_prepare', 'transfer_commit', 'disaster_transfer_prepare', 'disaster_transfer_commit', 'time_reset'].includes(operation) || nbf !== iat || exp <= iat || exp > iat + 300) {
     throw new LicenseApiError(401, 'CHALLENGE_INVALID');
   }
   const clientNonce = assertStringClaim(claims, 'client_nonce', 128);
