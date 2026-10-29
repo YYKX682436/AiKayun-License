@@ -314,7 +314,7 @@ function resolverFor(
         input.issuedAt > now) throw new Error('Trust key request does not match the accepted bundle context');
       const { record, publicKey } = getRootAuthenticatedCandidateKey(candidate, input.kid);
       if (record.revoked_at !== null || tombstones.has(record.kid)) throw new Error('Center signing key has been emergency-revoked');
-      if (input.issuedAt < record.not_before || (record.retire_after !== null && input.issuedAt > record.retire_after)) {
+      if (input.issuedAt < record.not_before || (record.retire_after !== null && input.issuedAt >= record.retire_after)) {
         throw new Error('JWT was signed outside the center key issuance window');
       }
       if (record.verify_until !== null && (now >= record.verify_until || input.expiresAt > record.verify_until)) {

@@ -123,6 +123,7 @@ export async function createTestSigningRuntime(options: CreateTestRuntimeOptions
     bundleVersion: trustBundleVersion,
     artifactSha256: trustBundleArtifactDigest(trustBundleJws),
     resolver,
+    assertIssuanceAllowed: async () => undefined,
   });
   const directory = await mkdtemp(join(tmpdir(), 'aikayun-license-tls-'));
   const tlsKeyFile = join(directory, 'tls-key.pem');

@@ -121,6 +121,40 @@ async function loadLockedSigningAuthority(
     privateKey: material.privateKey,
     publicKey: material.publicKey,
     publicJwk: material.publicJwk,
+    assertIssuanceAllowed: async (
+      claims: Readonly<Record<string, unknown>>,
+      options: { allowExpiredTestToken?: boolean } = {},
+    ) => {
+      const issuanceNowResult = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(trx);
+      const issuanceNow = issuanceNowResult.rows[0]!.now;
+      const issuanceNowSeconds = Math.floor(issuanceNow.getTime() / 1000);
+      try { assertTrustBundleValidAt(candidate, issuanceNowSeconds); }
+      catch { throw new LicenseApiError(503, 'SIGNING_TRUST_BUNDLE_OUTSIDE_VALIDITY'); }
+      if (record.revoked_at !== null || revoked.has(record.kid) || retired.has(record.kid)) {
+        throw new LicenseApiError(503, 'ACTIVE_SIGNING_KEY_REVOKED_OR_RETIRED');
+      }
+      if (issuanceNowSeconds < record.not_before ||
+        (record.retire_after !== null && issuanceNowSeconds >= record.retire_after) ||
+        (record.verify_until !== null && issuanceNowSeconds >= record.verify_until)) {
+        throw new LicenseApiError(503, 'ACTIVE_SIGNING_KEY_OUTSIDE_LIFECYCLE');
+      }
+      const issuedAt = claims['iat'];
+      const expiresAt = claims['exp'];
+      if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt) ||
+        (issuedAt as number) <= 0 || (expiresAt as number) <= (issuedAt as number) ||
+        (issuedAt as number) > issuanceNowSeconds) {
+        throw new LicenseApiError(503, 'SIGNING_CLAIM_TIME_INVALID');
+      }
+      if ((expiresAt as number) <= issuanceNowSeconds &&
+        !(options.allowExpiredTestToken === true && config.nodeEnv === 'development')) {
+        throw new LicenseApiError(503, 'SIGNING_CLAIM_TIME_INVALID');
+      }
+      if ((issuedAt as number) < record.not_before ||
+        (record.retire_after !== null && (issuedAt as number) >= record.retire_after) ||
+        (record.verify_until !== null && ((issuanceNowSeconds >= record.verify_until) || (expiresAt as number) > record.verify_until))) {
+        throw new LicenseApiError(503, 'ACTIVE_SIGNING_KEY_OUTSIDE_LIFECYCLE');
+      }
+    },
   });
   return { signer, authority, trustBundle: bundle, candidate, now };
 }

@@ -26,6 +26,13 @@ export interface VerifiedHttpSignature {
   requestDigest: string;
 }
 
+export function assertVerifiedHttpSignatureFresh(signature: Pick<VerifiedHttpSignature, 'created' | 'expires'>, now: Date): void {
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  if (signature.created < nowSeconds - 60 || signature.created > nowSeconds + 60 || signature.expires < nowSeconds) {
+    throw new LicenseApiError(401, 'HTTP_SIGNATURE_INVALID');
+  }
+}
+
 function getSingleHeader(request: SignedHttpRequest, name: string): string {
   let count = 0;
   let found = '';
@@ -90,14 +97,14 @@ export async function verifyHttpMessage(
     const keyid = params.get('keyid');
     const alg = params.get('alg');
     const tag = params.get('tag');
-    const nowSeconds = Math.floor(now.getTime() / 1000);
     if (typeof created !== 'number' || !Number.isSafeInteger(created) || typeof expires !== 'number' || !Number.isSafeInteger(expires) || typeof nonce !== 'string' ||
       typeof keyid !== 'string' || typeof alg !== 'string' || typeof tag !== 'string' ||
       keyid !== jkt || nonce !== expectedNonce || alg !== 'ed25519' || tag !== 'aikayun-license-v1' ||
-      Number(expires) <= Number(created) || Number(expires) - Number(created) > 60 ||
-      Number(created) < nowSeconds - 60 || Number(created) > nowSeconds + 60 || Number(expires) < nowSeconds) {
+      Number(expires) <= Number(created) || Number(expires) - Number(created) > 60) {
       throw new LicenseApiError(401, 'HTTP_SIGNATURE_INVALID');
     }
+    const verifiedTimestamp = { created, expires } as Pick<VerifiedHttpSignature, 'created' | 'expires'>;
+    assertVerifiedHttpSignatureFresh(verifiedTimestamp, now);
 
     const headers: Record<string, string | string[] | undefined> = {};
     for (const [keyName, value] of Object.entries(request.headers)) headers[keyName.toLowerCase()] = value;

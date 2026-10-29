@@ -285,6 +285,9 @@ function disasterTransferResponse(result: MutationResult, reply: FastifyReply) {
 }
 
 export function createApp({ config, db, now: providedNow, challengeNow: providedChallengeNow }: CreateAppOptions): FastifyInstance {
+  if (config.nodeEnv === 'production' && (providedNow || providedChallengeNow)) {
+    throw new Error('Injected time sources are disabled in production');
+  }
   const readNow = providedNow ?? (() => databaseNow(db));
   const readChallengeNow = providedChallengeNow ?? readNow;
   const app = Fastify({
@@ -365,8 +368,8 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     };
     const now = await readNow();
     const signature = await authenticateChallengeRequest(requestSignatureInput(request), body, config, now);
-    const challengeNow = await readChallengeNow();
-    const token = await issueChallenge(db, config, body, signature, challengeNow);
+    const challengeNowOverride = providedNow || providedChallengeNow ? readChallengeNow : undefined;
+    const token = await issueChallenge(db, config, body, signature, challengeNowOverride);
     return reply.code(201).send({ challenge: token });
   });
 

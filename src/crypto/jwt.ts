@@ -27,7 +27,9 @@ export async function signTypedJwt(
   signer: SigningContext,
   typ: string,
   claims: Record<string, unknown>,
+  options: { allowExpiredTestToken?: boolean } = {},
 ): Promise<string> {
+  await signer.assertIssuanceAllowed(claims, options);
   return new SignJWT(claims)
     .setProtectedHeader({ alg: 'Ed25519', kid: signer.kid, typ })
     .sign(signer.privateKey);

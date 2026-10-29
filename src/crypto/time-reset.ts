@@ -94,7 +94,7 @@ function validateVerifiedTimeAnchor(
     nonce !== input.clientNonce || !uuidPattern.test(jti)) throw new Error('Invalid time anchor claims');
   const key = input.keyRecord;
   if (key && (key.revoked_at !== null || iat < key.not_before ||
-    (key.retire_after !== null && iat > key.retire_after) ||
+    (key.retire_after !== null && iat >= key.retire_after) ||
     (key.verify_until !== null && (input.serverTime >= key.verify_until || exp > key.verify_until)))) {
     throw new Error('Time anchor is outside its root-authenticated bundle key policy');
   }

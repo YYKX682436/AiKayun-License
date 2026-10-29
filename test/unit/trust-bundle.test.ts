@@ -131,6 +131,7 @@ function runtimeFor(input: { privateKey: CryptoKey; publicKey: CryptoKey; public
     publicKey: input.publicKey, publicJwk: input.publicJwk as JWK,
     signerRevision: '1', bundleVersion: '1', artifactSha256: 'A'.repeat(43),
     resolver: { async resolveKey() { throw new Error('test signing context resolver is not used'); } },
+    assertIssuanceAllowed: async () => undefined,
   };
 }
 
@@ -352,11 +353,17 @@ describe('offline-root trust bundle and monotonic key selection', () => {
     const secondAccepted = await trust.accept(second, retireAt);
     const preRetirementLease = await lease({
       privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
-    }, retireAt);
+    }, retireAt - 1);
     await expect(verifyLicenseLeaseWithTrustedKeys(preRetirementLease.token, {
       resolver: secondAccepted.resolver, issuer: CENTER_ISSUER, now: new Date(retireAt * 1000),
     })).resolves.toBeTruthy();
-    const duringRetentionTime = retireAt + 7 * DAY - 1;
+    const boundaryLease = await lease({
+      privateKey: centerKeyOne, publicKey: centerVerifyOne, publicJwk: centerPublicOne, kid: centerKidOne,
+    }, retireAt);
+    await expect(verifyLicenseLeaseWithTrustedKeys(boundaryLease.token, {
+      resolver: secondAccepted.resolver, issuer: CENTER_ISSUER, now: new Date(retireAt * 1000),
+    })).rejects.toThrow(/issuance window/i);
+    const duringRetentionTime = retireAt + 7 * DAY - 2;
     const duringRetention = await trust.getAccepted(duringRetentionTime);
     await expect(verifyLicenseLeaseWithTrustedKeys(preRetirementLease.token, {
       resolver: duringRetention.resolver, issuer: CENTER_ISSUER, now: new Date(duringRetentionTime * 1000),

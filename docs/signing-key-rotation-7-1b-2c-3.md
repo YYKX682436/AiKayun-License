@@ -83,3 +83,18 @@ npm run admin -- signer audit --limit 50
 ## 发布边界
 
 本阶段验证的是隔离环境 A→B。Root-signed bundle 的本地验签和中心接受，只说明中心认可了候选公钥，并不证明任何客户已收到 bundle。生产轮换仍需在发布前建立可审计的 bundle 传播与客户端就绪证据、生产 MFA/双人审批、受管密钥服务、恢复演练和生产门禁；生产 signer 轮换和客户端集成均未完成。
+
+## R1：签发时钟与生命周期最终一致性
+
+R1 基线为 `8c1473b42d581bb504ffadf3dbb434f13e59e965`。修复前使用隔离 PostgreSQL 18、临时 root-signed A bundle、真实 Ed25519 客户实例签名和 HTTPS 请求复现了两条锁等待路径：
+
+- A 的 `retire_after` 为 `1793269886`。PID `89` 在等待 `licenses ... FOR UPDATE` 时仍持有 signer advisory `ShareLock`。跨界后 PostgreSQL 时间为 `1793269887`，旧实现返回 HTTP 200，JWT `kid` 是 A、`iat=1793269887`，并将该 lease 保存为不可变 `response_jws`、把 generation 提升到 1。随后用当前 bundle resolver 验签得到 `JWT was signed outside the center key issuance window`。这证明旧实现确实会提交客户无法验签的新 lease。
+- challenge 请求 PID `94` 在 signer advisory 锁队列中等待。其 RFC 9421 `created=1793269857`、`expires=1793269917`；旧实现仍返回 HTTP 201。既有测试时钟注入让 challenge `iat=1793269287`、`exp=1793269587`，当前 PostgreSQL 时间已到 `1793269917`，对应 nonce 的 `expires_at` 也早于当前时间；当前 resolver 拒绝该 JWT。HTTP 请求签名是在进入 handler 时真实验过的，缺陷是等待后未按同一 RFC 9421 窗口重验。
+
+旧实现根因是签名 key 生命周期只在取到共享 signer 锁时读取一次，事务之后还可能等待 operation、license、instance 等数据库锁；实际 JWT `iat` 却由等待后的数据库时间生成。challenge 则在等待 signer 锁前捕获其签发时间。另发现 resolver 原来允许 `iat == retire_after`，与 signer 使用的 `now >= retire_after` 拒绝规则相反。
+
+修复收敛在 `signTypedJwt()` 的统一签发入口。数据库权威 signer context 在持有原共享锁及原 authority/bundle 行锁的同一事务中，每次真正签名前重新读取 `clock_timestamp()`，重新检查 bundle 有效期、active key 撤销/退休状态、`not_before`、排除端点 `retire_after`、`verify_until`，以及 JWT `iat/exp` 是否仍符合 key 窗口。它不重新选择 key、不改变锁序；越界时事务回滚并返回诊断错误。所有 lease、status、operation、challenge、normal/disaster ticket/receipt、嵌套结果、time-anchor 和 time-reset JWT 共用此入口。
+
+签发和验证现统一按秒使用半开签发窗口 `[not_before, retire_after)`；`verify_until` 为排除端点。A 在 `retire_after - 1` 秒签出的未过期历史凭证仍按原用途验证，`iat == retire_after` 不接受。生产 challenge 在获取 signer 共享锁后以 PostgreSQL 时间生成 iat/exp 和 nonce 时间，并以该锁后的 PostgreSQL 时间复核原 RFC 9421 `created/expires`。超窗即 401，nonce/JWS 均不写入。测试时钟注入只允许开发配置，生产 app 和 challenge 服务均拒绝注入；过期测试 token 的显式兼容开关也只在开发 signer context 下有效。
+
+R1 的真实 PostgreSQL/HTTPS 回归在跨 `retire_after` 的 license 行锁等待中确认 waiter PID 同时持有 signer `ShareLock`，最终 503 且 operation、activation code 消费、attempt/audit、nonce 消费、generation/activation 均无提交；随后 B 在 A 到期后完成受控切换并正常签发可验证 lease，A 退休前签出的历史 lease 仍通过当前 resolver。challenge 超过原 HTTP 签名窗口时返回 401 且没有 nonce；短锁等待仍返回 201，challenge JWT 与 nonce 的 iat/exp 对齐锁后时间。unit 回归覆盖 `retire_after` 精确边界。

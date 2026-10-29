@@ -6,7 +6,7 @@ import type { Database } from '../db/types.js';
 import { LicenseApiError } from '../errors.js';
 import { verifyTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClaim } from '../crypto/jwt.js';
 import { validateIdentityJwk } from '../crypto/identity.js';
-import { verifyHttpMessage, type VerifiedHttpSignature } from '../crypto/http-signature.js';
+import { assertVerifiedHttpSignatureFresh, verifyHttpMessage, type VerifiedHttpSignature } from '../crypto/http-signature.js';
 import { loadTrustedSigningContext, lockSigningAuthorityForSigning } from '../crypto/signing-authority.js';
 import type { SigningContext, VerificationContext } from '../crypto/signing-types.js';
 
@@ -89,14 +89,18 @@ export async function issueChallenge(
   config: RuntimeConfig,
   request: ChallengeRequestBody,
   http: VerifiedHttpSignature,
-  now: Date,
+  challengeNowOverride?: () => Promise<Date>,
 ): Promise<string> {
+  if (config.nodeEnv === 'production' && challengeNowOverride) {
+    throw new LicenseApiError(503, 'TEST_TIME_SOURCE_DISABLED');
+  }
   const { signTypedJwt } = await import('../crypto/jwt.js');
   return db.transaction().execute(async (trx) => {
     const authority = await lockSigningAuthorityForSigning(trx, config);
-    // The caller obtains this timestamp from the center clock. The signer
-    // authority lock still validates the active key against PostgreSQL time.
-    const issuedAt = now;
+    // Recheck the original RFC9421 validity against PostgreSQL time after the
+    // signer lock wait, then timestamp the challenge from that same authority.
+    assertVerifiedHttpSignatureFresh(http, authority.now);
+    const issuedAt = challengeNowOverride ? await challengeNowOverride() : authority.now;
     const serverNonce = newNonce();
     const iat = Math.floor(issuedAt.getTime() / 1000);
     const claims = {
@@ -116,7 +120,9 @@ export async function issueChallenge(
       client_nonce: request.client_nonce,
       server_nonce: serverNonce,
     };
-    const token = await signTypedJwt(authority.signer, 'aikayun-license-challenge+jwt', claims);
+    const token = await signTypedJwt(authority.signer, 'aikayun-license-challenge+jwt', claims, {
+      ...(challengeNowOverride ? { allowExpiredTestToken: true } : {}),
+    });
     try {
       await trx.insertInto('request_nonces').values({
         nonce_hash: sha256(serverNonce),

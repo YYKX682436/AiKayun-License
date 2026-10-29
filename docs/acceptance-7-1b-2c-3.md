@@ -45,3 +45,40 @@
 ## 生产边界
 
 本记录不证明客户已收到新版 bundle。生产管理员 MFA/双人审批、密钥托管、bundle 传播和客户端就绪证明、生产发布门禁与恢复演练仍未完成；生产轮换、客户端集成和生产部署不属于本阶段。
+
+## R1：签发时间与 key 生命周期锁等待回归
+
+R1 基线：`8c1473b42d581bb504ffadf3dbb434f13e59e965`。修复前复现证据使用真实 PostgreSQL 18、HTTPS 和临时 Ed25519 身份：
+
+| 路径 | PostgreSQL/HTTP 证据 | 旧实现结果 |
+| --- | --- | --- |
+| A lease 跨 `retire_after` | PID 89 持有 signer `ShareLock` 并等待 license `FOR UPDATE`；退休秒 `1793269886`，放锁时 DB 秒 `1793269887` | HTTP 200；A `kid`、`iat=1793269887`；operation `response_jws` 和 generation=1 已提交；当前可信 resolver 拒绝 `JWT was signed outside the center key issuance window` |
+| challenge 等待 signer lock | PID 94 在 PostgreSQL advisory lock 队列；真实 RFC 9421 `expires=1793269917`，旧响应时 DB 时间已为 `1793269917` | HTTP 201；受控旧 challenge 时钟产出 `iat=1793269287`、`exp=1793269587`，nonce `expires_at` 早于 DB 当前时间；当前 resolver 拒绝 token |
+
+修复后将数据库当前时间与生命周期重检放入每次 JWT 实际签发的统一入口；仍使用原 signer 共享锁、原事务和原锁顺序。resolver 的 `retire_after` 端点改为排除，和签发侧 `now >= retire_after` 一致。challenge 在 signer 锁后使用 PostgreSQL 时间生成并重新核验 HTTP 签名有效窗。注入时间限于开发配置，production app 与 service 拒绝注入。
+
+R1 专项集成结果：
+
+- license 行锁等待跨过 A 的退休秒后返回 503 `ACTIVE_SIGNING_KEY_OUTSIDE_LIFECYCLE`；operation/attempt/audit 不存在，generation 仍为 0，activation code 未消费，challenge nonce 未消费。`pg_locks` 证实业务后端等待期间持有 signer `ShareLock`。
+- A 退休前签发的 lease 在当前 resolver 下仍有效；A 退休后管理员切换到已预发布 B，B 新 activation challenge/lease 由 B `kid` 签发并验证通过。
+- RFC 9421 签名窗口跨过后返回 401 `HTTP_SIGNATURE_INVALID`，没有 nonce 或 operation 写入；未超窗的短 signer 锁等待返回 HTTP 201，JWT `iat/exp` 与 nonce `created_at/expires_at` 一致。
+- 单元测试验证 `iat=retire_after-1` 可验证，`iat=retire_after` 被拒绝。
+- 修复前两条真实锁等待记录保留在专项设计文档；临时复现测试文件已替换为稳定回归测试。
+
+### R1 命令结果
+
+使用 Node 24.22.0 与本地临时 PostgreSQL 18 容器（`127.0.0.1:55674`，独立于商城容器）运行：
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm ci` | 完成，依赖安装成功；npm 报告 0 vulnerabilities |
+| `npm run typecheck` | 通过 |
+| `npm run build` | 通过 |
+| `npm test` | 48/48 通过，6 个测试文件 |
+| `npm run test:integration` | 89/89 通过，7 个测试文件；真实 PostgreSQL 18/HTTPS |
+| `npm audit --audit-level=low` | 0 vulnerabilities |
+| `git diff --check` | 通过 |
+
+R1 Dockerfile 镜像构建通过。导出 rootfs 并扫描 6,147 个普通文件：没有完整 PEM 私钥块，`/app` 下没有 `.pem`、`.key` 或 `.jwk` 私钥材料；不存在 admin CLI、keygen 或离线签名目录。临时镜像、扫描容器和 rootfs 目录已删除。Docker build 的共享缓存未做全局 prune，以免清除其他项目缓存。
+
+最终提交 SHA、`origin/main` 一致性及 GitHub Actions 对应精确 SHA 的状态将在推送后补录。

@@ -11,6 +11,11 @@ export interface SigningContext {
   readonly bundleVersion: string;
   readonly artifactSha256: string;
   readonly resolver: TrustedSigningKeyResolver;
+  /** Database-backed lifecycle guard attached only to a signer held under the authority transaction lock. */
+  readonly assertIssuanceAllowed: (
+    claims: Readonly<Record<string, unknown>>,
+    options?: { allowExpiredTestToken?: boolean },
+  ) => Promise<void>;
 }
 
 export interface VerificationContext {
