@@ -16,7 +16,9 @@ import type {
 } from '../db/types.js';
 import { LicenseApiError } from '../errors.js';
 import { sha256Base64url, validateIdentityJwk } from '../crypto/identity.js';
-import { assertCenterTimeSourceHealthy, databaseNow, challengeClaimsMatchRow, sha256, type AuthenticatedRequest } from './common.js';
+import { assertCenterTimeSourceHealthy, assertChallengeCurrent, databaseNow, challengeClaimsMatchRow, sha256, type AuthenticatedRequest } from './common.js';
+import { lockSigningAuthorityForSigning } from '../crypto/signing-authority.js';
+import type { SigningContext } from '../crypto/signing-types.js';
 import {
   signDisasterTransferResult, signDisasterTransferTicket, signLicenseLease, signOperationReceipt, signStatusReceipt,
   signTransferReceipt, signTransferTicket, verifyDisasterTransferTicket, verifyTransferTicket,
@@ -321,7 +323,7 @@ async function insertOperation(
 
 async function terminalOperationReceipt(
   trx: TransactionDatabase,
-  config: RuntimeConfig,
+  signer: SigningContext,
   auth: AuthenticatedRequest,
   input: {
     kind: MutationKind;
@@ -338,7 +340,7 @@ async function terminalOperationReceipt(
 ): Promise<string> {
   let token: string;
   if (input.responseType === 'status' && input.status) {
-    token = await signStatusReceipt(config, {
+    token = await signStatusReceipt(signer, {
       licenseId: input.licenseId,
       instanceId: auth.challenge.instanceId,
       identityJkt: auth.signature.identityJkt,
@@ -352,7 +354,7 @@ async function terminalOperationReceipt(
       now,
     });
   } else {
-    token = await signOperationReceipt(config, {
+    token = await signOperationReceipt(signer, {
       licenseId: input.licenseId,
       identityJkt: auth.signature.identityJkt,
       operationId: auth.challenge.operationId,
@@ -472,7 +474,7 @@ function assertSameOperation(
 
 async function insertSuccessfulActivation(
   trx: TransactionDatabase,
-  config: RuntimeConfig,
+  signer: SigningContext,
   auth: AuthenticatedRequest,
   license: LicenseRow,
   input: ActivationInput,
@@ -481,7 +483,7 @@ async function insertSuccessfulActivation(
 ): Promise<string> {
   const generation = (big(license.current_generation) + 1n).toString();
   const revision = license.entitlement_revision.toString();
-  const lease = await signLicenseLease(config, {
+  const lease = await signLicenseLease(signer, {
     licenseId: input.license_id,
     instanceId: input.instance_id,
     databaseId: input.database_id,
@@ -555,6 +557,9 @@ export async function processActivation(
 ): Promise<MutationResult> {
   bindAttemptNumber(auth, input.attempt_no);
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -575,14 +580,14 @@ export async function processActivation(
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
     if (license.status !== 'active') {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'LICENSE_REVOKED', responseType: 'operation',
       }, now);
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'LICENSE_REVOKED' };
     }
     if (license.confirmed_subscription_end.getTime() <= now.getTime()) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'SUBSCRIPTION_EXPIRED', responseType: 'operation',
       }, now);
@@ -591,27 +596,27 @@ export async function processActivation(
     const activeInstance = await trx.selectFrom('license_activations').select('license_id')
       .where('instance_id', '=', input.instance_id).where('state', '=', 'active').executeTakeFirst();
     if (activeInstance && activeInstance.license_id !== input.license_id) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'ACTIVATION_INSTANCE_ALREADY_ACTIVE', responseType: 'operation',
       }, now);
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_INSTANCE_ALREADY_ACTIVE' };
     }
     if (activeActivation || big(license.current_generation) !== 0n) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'ACTIVATION_CONFLICT', responseType: 'operation',
       }, now);
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_CONFLICT' };
     }
-    const token = await insertSuccessfulActivation(trx, config, auth, license, input, code, now);
+    const token = await insertSuccessfulActivation(trx, signer, auth, license, input, code, now);
     return { kind: 'response', responseType: 'license', token, state: 'committed', outcomeCode: 'ACTIVATED' };
   });
 }
 
 async function signedStatus(
   trx: TransactionDatabase,
-  config: RuntimeConfig,
+  signer: SigningContext,
   auth: AuthenticatedRequest,
   input: RenewalInput,
   license: LicenseRow,
@@ -620,7 +625,7 @@ async function signedStatus(
   outcomeCode: string,
   now: Date,
 ): Promise<MutationResult> {
-  const token = await terminalOperationReceipt(trx, config, auth, {
+  const token = await terminalOperationReceipt(trx, signer, auth, {
     kind: input.recovery_of_operation_id ? 'recovery' : 'renewal',
     licenseId: input.license_id,
     databaseId: input.database_id,
@@ -653,6 +658,9 @@ export async function processRenewal(
   const kind = input.recovery_of_operation_id ? 'recovery' : 'renewal';
   bindAttemptNumber(auth, input.attempt_no);
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -677,26 +685,26 @@ export async function processRenewal(
       if (activation.state === 'active' && activation.generation !== input.expected_generation) {
         throw new LicenseApiError(409, 'GENERATION_BINDING_MISMATCH');
       }
-      return signedStatus(trx, config, auth, input, license, activation, 'superseded', 'ACTIVATION_SUPERSEDED', now);
+      return signedStatus(trx, signer, auth, input, license, activation, 'superseded', 'ACTIVATION_SUPERSEDED', now);
     }
-    if (license.status === 'revoked') return signedStatus(trx, config, auth, input, license, activation, 'revoked', 'LICENSE_REVOKED', now);
+    if (license.status === 'revoked') return signedStatus(trx, signer, auth, input, license, activation, 'revoked', 'LICENSE_REVOKED', now);
     if (big(input.known_revision) > big(license.entitlement_revision)) throw new LicenseApiError(409, 'REVISION_AHEAD');
     if (license.confirmed_subscription_end.getTime() <= now.getTime()) {
-      return signedStatus(trx, config, auth, input, license, activation, 'expired', 'SUBSCRIPTION_EXPIRED', now);
+      return signedStatus(trx, signer, auth, input, license, activation, 'expired', 'SUBSCRIPTION_EXPIRED', now);
     }
     if (input.recovery_of_operation_id) {
       const sourceValid = sourceOperation?.state === 'committed' && sourceOperation.kind === 'activation' &&
         sourceOperation.license_id === input.license_id && sourceOperation.database_id === input.database_id &&
         sourceOperation.actor_jkt === auth.signature.identityJkt && sourceOperation.result_generation === activation.generation;
       if (!sourceValid) {
-        const token = await terminalOperationReceipt(trx, config, auth, {
+        const token = await terminalOperationReceipt(trx, signer, auth, {
           kind: operationKind, licenseId: input.license_id, databaseId: input.database_id,
           state: 'rejected', outcomeCode: 'RECOVERY_SOURCE_INVALID', responseType: 'operation',
         }, now);
         return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'RECOVERY_SOURCE_INVALID' };
       }
     }
-    const lease = await signLicenseLease(config, {
+    const lease = await signLicenseLease(signer, {
       licenseId: input.license_id,
       instanceId: input.instance_id,
       databaseId: input.database_id,
@@ -749,6 +757,9 @@ export async function processTimeReset(
     input.instance_id !== auth.challenge.instanceId) throw new LicenseApiError(401, 'TIME_RESET_IDENTITY_PROOF_INVALID');
 
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -830,7 +841,7 @@ export async function processTimeReset(
     if (!epochUpdate) throw new LicenseApiError(409, 'TIME_RESET_WATERMARK_CONFLICT');
 
     const eventId = randomUUID();
-    const token = await signTimeResetReceipt(config, {
+    const token = await signTimeResetReceipt(signer, {
       license_id: license.id,
       database_id: activation.database_id,
       instance_id: activation.instance_id,
@@ -901,6 +912,9 @@ export async function queryOperation(
 ): Promise<string | { retryable: string }> {
   bindAttemptNumber(auth, input.attempt_no);
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const activation = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
@@ -986,7 +1000,7 @@ export async function queryOperation(
     const associated = activation !== undefined || normalAssociated || disasterTarget?.rows[0]?.associated === true;
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     const result = async (state: OperationState, outcomeCode: string | null, resultJws: string | null,
-      attempt: { attemptNo: number; nonceHash: string; requestDigest: string } | undefined) => signOperationReceipt(config, {
+      attempt: { attemptNo: number; nonceHash: string; requestDigest: string } | undefined) => signOperationReceipt(signer, {
       licenseId: input.license_id,
       identityJkt: auth.signature.identityJkt,
       operationId: input.operation_id,
@@ -1055,27 +1069,33 @@ export async function continueOperation(
     ? await processActivation(db, config, auth, input as ActivationInput)
     : await processRenewal(db, config, auth, input as RenewalInput);
   if (direct.kind === 'retryable') throw new LicenseApiError(409, direct.code);
-  const source = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', input.operation_id).executeTakeFirst();
-  if (!source) throw new LicenseApiError(503, 'OPERATION_STATE_UNKNOWN');
-  const attempt = await db.selectFrom('license_operation_attempts').selectAll()
-    .where('operation_id', '=', source.operation_id).where('outcome', 'in', ['accepted', 'terminal_reject'])
-    .orderBy('attempt_no', 'asc').executeTakeFirst();
-  const now = await databaseNow(db);
-  return signOperationReceipt(config, {
-    licenseId: source.license_id,
-    identityJkt: auth.signature.identityJkt,
-    operationId: source.operation_id,
-    intentDigest: source.intent_digest,
-    state: source.state,
-    outcomeCode: source.outcome_code,
-    attemptNo: input.attempt_no,
-    requestNonceHash: auth.challenge.nonceHash,
-    requestDigest: auth.requestDigest,
-    committedAttemptNo: attempt?.attempt_no ?? null,
-    committedRequestNonceHash: attempt?.server_nonce_hash ?? null,
-    committedRequestDigest: attempt?.body_digest ?? null,
-    resultJws: source.response_jws,
-    now,
+  return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
+    await acquireOperationLock(trx, input.operation_id);
+    const source = await trx.selectFrom('license_operations').selectAll().where('operation_id', '=', input.operation_id).executeTakeFirst();
+    if (!source) throw new LicenseApiError(503, 'OPERATION_STATE_UNKNOWN');
+    const attempt = await trx.selectFrom('license_operation_attempts').selectAll()
+      .where('operation_id', '=', source.operation_id).where('outcome', 'in', ['accepted', 'terminal_reject'])
+      .orderBy('attempt_no', 'asc').executeTakeFirst();
+    const now = await databaseNow(trx);
+    return signOperationReceipt(signer, {
+      licenseId: source.license_id,
+      identityJkt: auth.signature.identityJkt,
+      operationId: source.operation_id,
+      intentDigest: source.intent_digest,
+      state: source.state,
+      outcomeCode: source.outcome_code,
+      attemptNo: input.attempt_no,
+      requestNonceHash: auth.challenge.nonceHash,
+      requestDigest: auth.requestDigest,
+      committedAttemptNo: attempt?.attempt_no ?? null,
+      committedRequestNonceHash: attempt?.server_nonce_hash ?? null,
+      committedRequestDigest: attempt?.body_digest ?? null,
+      resultJws: source.response_jws,
+      now,
+    });
   });
 }
 
@@ -1135,6 +1155,9 @@ export async function processTransferPrepare(
   }
   if (input.operation_id === input.approval_id) throw new LicenseApiError(409, 'TRANSFER_OPERATION_ID_REUSE');
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -1179,7 +1202,7 @@ export async function processTransferPrepare(
       ) AS present
     `.execute(trx);
     if (disasterApprovalConflict.rows[0]?.present) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'DISASTER_TRANSFER_REQUIRES_EXPLICIT_REVOCATION', responseType: 'operation',
       }, now);
@@ -1195,7 +1218,7 @@ export async function processTransferPrepare(
     }));
     const unrevokedApprovals = activeApprovals.filter((id): id is string => id !== null);
     if (unrevokedApprovals.length !== 1 || unrevokedApprovals[0] !== input.approval_id) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'TRANSFER_APPROVAL_AMBIGUOUS', responseType: 'operation',
       }, now);
@@ -1218,7 +1241,7 @@ export async function processTransferPrepare(
           currentPlan.source_generation.toString() === license.current_generation.toString() &&
           license.status === 'active' && license.confirmed_subscription_end.getTime() > now.getTime();
         if (stillCurrent) {
-          const token = await terminalOperationReceipt(trx, config, auth, {
+          const token = await terminalOperationReceipt(trx, signer, auth, {
             kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
             outcomeCode: 'TRANSFER_PLAN_ALREADY_PREPARED', responseType: 'operation',
           }, now);
@@ -1230,7 +1253,7 @@ export async function processTransferPrepare(
 
     const planId = randomUUID();
     const expiresAt = new Date((Math.floor(now.getTime() / 1000) + 10 * 60) * 1000);
-    const ticket = await signTransferTicket(config, {
+    const ticket = await signTransferTicket(signer, {
       plan_id: planId,
       approval_operation_id: approval.approval_id,
       prepare_operation_id: input.operation_id,
@@ -1293,25 +1316,33 @@ export async function processTransferCommit(
   controlledNow?: () => Promise<Date>,
 ): Promise<MutationResult> {
   bindAttemptNumber(auth, input.attempt_no);
-  let ticket: Awaited<ReturnType<typeof verifyTransferTicket>>;
-  try {
-    ticket = await verifyTransferTicket(input.transfer_ticket, config, auth.receivedAt);
-  } catch {
-    throw new LicenseApiError(401, 'TRANSFER_TICKET_INVALID');
-  }
-  const claims = ticket.claims;
   const targetIdentity = await validateIdentityJwk(input.public_jwk);
-  if (input.operation_id === input.approval_id || input.operation_id === input.prepare_operation_id) {
+  if (input.operation_id === input.approval_id) {
     throw new LicenseApiError(409, 'TRANSFER_OPERATION_ID_REUSE');
   }
-  if (input.identity_jkt !== auth.signature.identityJkt || targetIdentity.jkt !== auth.signature.identityJkt ||
-    ticketString(claims, 'license_id') !== input.license_id || ticketString(claims, 'database_id') !== input.database_id ||
-    ticketString(claims, 'target_instance_id') !== input.instance_id || ticketString(claims, 'target_identity_jkt') !== auth.signature.identityJkt ||
-    ticketString(claims, 'approval_operation_id') !== input.approval_id ||
-    ticketString(claims, 'prepare_operation_id') !== input.prepare_operation_id) {
+  if (input.identity_jkt !== auth.signature.identityJkt || targetIdentity.jkt !== auth.signature.identityJkt) {
     throw new LicenseApiError(401, 'TRANSFER_TICKET_BINDING_INVALID');
   }
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
+    let ticket: Awaited<ReturnType<typeof verifyTransferTicket>>;
+    try {
+      ticket = await verifyTransferTicket(input.transfer_ticket, {
+        issuer: signer.issuer, resolver: signer.resolver, trustedTime: Math.floor(signingAuthority.now.getTime() / 1000),
+      }, signingAuthority.now);
+    } catch {
+      throw new LicenseApiError(401, 'TRANSFER_TICKET_INVALID');
+    }
+    const claims = ticket.claims;
+    if (input.operation_id === input.prepare_operation_id ||
+      ticketString(claims, 'license_id') !== input.license_id || ticketString(claims, 'database_id') !== input.database_id ||
+      ticketString(claims, 'target_instance_id') !== input.instance_id || ticketString(claims, 'target_identity_jkt') !== auth.signature.identityJkt ||
+      ticketString(claims, 'approval_operation_id') !== input.approval_id ||
+      ticketString(claims, 'prepare_operation_id') !== input.prepare_operation_id) {
+      throw new LicenseApiError(401, 'TRANSFER_TICKET_BINDING_INVALID');
+    }
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -1328,7 +1359,7 @@ export async function processTransferCommit(
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
 
     const reject = async (code: string): Promise<MutationResult> => {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'transfer_commit', licenseId: input.license_id, databaseId: input.database_id,
         state: 'rejected', outcomeCode: code, responseType: 'operation',
       }, now);
@@ -1404,7 +1435,7 @@ export async function processTransferCommit(
       .where('id', '=', source.id).where('state', '=', 'active').where('generation', '=', plan.source_generation)
       .returning('id').executeTakeFirst();
     if (!retired) throw new LicenseApiError(409, 'TRANSFER_SOURCE_SUPERSEDED');
-    const lease = await signLicenseLease(config, {
+    const lease = await signLicenseLease(signer, {
       licenseId: input.license_id,
       instanceId: input.instance_id,
       databaseId: input.database_id,
@@ -1417,7 +1448,7 @@ export async function processTransferCommit(
       requestDigest: auth.requestDigest,
       now,
     });
-    const transferReceipt = await signTransferReceipt(config, {
+    const transferReceipt = await signTransferReceipt(signer, {
       licenseId: input.license_id,
       databaseId: input.database_id,
       sourceInstanceId: plan.source_instance_id,
@@ -1573,6 +1604,9 @@ export async function processDisasterTransferPrepare(
     throw new LicenseApiError(409, 'DISASTER_TARGET_BINDING_INVALID');
   }
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -1601,7 +1635,7 @@ export async function processDisasterTransferPrepare(
       recoveryRequest.account_reference === approval.account_reference && recoveryRequest.target_identity_jkt === approval.target_identity_jkt &&
       disasterApprovalMatches(approval, input, license, source, now);
     const reject = async (code: string): Promise<MutationResult> => {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'disaster_transfer_prepare', licenseId: input.license_id, databaseId: input.database_id,
         state: 'rejected', outcomeCode: code, responseType: 'operation',
       }, now);
@@ -1647,7 +1681,7 @@ export async function processDisasterTransferPrepare(
 
     const planId = randomUUID();
     const expiresAt = new Date((Math.floor(now.getTime() / 1000) + 10 * 60) * 1000);
-    const ticket = await signDisasterTransferTicket(config, {
+    const ticket = await signDisasterTransferTicket(signer, {
       plan_id: planId,
       request_id: approval.request_id,
       approval_id: approval.approval_id,
@@ -1706,22 +1740,31 @@ export async function processDisasterTransferCommit(
   controlledNow?: () => Promise<Date>,
 ): Promise<MutationResult> {
   bindAttemptNumber(auth, input.attempt_no);
-  let verifiedTicket: Awaited<ReturnType<typeof verifyDisasterTransferTicket>>;
-  try { verifiedTicket = await verifyDisasterTransferTicket(input.disaster_ticket, config, auth.receivedAt); }
-  catch { throw new LicenseApiError(401, 'DISASTER_TICKET_INVALID'); }
-  const claims = verifiedTicket.claims;
   const target = await validateIdentityJwk(input.public_jwk);
   if (input.identity_jkt !== auth.signature.identityJkt || target.jkt !== auth.signature.identityJkt ||
-    input.operation_id === input.approval_id || input.operation_id === input.prepare_operation_id ||
-    disasterTicketString(claims, 'license_id') !== input.license_id ||
-    disasterTicketString(claims, 'database_id') !== input.database_id ||
-    disasterTicketString(claims, 'target_instance_id') !== input.instance_id ||
-    disasterTicketString(claims, 'target_identity_jkt') !== target.jkt ||
-    disasterTicketString(claims, 'approval_id') !== input.approval_id ||
-    disasterTicketString(claims, 'prepare_operation_id') !== input.prepare_operation_id) {
+    input.operation_id === input.approval_id) {
     throw new LicenseApiError(401, 'DISASTER_TICKET_BINDING_INVALID');
   }
   return db.transaction().execute(async (trx) => {
+    const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
+    const signer = signingAuthority.signer;
+    await assertChallengeCurrent(signer, auth, signingAuthority.now);
+    let verifiedTicket: Awaited<ReturnType<typeof verifyDisasterTransferTicket>>;
+    try {
+      verifiedTicket = await verifyDisasterTransferTicket(input.disaster_ticket, {
+        issuer: signer.issuer, resolver: signer.resolver, trustedTime: Math.floor(signingAuthority.now.getTime() / 1000),
+      }, signingAuthority.now);
+    } catch { throw new LicenseApiError(401, 'DISASTER_TICKET_INVALID'); }
+    const claims = verifiedTicket.claims;
+    if (input.operation_id === input.prepare_operation_id ||
+      disasterTicketString(claims, 'license_id') !== input.license_id ||
+      disasterTicketString(claims, 'database_id') !== input.database_id ||
+      disasterTicketString(claims, 'target_instance_id') !== input.instance_id ||
+      disasterTicketString(claims, 'target_identity_jkt') !== target.jkt ||
+      disasterTicketString(claims, 'approval_id') !== input.approval_id ||
+      disasterTicketString(claims, 'prepare_operation_id') !== input.prepare_operation_id) {
+      throw new LicenseApiError(401, 'DISASTER_TICKET_BINDING_INVALID');
+    }
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
     const existing = await findOperation(trx, input.operation_id);
@@ -1737,7 +1780,7 @@ export async function processDisasterTransferCommit(
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
 
     const reject = async (code: string): Promise<MutationResult> => {
-      const token = await terminalOperationReceipt(trx, config, auth, {
+      const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'disaster_transfer_commit', licenseId: input.license_id, databaseId: input.database_id,
         state: 'rejected', outcomeCode: code, responseType: 'operation',
       }, now);
@@ -1841,7 +1884,7 @@ export async function processDisasterTransferCommit(
     const canOperate = license.status === 'active' && license.confirmed_subscription_end.getTime() > now.getTime() && endsAtSeconds > nowSeconds;
     let lease: string | undefined;
     if (canOperate) {
-      const signedLease = await signLicenseLease(config, {
+      const signedLease = await signLicenseLease(signer, {
         licenseId: license.id, instanceId: plan.target_instance_id, databaseId: plan.database_id,
         identityJkt: target.jkt, generation: nextGeneration, entitlementRevision: license.entitlement_revision.toString(),
         plan: license.plan, subscriptionEnd: license.confirmed_subscription_end,
@@ -1850,7 +1893,7 @@ export async function processDisasterTransferCommit(
       lease = signedLease.token;
     }
     const resultMode = canOperate ? 'active_lease' as const : 'binding_only' as const;
-    const disasterResult = await signDisasterTransferResult(config, {
+    const disasterResult = await signDisasterTransferResult(signer, {
       mode: resultMode,
       licenseId: license.id,
       databaseId: plan.database_id,

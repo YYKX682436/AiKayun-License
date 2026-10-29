@@ -242,6 +242,29 @@ function assertLifecycleTransition(
   }
 }
 
+export function validateTrustBundleTransition(input: {
+  previous: RootAuthenticatedTrustBundleCandidate | null;
+  next: RootAuthenticatedTrustBundleCandidate;
+  previousRevokedKids: readonly string[];
+  previousRetiredKids: readonly string[];
+  acceptedAt: number;
+}): { revokedKids: string[]; retiredKids: string[] } {
+  const now = positiveTrustedTime(input.acceptedAt);
+  const revokedKids = revokedKidsFor(input.next, input.previousRevokedKids);
+  assertNoRevocationResurrection(input.next, revokedKids);
+  if (input.previous) assertLifecycleTransition(input.previous, input.next, input.previousRevokedKids, now);
+  const retiredKids = retiredKidsFor(
+    input.previous,
+    input.next,
+    input.previousRevokedKids,
+    input.previousRetiredKids,
+    now,
+  );
+  assertNoRetirementResurrection(input.next, retiredKids);
+  assertTombstoneCapacity(revokedKids, retiredKids);
+  return { revokedKids, retiredKids };
+}
+
 function sameRecord(left: BundleRecord | null, right: BundleRecord | null): boolean {
   if (left === null || right === null) return left === right;
   return left.bundle_version === right.bundle_version && left.artifact_sha256 === right.artifact_sha256 &&
@@ -302,6 +325,13 @@ function resolverFor(
   });
 }
 
+export function createTrustedSigningKeyResolver(
+  candidate: RootAuthenticatedTrustBundleCandidate,
+  input: { revokedKids?: readonly string[]; trustedTime: number },
+): TrustedSigningKeyResolver {
+  return resolverFor(candidate, input.revokedKids ?? [], input.trustedTime, async () => undefined);
+}
+
 export class TrustBundleStore {
   readonly directory: string;
   readonly trustedRoot: TrustedOfflineRootPin;
@@ -360,17 +390,13 @@ export class TrustBundleStore {
         }
       }
 
-      const revokedKids = revokedKidsFor(candidate, previousRecord?.revoked_kids ?? []);
-      assertNoRevocationResurrection(candidate, revokedKids);
-      if (previous) assertLifecycleTransition(previous.candidate, candidate, previousRecord!.revoked_kids, now);
-      const retiredKids = retiredKidsFor(
-        previous?.candidate ?? null,
-        candidate,
-        previousRecord?.revoked_kids ?? [],
-        previousRecord?.retired_kids ?? [],
-        now,
-      );
-      assertNoRetirementResurrection(candidate, retiredKids);
+      const { revokedKids, retiredKids } = validateTrustBundleTransition({
+        previous: previous?.candidate ?? null,
+        next: candidate,
+        previousRevokedKids: previousRecord?.revoked_kids ?? [],
+        previousRetiredKids: previousRecord?.retired_kids ?? [],
+        acceptedAt: now,
+      });
       const next = recordFromCandidate(candidate, revokedKids, retiredKids);
       const pending: PendingRecord = {
         accepted_at: now,

@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
-import { CompactSign, calculateJwkThumbprint, compactVerify, importJWK } from 'jose';
+import { calculateJwkThumbprint, compactVerify, importJWK } from 'jose';
 import type { CryptoKey, JWK } from 'jose';
-import canonicalize from 'canonicalize';
 import { parseStrictJsonSegment } from '../strict-json.js';
 
 export const TRUST_BUNDLE_TYP = 'aikayun-license-trust-bundle+jwt';
@@ -139,10 +138,6 @@ function sha256Base64url(value: Uint8Array | string): string {
   return createHash('sha256').update(value).digest('base64url');
 }
 
-function sha256Hex(value: Uint8Array | string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
 async function validateRootPin(pin: TrustedOfflineRootPin): Promise<{ kid: string; publicKey: CryptoKey }> {
   assertExactFields(pin as unknown as Record<string, unknown>, ['kid', 'publicJwk'], 'offline root pin');
   assertExactFields(pin.publicJwk as unknown as Record<string, unknown>, ['kty', 'crv', 'x'], 'offline root JWK');
@@ -238,81 +233,13 @@ async function validateClaims(value: unknown, expectedCenterIssuer: string, root
   };
 }
 
-export async function buildTrustBundleClaims(
+/** Shared strict claim validator; private-key operations live only under tools/offline-trust. */
+export async function validateTrustBundleClaimsForSigning(
+  claims: unknown,
   expectedCenterIssuer: string,
-  input: TrustBundleSigningInput,
-  rootPublicJwk?: Ed25519PublicJwk,
+  rootKid?: string,
 ): Promise<TrustBundleClaims> {
-  const payload = {
-    iss: OFFLINE_ROOT_ISSUER,
-    aud: TRUST_BUNDLE_AUDIENCE,
-    sub: canonicalCenterIssuer(expectedCenterIssuer),
-    bundle_schema: TRUST_BUNDLE_SCHEMA,
-    bundle_version: input.bundle_version,
-    iat: input.iat,
-    nbf: input.nbf,
-    exp: input.exp,
-    propagation_budget_seconds: input.propagation_budget_seconds,
-    keys: input.keys,
-  };
-  const rootKid = rootPublicJwk ? await calculateJwkThumbprint(rootPublicJwk as JWK, 'sha256') : undefined;
-  return (await validateClaims(payload, expectedCenterIssuer, rootKid)).claims;
-}
-
-function canonicalPayloadBytes(claims: TrustBundleClaims): Buffer {
-  const canonical = canonicalize(claims);
-  if (typeof canonical !== 'string') throw new Error('Unable to serialize trust bundle payload');
-  return Buffer.from(canonical, 'utf8');
-}
-
-export async function previewTrustBundleSigning(
-  claims: TrustBundleClaims,
-  rootPublicJwk: Ed25519PublicJwk,
-): Promise<TrustBundleSigningPreview> {
-  assertExactFields(rootPublicJwk as unknown as Record<string, unknown>, ['kty', 'crv', 'x'], 'offline root JWK');
-  if (rootPublicJwk.kty !== 'OKP' || rootPublicJwk.crv !== 'Ed25519' || !isCanonicalBase64Url32(rootPublicJwk.x)) {
-    throw new Error('Invalid offline root public JWK');
-  }
-  const kid = await calculateJwkThumbprint(rootPublicJwk as JWK, 'sha256');
-  const validated = await validateClaims(claims, claims.sub, kid);
-  if (validated.claims.sub !== claims.sub || validated.claims.iss !== OFFLINE_ROOT_ISSUER) throw new Error('Invalid signing claims');
-  const header = { alg: 'Ed25519', kid, typ: TRUST_BUNDLE_TYP };
-  const protectedSegment = Buffer.from(JSON.stringify(header), 'utf8').toString('base64url');
-  const payloadBytes = canonicalPayloadBytes(validated.claims);
-  const payloadSegment = payloadBytes.toString('base64url');
-  if (Buffer.byteLength(`${protectedSegment}.${payloadSegment}.${'A'.repeat(86)}`, 'utf8') > MAX_TRUST_BUNDLE_BYTES) {
-    throw new Error('Trust bundle signing input exceeds the JWS size limit');
-  }
-  return {
-    rootKid: kid,
-    bundleVersion: validated.claims.bundle_version,
-    centerIssuer: validated.claims.sub,
-    issuedAt: validated.claims.iat,
-    notBefore: validated.claims.nbf,
-    expiresAt: validated.claims.exp,
-    propagationBudgetSeconds: validated.claims.propagation_budget_seconds,
-    keys: validated.claims.keys.map((entry) => ({ ...entry })),
-    payloadSha256: sha256Hex(payloadBytes),
-    signingInputSha256: sha256Hex(`${protectedSegment}.${payloadSegment}`),
-  };
-}
-
-export async function signTrustBundle(
-  claims: TrustBundleClaims,
-  rootPrivateKey: CryptoKey,
-  rootPublicJwk: Ed25519PublicJwk,
-): Promise<{ token: string; preview: TrustBundleSigningPreview }> {
-  const preview = await previewTrustBundleSigning(claims, rootPublicJwk);
-  const safeClaims = (await validateClaims(claims, claims.sub, preview.rootKid)).claims;
-  const payload = canonicalPayloadBytes(safeClaims);
-  const token = await new CompactSign(payload)
-    .setProtectedHeader({ alg: 'Ed25519', kid: preview.rootKid, typ: TRUST_BUNDLE_TYP })
-    .sign(rootPrivateKey);
-  if (Buffer.byteLength(token, 'utf8') > MAX_TRUST_BUNDLE_BYTES || token.split('.').length !== 3) throw new Error('Signed trust bundle exceeds size limit');
-  await compactVerify(token, await importJWK(rootPublicJwk as JWK, 'Ed25519') as CryptoKey, { algorithms: ['Ed25519'] });
-  const inputDigest = sha256Hex(token.split('.').slice(0, 2).join('.'));
-  if (inputDigest !== preview.signingInputSha256) throw new Error('JOSE protected header serialization did not match the reviewed signing digest');
-  return { token, preview };
+  return (await validateClaims(claims, expectedCenterIssuer, rootKid)).claims;
 }
 
 function validateCompactJws(token: unknown): { segments: [string, string, string]; header: Record<string, unknown>; payload: Record<string, unknown> } {

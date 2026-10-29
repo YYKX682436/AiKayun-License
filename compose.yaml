@@ -31,7 +31,9 @@ services:
       LICENSE_DATABASE_URL: postgres://license:license-dev-only@postgres:5432/license_center
       LICENSE_ISSUER: ${LICENSE_ISSUER:-https://license.example.test}
       LICENSE_PUBLIC_ORIGIN: ${LICENSE_PUBLIC_ORIGIN:-https://license.example.test}
-      LICENSE_SIGNING_KEY_FILE: /run/secrets/license-signing-key.pem
+      LICENSE_SIGNING_KEYRING_FILE: /run/secrets/online-signing-keyring.json
+      LICENSE_OFFLINE_ROOT_JWK_FILE: /run/secrets/offline-root-public.json
+      LICENSE_TRUST_BUNDLE_MIN_VERSION: ${LICENSE_TRUST_BUNDLE_MIN_VERSION:-1}
       LICENSE_TLS_KEY_FILE: /run/secrets/license-tls-key.pem
       LICENSE_TLS_CERT_FILE: /run/secrets/license-tls-cert.pem
       LICENSE_HTTP_PORT: "4318"
@@ -39,7 +41,10 @@ services:
       LICENSE_ISOLATED_CONTAINER: compose
     user: "${LICENSE_CONTAINER_UID:-1000}:${LICENSE_CONTAINER_GID:-1000}"
     volumes:
-      - ./secrets/license-signing-key.pem:/run/secrets/license-signing-key.pem:ro
+      - ./secrets/online-signing-keyring.json:/run/secrets/online-signing-keyring.json:ro
+      - ./secrets/offline-root-public.json:/run/secrets/offline-root-public.json:ro
+      - ./secrets/license-signing-key-a.pem:/run/secrets/license-signing-key-a.pem:ro
+      - ./secrets/license-signing-key-b.pem:/run/secrets/license-signing-key-b.pem:ro
       - ./secrets/license-tls-key.pem:/run/secrets/license-tls-key.pem:ro
       - ./secrets/license-tls-cert.pem:/run/secrets/license-tls-cert.pem:ro
     ports:

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { rotateSignerRequestDigest } from '../../src/admin/signing-service.js';
 import { runAdminCli } from '../../src/admin/cli.js';
 import { openAdminSession } from '../../src/admin/policy.js';
 import {
@@ -98,6 +99,32 @@ describe('local admin CLI boundary', () => {
     expect(stderr.text()).toBe('');
     expect(JSON.parse(stdout.text())['request_digest']).toBe(digest);
     expect(JSON.parse(stdout.text())['review_required']).toBe(true);
+  });
+
+  it('prints a controlled signer rotation review without enabling the production CLI', async () => {
+    const request = {
+      operationId: '00000000-0000-4000-8000-000000000008',
+      expectedSignerRevision: '2',
+      targetKid: 'A'.repeat(43),
+      bundleVersion: '3',
+      artifactSha256: 'B'.repeat(43),
+      reason: 'isolated controlled signer rotation',
+    };
+    const expectedDigest = rotateSignerRequestDigest(request);
+    process.env['NODE_ENV'] = 'production';
+    const stdout = fakeStream();
+    const stderr = fakeStream();
+    const status = await runAdminCli([
+      'signer', 'rotate', '--operation-id', request.operationId,
+      '--expected-revision', request.expectedSignerRevision, '--target-kid', request.targetKid,
+      '--bundle-version', request.bundleVersion, '--artifact-sha256', request.artifactSha256,
+      '--reason', request.reason,
+    ], stdout.stream, stderr.stream);
+    expect(status).toBe(0);
+    expect(stderr.text()).toBe('');
+    expect(JSON.parse(stdout.text())).toMatchObject({
+      review_required: true, action: 'signer_key_rotate', request_digest: expectedDigest,
+    });
   });
 
   it('binds transfer approval review to the source, target, binding revision, and license revision', async () => {

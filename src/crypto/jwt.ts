@@ -1,7 +1,7 @@
-import { SignJWT, jwtVerify } from 'jose';
+import { SignJWT, compactVerify } from 'jose';
 import type { CryptoKey } from 'jose';
-import type { RuntimeConfig } from '../config.js';
 import { parseStrictJsonSegment } from '../strict-json.js';
+import type { SigningContext, VerificationContext } from './signing-types.js';
 
 const MAX_TOKEN_BYTES = 16 * 1024;
 const LICENSE_HEADER = ['alg', 'kid', 'typ'];
@@ -24,31 +24,51 @@ export interface TrustedSigningKeyResolver {
 }
 
 export async function signTypedJwt(
-  config: RuntimeConfig,
+  signer: SigningContext,
   typ: string,
   claims: Record<string, unknown>,
 ): Promise<string> {
   return new SignJWT(claims)
-    .setProtectedHeader({ alg: 'Ed25519', kid: config.signingKeyId, typ })
-    .sign(config.signingPrivateKey);
+    .setProtectedHeader({ alg: 'Ed25519', kid: signer.kid, typ })
+    .sign(signer.privateKey);
 }
 
+type TypedJwtVerificationInput = VerificationContext & {
+    typ: string;
+    requiredClaims: readonly string[];
+    audience: string;
+    now: Date;
+    allowExpired?: boolean;
+  };
+
+export async function verifyTypedJwt(token: unknown, input: TypedJwtVerificationInput): Promise<VerifiedJwt>;
 export async function verifyTypedJwt(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   typ: string,
-  requiredClaims: string[],
+  requiredClaims: readonly string[],
   now: Date,
+  allowExpired?: boolean,
+): Promise<VerifiedJwt>;
+export async function verifyTypedJwt(
+  token: unknown,
+  input: TypedJwtVerificationInput | VerificationContext,
+  typ?: string,
+  requiredClaims?: readonly string[],
+  now?: Date,
+  allowExpired?: boolean,
 ): Promise<VerifiedJwt> {
-  return verifyTypedJwtWithKey(token, {
-    publicKey: config.signingPublicKey,
-    keyId: config.signingKeyId,
-    issuer: config.issuer,
-    audience: 'aikayun-commerce',
-    typ,
-    requiredClaims,
-    now,
-  });
+  const normalized: TypedJwtVerificationInput = 'typ' in input
+    ? input
+    : {
+      ...input,
+      typ: typ!,
+      requiredClaims: requiredClaims!,
+      audience: typ === 'aikayun-license-time-reset+jwt' ? 'aikayun-license-time-reset' : 'aikayun-commerce',
+      now: now!,
+      ...(allowExpired ? { allowExpired: true } : {}),
+    };
+  return verifyTypedJwtWithResolver(token, normalized);
 }
 
 async function parseTypedJwt(
@@ -83,18 +103,25 @@ export async function verifyTypedJwtWithKey(
     typ: string;
     requiredClaims: readonly string[];
     now: Date;
+    allowExpired?: boolean;
   },
 ): Promise<VerifiedJwt> {
   const parsed = await parseTypedJwt(token, input.typ, input.requiredClaims, input.keyId);
-  const verified = await jwtVerify(parsed.token, input.publicKey, {
-    algorithms: ['Ed25519'],
-    issuer: input.issuer,
-    audience: input.audience,
-    currentDate: input.now,
-    clockTolerance: 0,
-  });
+  const verified = await compactVerify(parsed.token, input.publicKey, { algorithms: ['Ed25519'] });
   if (verified.protectedHeader['alg'] !== 'Ed25519' || verified.protectedHeader['kid'] !== input.keyId || verified.protectedHeader['typ'] !== input.typ) {
     throw new Error('Unexpected protected JWS header');
+  }
+  const nowSeconds = Math.floor(input.now.getTime() / 1000);
+  const claims = parsed.claims;
+  const issuedAt = claims['iat'];
+  const notBefore = claims['nbf'];
+  const expiresAt = claims['exp'];
+  if (claims['iss'] !== input.issuer || claims['aud'] !== input.audience ||
+    typeof issuedAt !== 'number' || !Number.isSafeInteger(issuedAt) || issuedAt <= 0 || issuedAt > nowSeconds ||
+    typeof notBefore !== 'number' || !Number.isSafeInteger(notBefore) || notBefore > nowSeconds ||
+    typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt <= issuedAt ||
+    (!input.allowExpired && expiresAt <= nowSeconds)) {
+    throw new Error('Signed token issuer, audience, or time claims are invalid');
   }
   return { header: parsed.header, claims: parsed.claims };
 }
@@ -108,6 +135,7 @@ export async function verifyTypedJwtWithResolver(
     typ: string;
     requiredClaims: readonly string[];
     now: Date;
+    allowExpired?: boolean;
   },
 ): Promise<VerifiedJwt> {
   const parsed = await parseTypedJwt(token, input.typ, input.requiredClaims);
@@ -139,6 +167,7 @@ export async function verifyTypedJwtWithResolver(
     typ: input.typ,
     requiredClaims: input.requiredClaims,
     now: input.now,
+    ...(input.allowExpired ? { allowExpired: true } : {}),
   });
   if (selected.verifyUntil !== null && (trustedTime >= selected.verifyUntil || expiresAt > selected.verifyUntil)) {
     throw new Error('Signed token exceeds its trusted key verification window');

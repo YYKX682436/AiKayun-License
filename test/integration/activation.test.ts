@@ -1,7 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { sql, type Kysely } from 'kysely';
 import { decodeJwt, jwtVerify } from 'jose';
@@ -235,6 +232,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     runtime = await createTestSigningRuntime();
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
+    await runtime.initializeAuthority(db);
     server = await startAppServer(createApp({ config: runtime.config, db }));
   });
 
@@ -593,7 +591,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect(continued.status).toBe(200);
 
     const late = await sendActivation(prepared, staleAttempt);
-    expect(late.status).toBe(409);
+    expect(late.status, JSON.stringify(late.json)).toBe(409);
     expect(late.json['error']).toEqual({ code: 'CHALLENGE_EXPIRED_OR_REPLAYED' });
     await oldServer.stop();
     const attempts = await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).orderBy('attempt_no').execute();
@@ -621,7 +619,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       expect(await db.selectFrom('request_nonces').selectAll().where('nonce_hash', '=', nonceHash).executeTakeFirst()).toBeUndefined();
 
       const late = await sendActivation(prepared, staleAttempt);
-      expect(late.status).toBe(409);
+      expect(late.status, JSON.stringify(late.json)).toBe(409);
       expect(late.json['error']).toEqual({ code: 'CHALLENGE_EXPIRED_OR_REPLAYED' });
       expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).executeTakeFirst()).toBeUndefined();
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', prepared.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('0');
@@ -821,14 +819,14 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
     try {
       const attempt = await activationAttempt(prepared, 1, 'activation', proxyServer);
-      const commitDropped = proxy.armNextCommitAckDrop();
+      const commitDropped = proxy.armNextCommitAckDrop(1);
       const responsePromise = signPost({
         port: proxyServer.port, origin: runtime.config.publicOrigin, path: '/v1/activations', body: attempt.body,
         identity: prepared.identity, nonce: attempt.serverNonce,
       });
       await commitDropped;
       const lostResponse = await responsePromise;
-      expect(lostResponse.status).toBe(500);
+      expect(lostResponse.status, JSON.stringify(lostResponse.json)).toBe(500);
       const durable = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).executeTakeFirstOrThrow();
       expect(durable.state).toBe('committed');
       expect(durable.response_type).toBe('license');
@@ -851,16 +849,16 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
 
   it('rolls back a blocked activation when the process is killed and resumes after restart', async () => {
     const prepared = await prepareActivation();
-    const secretDir = await mkdtemp(join(tmpdir(), 'aikayun-license-process-'));
-    const keyFile = join(secretDir, 'license-signing-key.pem');
-    await writeFile(keyFile, runtime.privatePem, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     let child: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     let restarted: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     const blocker = await holdLicenseRow(db, prepared.licenseId);
     try {
       child = await startChildLicenseServer({
         databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer,
-        publicOrigin: runtime.config.publicOrigin, keyFile,
+        publicOrigin: runtime.config.publicOrigin,
+        keyringFile: runtime.keyringFile,
+        offlineRootJwkFile: runtime.offlineRootJwkFile,
+        minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
         tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
       });
       const attempt = await activationAttempt(prepared, 1, 'activation', child);
@@ -888,7 +886,10 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
 
       restarted = await startChildLicenseServer({
         databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer,
-        publicOrigin: runtime.config.publicOrigin, keyFile,
+        publicOrigin: runtime.config.publicOrigin,
+        keyringFile: runtime.keyringFile,
+        offlineRootJwkFile: runtime.offlineRootJwkFile,
+        minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
         tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
       });
       const continued = await sendContinue(prepared, 2, restarted);
@@ -903,7 +904,6 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       await blocker.done.catch(() => undefined);
       await child?.stop('SIGKILL').catch(() => undefined);
       await restarted?.stop().catch(() => undefined);
-      await rm(secretDir, { recursive: true, force: true });
     }
   });
 });

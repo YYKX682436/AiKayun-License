@@ -46,6 +46,7 @@ import {
   type TimeResetInput,
 } from './services/operations.js';
 import { signTimeAnchor } from './crypto/time-reset.js';
+import { lockSigningAuthorityForSigning } from './crypto/signing-authority.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -346,9 +347,14 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
   }, async (request, reply) => {
     const body = request.body as { client_nonce: string };
     if (!validateNonce(body.client_nonce)) throw new LicenseApiError(400, 'INVALID_TIME_ANCHOR_REQUEST');
-    const centerTime = await readNow();
-    assertCenterTimeSourceHealthy(centerTime);
-    const token = await signTimeAnchor(config, body.client_nonce, centerTime);
+    const observedCenterTime = await readNow();
+    assertCenterTimeSourceHealthy(observedCenterTime);
+    const token = await db.transaction().execute(async (trx) => {
+      const trustedNowOverride = providedNow ? observedCenterTime : undefined;
+      const authority = await lockSigningAuthorityForSigning(trx, config, trustedNowOverride);
+      assertCenterTimeSourceHealthy(authority.now);
+      return signTimeAnchor(authority.signer, body.client_nonce, authority.now);
+    });
     return reply.code(200).send({ time_anchor: token });
   });
 
@@ -368,7 +374,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     const body = request.body as ActivationInput;
     const origin = normalizeOrigin(body.origin);
     const now = await readNow();
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, now, 'activation');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, now, 'activation');
     const expectedIntent = activationIntentDigest({
       licenseId: body.license_id,
       activationCode: body.activation_code,
@@ -385,7 +391,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     const body = request.body as RenewalInput;
     const kind = body.recovery_of_operation_id ? 'recovery' : 'renewal';
     const now = await readNow();
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, now, kind);
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, now, kind);
     const expectedIntent = renewalIntentDigest({
       kind,
       licenseId: body.license_id,
@@ -403,7 +409,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
   app.post('/v1/operations/query', { schema: { body: querySchema } }, async (request, reply) => {
     const body = request.body as OperationQueryInput;
     const now = await readNow();
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, now, 'query');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, now, 'query');
     const token = await queryOperation(db, config, auth, body);
     if (typeof token !== 'string') throw new LicenseApiError(409, token.retryable);
     return reply.send({ operation_receipt: token });
@@ -415,7 +421,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
     const body = request.body as ActivationInput & RenewalInput & { kind: 'activation' | 'renewal' | 'recovery' };
     const kind = body.kind;
     const now = await readNow();
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, now, 'continue');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, now, 'continue');
     if (kind === 'activation') {
       const activation = body as ActivationInput;
       const origin = normalizeOrigin(activation.origin);
@@ -451,7 +457,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/transfers/prepare', { schema: { body: transferPrepareSchema } }, async (request, reply) => {
     const body = request.body as TransferPrepareInput;
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'transfer_prepare');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, await readNow(), 'transfer_prepare');
     const expectedIntent = transferPrepareIntentDigest({
       licenseId: body.license_id,
       databaseId: body.database_id,
@@ -470,7 +476,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/transfers/commit', { schema: { body: transferCommitSchema } }, async (request, reply) => {
     const body = request.body as TransferCommitInput;
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'transfer_commit');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, await readNow(), 'transfer_commit');
     const expectedIntent = transferCommitIntentDigest({
       licenseId: body.license_id,
       databaseId: body.database_id,
@@ -486,7 +492,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/disaster-transfers/prepare', { schema: { body: disasterTransferPrepareSchema } }, async (request, reply) => {
     const body = request.body as DisasterTransferPrepareInput;
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'disaster_transfer_prepare');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, await readNow(), 'disaster_transfer_prepare');
     const expectedIntent = disasterTransferPrepareIntentDigest({
       licenseId: body.license_id,
       accountReference: body.account_reference,
@@ -508,7 +514,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/disaster-transfers/commit', { schema: { body: disasterTransferCommitSchema } }, async (request, reply) => {
     const body = request.body as DisasterTransferCommitInput;
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'disaster_transfer_commit');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, await readNow(), 'disaster_transfer_commit');
     const expectedIntent = disasterTransferCommitIntentDigest({
       licenseId: body.license_id,
       databaseId: body.database_id,
@@ -524,7 +530,7 @@ export function createApp({ config, db, now: providedNow, challengeNow: provided
 
   app.post('/v1/time-resets/commit', { schema: { body: timeResetSchema } }, async (request, reply) => {
     const body = request.body as TimeResetInput;
-    const auth = await authenticateOperationRequest(requestSignatureInput(request), body, config, await readNow(), 'time_reset');
+    const auth = await authenticateOperationRequest(db, requestSignatureInput(request), body, config, await readNow(), 'time_reset');
     const expectedIntent = timeResetIntentDigest({
       operationId: body.operation_id,
       approvalId: body.approval_id,

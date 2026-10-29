@@ -32,7 +32,9 @@ export async function startChildLicenseServer(input: {
   databaseUrl: string;
   issuer: string;
   publicOrigin: string;
-  keyFile: string;
+  keyringFile: string;
+  offlineRootJwkFile: string;
+  minimumTrustBundleVersion: string;
   tlsKeyFile: string;
   tlsCertFile: string;
 }): Promise<ChildLicenseServer> {
@@ -47,7 +49,9 @@ export async function startChildLicenseServer(input: {
       LICENSE_DATABASE_URL: input.databaseUrl,
       LICENSE_ISSUER: input.issuer,
       LICENSE_PUBLIC_ORIGIN: input.publicOrigin,
-      LICENSE_SIGNING_KEY_FILE: input.keyFile,
+      LICENSE_SIGNING_KEYRING_FILE: input.keyringFile,
+      LICENSE_OFFLINE_ROOT_JWK_FILE: input.offlineRootJwkFile,
+      LICENSE_TRUST_BUNDLE_MIN_VERSION: input.minimumTrustBundleVersion,
       LICENSE_TLS_KEY_FILE: input.tlsKeyFile,
       LICENSE_TLS_CERT_FILE: input.tlsCertFile,
       LICENSE_HTTP_PORT: String(port),

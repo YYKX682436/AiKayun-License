@@ -6,11 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { importPKCS8 } from 'jose';
 import type { CryptoKey } from 'jose';
 import { parseStrictJson } from '../../src/strict-json.js';
-import {
-  buildTrustBundleClaims,
-  previewTrustBundleSigning,
-  signTrustBundle,
-} from '../../src/trust/trust-bundle.js';
+import { buildTrustBundleClaims, previewTrustBundleSigning, signTrustBundle } from './trust-bundle-signing.js';
 import type { Ed25519PublicJwk, TrustBundleSigningInput } from '../../src/trust/trust-bundle.js';
 
 const MAX_ROOT_FILE_BYTES = 8 * 1024;

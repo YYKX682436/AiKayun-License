@@ -7,6 +7,8 @@ import { LicenseApiError } from '../errors.js';
 import { verifyTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClaim } from '../crypto/jwt.js';
 import { validateIdentityJwk } from '../crypto/identity.js';
 import { verifyHttpMessage, type VerifiedHttpSignature } from '../crypto/http-signature.js';
+import { loadTrustedSigningContext, lockSigningAuthorityForSigning } from '../crypto/signing-authority.js';
+import type { SigningContext, VerificationContext } from '../crypto/signing-types.js';
 
 export type ChallengeOperation = 'activation' | 'renewal' | 'recovery' | 'query' | 'continue' | 'transfer_prepare' | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset';
 export interface ChallengeRequestBody {
@@ -90,63 +92,68 @@ export async function issueChallenge(
   now: Date,
 ): Promise<string> {
   const { signTypedJwt } = await import('../crypto/jwt.js');
-  const serverNonce = newNonce();
-  const iat = Math.floor(now.getTime() / 1000);
-  const claims = {
-    v: 1,
-    iss: config.issuer,
-    aud: 'aikayun-commerce',
-    sub: request.instance_id,
-    jti: randomUUID(),
-    iat,
-    nbf: iat,
-    exp: iat + 5 * 60,
-    operation: request.operation,
-    operation_id: request.operation_id,
-    intent_digest: request.intent_digest,
-    instance_id: request.instance_id,
-    identity_jkt: http.identityJkt,
-    client_nonce: request.client_nonce,
-    server_nonce: serverNonce,
-  };
-  const token = await signTypedJwt(config, 'aikayun-license-challenge+jwt', claims);
-  try {
-    await db.insertInto('request_nonces').values({
-      nonce_hash: sha256(serverNonce),
+  return db.transaction().execute(async (trx) => {
+    const authority = await lockSigningAuthorityForSigning(trx, config);
+    // The caller obtains this timestamp from the center clock. The signer
+    // authority lock still validates the active key against PostgreSQL time.
+    const issuedAt = now;
+    const serverNonce = newNonce();
+    const iat = Math.floor(issuedAt.getTime() / 1000);
+    const claims = {
+      v: 1,
+      iss: authority.signer.issuer,
+      aud: 'aikayun-commerce',
+      sub: request.instance_id,
+      jti: randomUUID(),
+      iat,
+      nbf: iat,
+      exp: iat + 5 * 60,
       operation: request.operation,
       operation_id: request.operation_id,
       intent_digest: request.intent_digest,
       instance_id: request.instance_id,
       identity_jkt: http.identityJkt,
-      client_nonce_hash: sha256(request.client_nonce),
-      challenge_jws_digest: sha256(token),
-      created_at: now,
-      expires_at: new Date(now.getTime() + 5 * 60 * 1000),
-      consumed_at: null,
-    }).execute();
-  } catch {
-    throw new LicenseApiError(409, 'CHALLENGE_NONCE_REPLAY');
-  }
-  return token;
+      client_nonce: request.client_nonce,
+      server_nonce: serverNonce,
+    };
+    const token = await signTypedJwt(authority.signer, 'aikayun-license-challenge+jwt', claims);
+    try {
+      await trx.insertInto('request_nonces').values({
+        nonce_hash: sha256(serverNonce),
+        operation: request.operation,
+        operation_id: request.operation_id,
+        intent_digest: request.intent_digest,
+        instance_id: request.instance_id,
+        identity_jkt: http.identityJkt,
+        client_nonce_hash: sha256(request.client_nonce),
+        challenge_jws_digest: sha256(token),
+        created_at: issuedAt,
+        expires_at: new Date(issuedAt.getTime() + 5 * 60 * 1000),
+        consumed_at: null,
+      }).execute();
+    } catch {
+      throw new LicenseApiError(409, 'CHALLENGE_NONCE_REPLAY');
+    }
+    return token;
+  });
 }
 
-async function verifyChallengeToken(token: string, config: RuntimeConfig, now: Date): Promise<ChallengeClaims> {
+async function verifyChallengeToken(token: string, context: VerificationContext, now: Date): Promise<ChallengeClaims> {
   const parts = token.split('.');
   if (parts.length !== 3) throw new LicenseApiError(401, 'CHALLENGE_INVALID');
-  let issuedAt: number;
-  try {
-    const decoded = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as Record<string, unknown>;
-    if (!Number.isSafeInteger(decoded['iat'])) throw new Error('iat');
-    issuedAt = Number(decoded['iat']);
-  } catch {
-    throw new LicenseApiError(401, 'CHALLENGE_INVALID');
-  }
   let claims: Record<string, unknown>;
   try {
-    const verified = await verifyTypedJwt(token, config, 'aikayun-license-challenge+jwt', [
+    const verified = await verifyTypedJwt(token, {
+      ...context,
+      typ: 'aikayun-license-challenge+jwt',
+      audience: 'aikayun-commerce',
+      now,
+      requiredClaims: [
       'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'operation', 'operation_id', 'intent_digest',
       'instance_id', 'identity_jkt', 'client_nonce', 'server_nonce',
-    ], new Date(issuedAt * 1000));
+      ],
+      allowExpired: true,
+    });
     claims = verified.claims;
   } catch {
     throw new LicenseApiError(401, 'CHALLENGE_INVALID');
@@ -216,24 +223,50 @@ export interface SignedHttpRequestInput {
 }
 
 export async function authenticateOperationRequest(
+  db: Kysely<Database>,
   request: SignedHttpRequestInput,
   body: AuthenticatedBody,
   config: RuntimeConfig,
   now: Date,
   expectedOperation: ChallengeOperation,
 ): Promise<AuthenticatedRequest> {
+  void now;
   const identity = await validateIdentityJwk(body.public_jwk);
   if (body.identity_jkt !== identity.jkt || !validateDigest(body.intent_digest) || !Number.isSafeInteger(body.attempt_no) || body.attempt_no < 1) {
     throw new LicenseApiError(400, 'INVALID_OPERATION_REQUEST');
   }
-  const challenge = await verifyChallengeToken(body.challenge, config, now);
+  const verification = await loadTrustedSigningContext(db, config);
+  const currentTime = new Date(verification.context.trustedTime * 1000);
+  const challenge = await verifyChallengeToken(body.challenge, verification.context, currentTime);
   if (challenge.operation !== expectedOperation || challenge.operationId !== body.operation_id || challenge.intentDigest !== body.intent_digest ||
     challenge.instanceId !== body.instance_id || challenge.identityJkt !== identity.jkt) {
     throw new LicenseApiError(401, 'CHALLENGE_BINDING_INVALID');
   }
-  const signature = await verifyHttpMessage(request, body.public_jwk, config.publicOrigin, challenge.serverNonce, now);
+  const signature = await verifyHttpMessage(request, body.public_jwk, config.publicOrigin, challenge.serverNonce, currentTime);
   if (signature.identityJkt !== identity.jkt) throw new LicenseApiError(401, 'HTTP_SIGNATURE_INVALID');
-  return { challenge, signature, requestDigest: signature.requestDigest, receivedAt: now };
+  return { challenge, signature, requestDigest: signature.requestDigest, receivedAt: currentTime };
+}
+
+export async function assertChallengeCurrent(
+  signer: SigningContext,
+  auth: AuthenticatedRequest,
+  now: Date,
+): Promise<void> {
+  let challenge: ChallengeClaims;
+  try {
+    challenge = await verifyChallengeToken(auth.challenge.token, {
+      issuer: signer.issuer,
+      resolver: signer.resolver,
+      trustedTime: Math.floor(now.getTime() / 1000),
+    }, now);
+  } catch {
+    throw new LicenseApiError(401, 'CHALLENGE_INVALID_AFTER_SIGNER_STATE_CHANGE');
+  }
+  if (challenge.operation !== auth.challenge.operation || challenge.operationId !== auth.challenge.operationId ||
+    challenge.intentDigest !== auth.challenge.intentDigest || challenge.instanceId !== auth.challenge.instanceId ||
+    challenge.identityJkt !== auth.challenge.identityJkt || challenge.serverNonce !== auth.challenge.serverNonce) {
+    throw new LicenseApiError(401, 'CHALLENGE_BINDING_INVALID');
+  }
 }
 
 export function challengeClaimsMatchRow(row: {

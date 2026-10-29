@@ -6,14 +6,22 @@ RUN npm ci
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npm run build
+RUN rm -rf ./dist/admin ./dist/crypto/keygen.js \
+  && test ! -e ./dist/admin/cli.js \
+  && test ! -e ./dist/crypto/keygen.js
 
 FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runtime
 ENV NODE_ENV=development
 WORKDIR /app
 COPY --from=build /app/package.runtime.json ./package.json
 COPY package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts \
+  && npm cache clean --force \
+  && rm -rf /root/.npm /tmp/node-compile-cache /tmp/npm-*
 COPY --from=build /app/dist ./dist
+RUN test ! -e ./dist/admin/cli.js \
+  && test ! -e ./dist/crypto/keygen.js \
+  && test ! -e ./dist/offline-trust
 USER node
 EXPOSE 4318
 CMD ["node", "dist/main.js"]

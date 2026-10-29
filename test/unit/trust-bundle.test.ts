@@ -7,15 +7,14 @@ import {
 } from 'jose';
 import type { CryptoKey, JWK } from 'jose';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { RuntimeConfig } from '../../src/config.js';
+import type { SigningContext } from '../../src/crypto/signing-types.js';
 import { parseStrictJsonSegment } from '../../src/strict-json.js';
 import { verifyLicenseLeaseWithTrustedKeys, signLicenseLease } from '../../src/receipts.js';
 import { signTimeAnchor, verifyTimeAnchorWithTrustBundleCandidate } from '../../src/crypto/time-reset.js';
+import { buildTrustBundleClaims, signTrustBundle } from '../../tools/offline-trust/trust-bundle-signing.js';
 import {
-  buildTrustBundleClaims,
   compareBundleVersions,
   MAX_TRUSTED_KEY_TOMBSTONES,
-  signTrustBundle,
   verifyTrustBundleSignature,
 } from '../../src/trust/trust-bundle.js';
 import type {
@@ -126,12 +125,12 @@ async function rawRootSigned(payload: string | Record<string, unknown>, header: 
   }).sign(rootPrivateKey);
 }
 
-function runtimeFor(input: { privateKey: CryptoKey; publicKey: CryptoKey; publicJwk: Ed25519PublicJwk; kid: string }): RuntimeConfig {
+function runtimeFor(input: { privateKey: CryptoKey; publicKey: CryptoKey; publicJwk: Ed25519PublicJwk; kid: string }): SigningContext {
   return {
-    nodeEnv: 'development', databaseUrl: 'postgres://unused', issuer: CENTER_ISSUER, publicOrigin: CENTER_ISSUER,
-    tlsKeyFile: '', tlsCertFile: '', tlsPrivateKey: Buffer.alloc(0), tlsCertificate: Buffer.alloc(0),
-    port: 1, listenHost: '127.0.0.1', signingPrivateKey: input.privateKey,
-    signingPublicKey: input.publicKey, signingPublicJwk: input.publicJwk as JWK, signingKeyId: input.kid,
+    issuer: CENTER_ISSUER, kid: input.kid, privateKey: input.privateKey,
+    publicKey: input.publicKey, publicJwk: input.publicJwk as JWK,
+    signerRevision: '1', bundleVersion: '1', artifactSha256: 'A'.repeat(43),
+    resolver: { async resolveKey() { throw new Error('test signing context resolver is not used'); } },
   };
 }
 

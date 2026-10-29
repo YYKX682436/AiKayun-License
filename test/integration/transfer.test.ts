@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { userInfo, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sql, type Kysely } from 'kysely';
-import { decodeJwt, jwtVerify } from 'jose';
+import { decodeJwt, decodeProtectedHeader } from 'jose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import {
@@ -16,13 +16,18 @@ import {
   type ApproveTransferRequest,
   type AdminOperationResult,
 } from '../../src/admin/service.js';
+import { acceptSignerTrustBundleRequestDigest } from '../../src/admin/signing-service.js';
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
 import type { Database } from '../../src/db/types.js';
 import { activationIntentDigest, renewalIntentDigest, timeResetIntentDigest, transferCommitIntentDigest, transferPrepareIntentDigest } from '../../src/intent.js';
 import { signTypedJwt } from '../../src/crypto/jwt.js';
+import { loadTrustedSigningContext } from '../../src/crypto/signing-authority.js';
+import { verifyTypedJwt } from '../../src/crypto/jwt.js';
 import { verifyTimeResetReceipt } from '../../src/crypto/time-reset.js';
-import { signTransferTicket, verifyLicenseLease, verifyTransferReceipt } from '../../src/receipts.js';
+import { signTransferTicket, verifyLicenseLease, verifyTransferReceipt, verifyTransferTicket } from '../../src/receipts.js';
+import { publishAndRotateTo } from '../support/signing-rotation.js';
 import { createActivationCode, createLicense, getDbNow } from '../fixtures.js';
+import { trustBundleArtifactDigest } from '../../src/trust/trust-bundle.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
 import { terminatePostgresBackend, waitForLicenseRowWaiterPids, waitForLicenseRowWaiters, waitForNoLockWaiters } from '../support/pg-waits.js';
@@ -87,9 +92,17 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
   let policyFile: string;
 
   async function verifyCenterJwt(token: string) {
-    return jwtVerify(token, runtime.config.signingPublicKey, {
-      algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce',
+    const context = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const header = decodeProtectedHeader(token);
+    const claims = decodeJwt(token);
+    const verified = await verifyTypedJwt(token, {
+      ...context,
+      typ: String(header['typ']),
+      audience: 'aikayun-commerce',
+      now: new Date(context.trustedTime * 1000),
+      requiredClaims: Object.keys(claims),
     });
+    return { payload: verified.claims, protectedHeader: verified.header };
   }
 
   async function activate(): Promise<ActiveSource> {
@@ -302,6 +315,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     runtime = await createTestSigningRuntime();
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
+    await runtime.initializeAuthority(db);
     server = await startAppServer(createApp({ config: runtime.config, db }));
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-transfer-'));
     await chmod(scratchDirectory, 0o700);
@@ -593,6 +607,126 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     expect((await verifyCenterJwt(newResponse.json['license'] as string)).payload).toMatchObject({
       activation_generation: '2', identity_jkt: prepared.target.jkt, entitlement_revision: before.entitlement_revision,
     });
+  });
+
+  it('commits an A-signed normal transfer ticket after B becomes authoritative and signs a B result', async () => {
+    const active = await activate();
+    const before = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const activationBefore = await db.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', active.licenseId).where('state', '=', 'active').executeTakeFirstOrThrow();
+    const prepared = await prepare(active);
+    const originalPrepare = await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow();
+    expect(decodeProtectedHeader(prepared.ticket)['kid']).toBe(runtime.onlineKey.kid);
+
+    const b = await runtime.createOnlineKey();
+    const { context } = await publishAndRotateTo(db, runtime, b, '2');
+    const authority = await db.selectFrom('license_signer_authority').selectAll().where('singleton', '=', true).executeTakeFirstOrThrow();
+    expect(authority).toMatchObject({ active_signing_kid: b.kid, signer_revision: '2', previous_signing_kid: runtime.onlineKey.kid });
+    const afterRotation = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    expect([afterRotation.current_generation, afterRotation.revision, afterRotation.entitlement_revision,
+      afterRotation.confirmed_subscription_end]).toEqual([
+      before.current_generation, before.revision, before.entitlement_revision, before.confirmed_subscription_end,
+    ]);
+    const verificationTime = new Date(context.trustedTime * 1000);
+    const activationAfterRotation = await db.selectFrom('license_activations').selectAll()
+      .where('id', '=', activationBefore.id).executeTakeFirstOrThrow();
+    expect(activationAfterRotation.time_epoch).toBe(activationBefore.time_epoch);
+    const verifiedOldTicket = await verifyTransferTicket(prepared.ticket, context, verificationTime);
+    expect(verifiedOldTicket.expired).toBe(false);
+    expect(verifiedOldTicket.claims['plan_id']).toBe(decodeJwt(originalPrepare.response_jws)['plan_id']);
+
+    const committed = await commit(prepared);
+    expect(committed.response.status).toBe(200);
+    const receiptToken = committed.response.json['transfer_receipt'] as string;
+    expect(decodeProtectedHeader(receiptToken)['kid']).toBe(b.kid);
+    const resultContext = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const validationNow = new Date(resultContext.trustedTime * 1000);
+    const receipt = await verifyTransferReceipt(receiptToken, resultContext, validationNow);
+    const leaseToken = receipt['new_lease'] as string;
+    expect(decodeProtectedHeader(leaseToken)['kid']).toBe(b.kid);
+    const lease = await verifyLicenseLease(leaseToken, resultContext, validationNow);
+    expect(lease['activation_generation']).toBe('2');
+    expect(receipt['entitlement_revision']).toBe(before.entitlement_revision);
+    const plan = await db.selectFrom('license_transfer_plans').selectAll()
+      .where('plan_id', '=', decodeJwt(prepared.ticket)['plan_id'] as string).executeTakeFirstOrThrow();
+    expect(plan.ticket_jws).toBe(prepared.ticket);
+    expect(originalPrepare.response_jws).toBe(prepared.ticket);
+    const afterCommit = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    expect(afterCommit.current_generation).toBe('2');
+    expect(afterCommit.revision).toBe(decimalPlusOne(before.revision));
+    expect(afterCommit.entitlement_revision).toBe(before.entitlement_revision);
+    expect(afterCommit.confirmed_subscription_end).toEqual(before.confirmed_subscription_end);
+  });
+
+  it('invalidates and audits an unfinished A ticket when the offline root urgently revokes A', async () => {
+    const previous = { db, server, runtime, admin, policyFile };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }));
+    const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
+    const isolatedAdmin = await createAdminService(isolatedPolicy);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    admin = isolatedAdmin;
+    policyFile = isolatedPolicy;
+    try {
+    const active = await activate();
+    const prepared = await prepare(active);
+    const originalPrepare = await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow();
+    const planId = decodeJwt(prepared.ticket)['plan_id'] as string;
+    const b = await runtime.createOnlineKey();
+    await publishAndRotateTo(db, runtime, b, '2');
+
+    const revokedAt = Math.floor((await getDbNow(db)).getTime() / 1000);
+    const revokedBundle = await runtime.createBundle('3', [
+      { ...runtime.onlineKey.record, revoked_at: revokedAt }, b.record,
+    ]);
+    const service = runtime.createAdminService(db);
+    const accept = {
+      operationId: randomUUID(), expectedSignerRevision: '2', bundleJws: revokedBundle,
+      reason: 'emergency revoke compromised A signing key',
+    };
+    const accepted = await service.acceptTrustBundle({
+      ...accept,
+      rolloutGate: 'isolated-development-confirmed',
+      confirmedRequestDigest: acceptSignerTrustBundleRequestDigest(accept),
+    });
+    expect(accepted).toMatchObject({ state: 'succeeded', signerRevision: '2' });
+    expect(accepted.result['invalidated_prepared_plans']).toBe(1);
+    const plan = await db.selectFrom('license_transfer_plans').selectAll()
+      .where('plan_id', '=', planId).executeTakeFirstOrThrow();
+    expect(plan).toMatchObject({ state: 'invalidated', ticket_jws: prepared.ticket });
+    const events = await db.selectFrom('license_transfer_events').selectAll().where('plan_id', '=', planId).execute();
+    expect(events.map((event) => event.kind)).toEqual(['prepared', 'invalidated']);
+    expect(events[1]!.safe_details).toMatchObject({
+      reason: 'signing_key_revoked_or_retired', signer_kid: runtime.onlineKey.kid,
+    });
+    expect(originalPrepare.response_jws).toBe(prepared.ticket);
+
+    const lateCommit = await commit(prepared);
+    expect(lateCommit.response.status).toBe(401);
+    expect(lateCommit.response.json['error']).toEqual({ code: 'TRANSFER_TICKET_INVALID' });
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    expect(license.current_generation).toBe('1');
+    expect((await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow()).response_jws).toBe(prepared.ticket);
+    expect(trustBundleArtifactDigest(revokedBundle)).toBe(accepted.artifactSha256);
+    } finally {
+      await isolatedAdmin.close();
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
+      admin = previous.admin;
+      policyFile = previous.policyFile;
+    }
   });
 
   it('prevents A-to-B-to-A identity rollback while allowing a fresh C identity', async () => {
@@ -1021,7 +1155,7 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
     try {
       const commitAttempt = await makeCommitAttempt(prepared2, { requestServer: proxyServer });
-      const droppedAck = pgProxy.armNextCommitAckDrop();
+      const droppedAck = pgProxy.armNextCommitAckDrop(1);
       const lost = sendCommit(commitAttempt.attempt, prepared2.target, proxyServer);
       await droppedAck;
       expect((await lost).status).toBe(500);
@@ -1056,16 +1190,15 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       await releaseBlocker.promise;
     });
     await blockerReady.promise;
-    const secretDir = await mkdtemp(join(tmpdir(), 'aikayun-license-transfer-process-'));
-    const keyFile = join(secretDir, 'signing-key.pem');
-    await writeFile(keyFile, runtime.privatePem, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     let child: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     let restarted: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     const commitOperationId = randomUUID();
     try {
       child = await startChildLicenseServer({
         databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer, publicOrigin: runtime.config.publicOrigin,
-        keyFile, tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
+        keyringFile: runtime.keyringFile, offlineRootJwkFile: runtime.offlineRootJwkFile,
+        minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
+        tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
       });
       const first = await makeCommitAttempt(prepared, { operationId: commitOperationId, requestServer: child });
       const response = sendCommit(first.attempt, prepared.target, child).catch((error: unknown) => error);
@@ -1087,7 +1220,9 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       await blocker;
       restarted = await startChildLicenseServer({
         databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer, publicOrigin: runtime.config.publicOrigin,
-        keyFile, tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
+        keyringFile: runtime.keyringFile, offlineRootJwkFile: runtime.offlineRootJwkFile,
+        minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
+        tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile,
       });
       const retry = await makeCommitAttempt(prepared, { operationId: commitOperationId, attemptNo: 2, requestServer: restarted });
       expect((await sendCommit(retry.attempt, prepared.target, restarted)).status).toBe(200);
@@ -1097,7 +1232,6 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       await blocker.catch(() => undefined);
       await child?.stop().catch(() => undefined);
       await restarted?.stop().catch(() => undefined);
-      await rm(secretDir, { recursive: true, force: true });
     }
   });
 
@@ -1219,8 +1353,8 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
 
     const trustedServerTime = Math.floor((await getDbNow(db)).getTime() / 1000);
     await expect(verifyTimeResetReceipt(resetReceipt, {
-      publicKey: runtime.config.signingPublicKey, issuer: runtime.config.issuer,
-      keyId: runtime.config.signingKeyId, trustedServerTime,
+      resolver: (await loadTrustedSigningContext(db, runtime.config)).context.resolver,
+      issuer: runtime.config.issuer, trustedServerTime,
       expected: {
         license_id: active.licenseId, database_id: active.databaseId, instance_id: active.instanceId,
         identity_jkt: target.jkt, activation_generation: '2', management_revision: revision,
@@ -1260,7 +1394,6 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       sourceGeneration: license.current_generation.toString(), expectedBindingRevision: '7',
     };
     const historicalAdmin = await createAdminService(policyFile, { controlledTestNow: async () => historicalApprovalTime });
-    let expiryServer: RunningTestServer | undefined;
     try {
       const approval = await historicalAdmin.approveTransfer({ ...approvalRequest,
         confirmedRequestDigest: approveTransferRequestDigest(approvalRequest) });
@@ -1278,22 +1411,19 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
         active, target, approval, approvalId: approval.operationId,
         prepareOperationId: prepareAttempt.operationId, prepareIntentDigest: prepareAttempt.intentDigest, ticket,
       };
-      const commitTime = new Date(base.getTime() + 30 * 1000);
-      expiryServer = await startAppServer(createApp({ config: runtime.config, db, now: async () => commitTime }));
-      const commitAttempt = await makeCommitAttempt(prepared, { requestServer: expiryServer });
-      const response = await sendCommit(commitAttempt.attempt, target, expiryServer);
+      await new Promise((resolve) => setTimeout(resolve, 25_000));
+      const commitAttempt = await makeCommitAttempt(prepared);
+      const response = await sendCommit(commitAttempt.attempt, target);
       expect(response.status).toBe(409);
       expect(typeof response.json['operation_receipt']).toBe('string');
       expect(response.json).not.toHaveProperty('transfer_receipt');
       expect(response.json).not.toHaveProperty('transfer_ticket');
-      const rejected = await jwtVerify(response.json['operation_receipt'] as string, runtime.config.signingPublicKey, {
-        algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce', currentDate: commitTime,
-      });
+      const rejected = await verifyCenterJwt(response.json['operation_receipt'] as string);
       expect(rejected.payload).toMatchObject({ state: 'rejected', outcome_code: 'TRANSFER_APPROVAL_EXPIRED' });
       const historicalReplayAttempt = await makeCommitAttempt(prepared, {
-        operationId: commitAttempt.operationId, attemptNo: 2, requestServer: expiryServer,
+        operationId: commitAttempt.operationId, attemptNo: 2,
       });
-      const historicalReplay = await sendCommit(historicalReplayAttempt.attempt, target, expiryServer);
+      const historicalReplay = await sendCommit(historicalReplayAttempt.attempt, target);
       expect(historicalReplay.status).toBe(409);
       expect(historicalReplay.json['operation_receipt']).toBe(response.json['operation_receipt']);
       expect(historicalReplay.json).not.toHaveProperty('transfer_receipt');
@@ -1306,7 +1436,6 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
         .where('identity_jkt', '=', target.jkt).execute()).toHaveLength(0);
     } finally {
-      await expiryServer?.stop();
       await historicalAdmin.close();
     }
   });

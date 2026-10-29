@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { CryptoKey } from 'jose';
-import type { RuntimeConfig } from '../config.js';
+import type { SigningContext } from './signing-types.js';
 import {
   signTypedJwt, assertExactClaims, assertIntegerClaim, assertStringClaim,
   verifyTypedJwtWithKey, verifyTypedJwtWithResolver,
@@ -53,12 +53,12 @@ function assertHeader(token: string, typ: string, kid?: string): Record<string, 
   return header;
 }
 
-export async function signTimeAnchor(config: RuntimeConfig, clientNonce: string, now: Date): Promise<string> {
+export async function signTimeAnchor(signer: SigningContext, clientNonce: string, now: Date): Promise<string> {
   if (!isCanonical256BitValue(clientNonce)) throw new Error('Invalid client nonce');
   const serverTime = Math.floor(now.getTime() / 1000);
-  return signTypedJwt(config, TIME_ANCHOR_TYP, {
+  return signTypedJwt(signer, TIME_ANCHOR_TYP, {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: TIME_ANCHOR_AUDIENCE,
     sub: 'license-center-time',
     jti: randomUUID(),
@@ -199,14 +199,14 @@ export interface TimeResetReceiptClaims {
 }
 
 export async function signTimeResetReceipt(
-  config: RuntimeConfig,
+  signer: SigningContext,
   claims: TimeResetReceiptClaims,
   now: Date,
 ): Promise<string> {
   const serverTime = Math.floor(now.getTime() / 1000);
-  return signTypedJwt(config, TIME_RESET_TYP, {
+  return signTypedJwt(signer, TIME_RESET_TYP, {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: TIME_RESET_AUDIENCE,
     sub: claims.license_id,
     jti: randomUUID(),
@@ -228,33 +228,24 @@ export async function verifyTimeResetReceipt(
       'license_id' | 'database_id' | 'instance_id' | 'identity_jkt' | 'activation_generation' | 'management_revision' |
       'entitlement_revision' | 'old_time_epoch' | 'new_time_epoch' | 'old_watermark_digest' | 'operation_id' | 'intent_digest' |
       'request_nonce' | 'client_nonce' | 'request_digest' | 'admin_approval_id' | 'admin_operation_id' | 'admin_approval_digest'>;
-  } & ({ publicKey: CryptoKey; keyId: string; resolver?: never } | { resolver: TrustedSigningKeyResolver; publicKey?: never; keyId?: never }),
+    resolver: TrustedSigningKeyResolver;
+  },
 ): Promise<TimeResetReceiptClaims & { server_time: number; expires_at: number; receipt_id: string }> {
   if (typeof token !== 'string' || !Number.isSafeInteger(input.trustedServerTime) || input.trustedServerTime <= 0) throw new Error('Invalid reset receipt input');
-  const header = assertHeader(token, TIME_RESET_TYP, 'keyId' in input ? input.keyId : undefined);
+  const header = assertHeader(token, TIME_RESET_TYP);
   const segments = token.split('.');
   const rawClaims = parseStrictJsonSegment(segments[1]!);
   const serverTime = rawClaims['server_time'];
   if (typeof serverTime !== 'number' || !Number.isSafeInteger(serverTime) || input.trustedServerTime < serverTime ||
     input.trustedServerTime - serverTime > 10 * 60) throw new Error('Reset evidence is outside its fresh window');
-  const verification = 'resolver' in input && input.resolver
-    ? await verifyTypedJwtWithResolver(token, {
-      resolver: input.resolver,
-      issuer: input.issuer,
-      audience: TIME_RESET_AUDIENCE,
-      typ: TIME_RESET_TYP,
-      requiredClaims: TIME_RESET_CLAIMS,
-      now: new Date(input.trustedServerTime * 1000),
-    })
-    : await verifyTypedJwtWithKey(token, {
-      publicKey: input.publicKey!,
-      keyId: input.keyId!,
-      issuer: input.issuer,
-      audience: TIME_RESET_AUDIENCE,
-      typ: TIME_RESET_TYP,
-      requiredClaims: TIME_RESET_CLAIMS,
-      now: new Date(input.trustedServerTime * 1000),
-    });
+  const verification = await verifyTypedJwtWithResolver(token, {
+    resolver: input.resolver,
+    issuer: input.issuer,
+    audience: TIME_RESET_AUDIENCE,
+    typ: TIME_RESET_TYP,
+    requiredClaims: TIME_RESET_CLAIMS,
+    now: new Date(input.trustedServerTime * 1000),
+  });
   const claims = verification.claims;
   if (verification.header['alg'] !== 'Ed25519' || verification.header['typ'] !== TIME_RESET_TYP ||
     verification.header['kid'] !== header['kid']) throw new Error('Unexpected time reset header');

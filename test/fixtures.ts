@@ -2,6 +2,7 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { sql, type Kysely } from 'kysely';
 import { signTypedJwt } from '../src/crypto/jwt.js';
 import type { RuntimeConfig } from '../src/config.js';
+import type { SigningContext } from '../src/crypto/signing-types.js';
 import type { Database } from '../src/db/types.js';
 import type { TestIdentity } from './support/runtime.js';
 
@@ -50,7 +51,7 @@ export async function createActivationCode(db: Kysely<Database>, licenseId: stri
 
 export async function createExpiredActivationFixture(
   db: Kysely<Database>,
-  config: RuntimeConfig,
+  config: RuntimeConfig & SigningContext,
   identity: TestIdentity,
 ) {
   const license = await createLicense(db);

@@ -191,6 +191,7 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
     process.env['LICENSE_ADMIN_ACTOR'] = 'spoofed-actor-from-environment';
     db = createDatabase(databaseUrl, 24);
     await migrateToLatest(db);
+    await runtime.initializeAuthority(db);
     server = await startAppServer(createApp({ config: runtime.config, db }));
     service = await createAdminService(policyFile);
   });

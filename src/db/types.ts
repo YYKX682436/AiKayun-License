@@ -5,6 +5,7 @@ type Bigint = ColumnType<string, number | string, number | string>;
 type DefaultedBigint = ColumnType<string, number | string | undefined, number | string>;
 type NullableTimestamp = ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 type Json = ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>;
+type JsonStringArray = ColumnType<string[], string[], string[]>;
 
 export interface LicensesTable {
   id: string;
@@ -382,6 +383,71 @@ export interface LicenseTransferRevocationsTable {
   revoked_at: Timestamp;
 }
 
+export interface LicenseSignerOperationsTable {
+  operation_id: string;
+  request_digest: string;
+  action: 'initialize' | 'trust_bundle_accept' | 'key_rotate';
+  expected_signer_revision: Bigint;
+  previous_signing_kid: string | null;
+  target_signing_kid: string | null;
+  bundle_version: string | null;
+  artifact_sha256: string | null;
+  proof_sha256: string | null;
+  rollout_gate: 'isolated-development-confirmed';
+  reason: string;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  state: 'succeeded' | 'rejected';
+  outcome_code: string;
+  result: Json;
+  created_at: Timestamp;
+  finalized_at: Timestamp;
+}
+
+export interface LicenseSignerAuditEventsTable {
+  event_id: string;
+  operation_id: string;
+  request_digest: string;
+  action: LicenseSignerOperationsTable['action'];
+  expected_signer_revision: Bigint;
+  previous_signing_kid: string | null;
+  target_signing_kid: string | null;
+  bundle_version: string | null;
+  artifact_sha256: string | null;
+  proof_sha256: string | null;
+  rollout_gate: 'isolated-development-confirmed';
+  reason: string;
+  actor_os_uid: number;
+  actor_os_username: string;
+  actor_database_role: string;
+  state: 'succeeded' | 'rejected';
+  outcome_code: string;
+  result: Json;
+  created_at: Timestamp;
+}
+
+export interface LicenseSignerTrustBundlesTable {
+  bundle_version: string;
+  artifact_sha256: string;
+  root_kid: string;
+  bundle_jws: string;
+  revoked_kids: JsonStringArray;
+  retired_kids: JsonStringArray;
+  accepted_by_operation_id: string;
+  accepted_at: Timestamp;
+}
+
+export interface LicenseSignerAuthorityTable {
+  singleton: boolean;
+  active_signing_kid: string | null;
+  signer_revision: Bigint;
+  bundle_version: string | null;
+  artifact_sha256: string | null;
+  previous_signing_kid: string | null;
+  changed_at: Timestamp;
+}
+
 export interface Database {
   licenses: LicensesTable;
   license_activations: LicenseActivationsTable;
@@ -405,6 +471,10 @@ export interface Database {
   license_time_reset_approvals: LicenseTimeResetApprovalsTable;
   license_time_reset_revocations: LicenseTimeResetRevocationsTable;
   license_time_reset_events: LicenseTimeResetEventsTable;
+  license_signer_operations: LicenseSignerOperationsTable;
+  license_signer_audit_events: LicenseSignerAuditEventsTable;
+  license_signer_trust_bundles: LicenseSignerTrustBundlesTable;
+  license_signer_authority: LicenseSignerAuthorityTable;
 }
 
 export type LicenseRow = Selectable<LicensesTable>;
@@ -419,3 +489,6 @@ export type LicenseTransferPlanRow = Selectable<LicenseTransferPlansTable>;
 export type LicenseDisasterRecoveryRequestRow = Selectable<LicenseDisasterRecoveryRequestsTable>;
 export type LicenseDisasterTransferApprovalRow = Selectable<LicenseDisasterTransferApprovalsTable>;
 export type LicenseDisasterTransferPlanRow = Selectable<LicenseDisasterTransferPlansTable>;
+export type LicenseSignerOperationRow = Selectable<LicenseSignerOperationsTable>;
+export type LicenseSignerAuthorityRow = Selectable<LicenseSignerAuthorityTable>;
+export type LicenseSignerTrustBundleRow = Selectable<LicenseSignerTrustBundlesTable>;

@@ -3,9 +3,10 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { userInfo, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sql, type Kysely } from 'kysely';
-import { decodeJwt, jwtVerify } from 'jose';
+import { decodeJwt, decodeProtectedHeader } from 'jose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
+import { acceptSignerTrustBundleRequestDigest } from '../../src/admin/signing-service.js';
 import {
   approveDisasterTransferRequestDigest,
   approveTransferRequestDigest,
@@ -20,6 +21,8 @@ import {
 } from '../../src/admin/service.js';
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
 import { signTypedJwt } from '../../src/crypto/jwt.js';
+import { loadTrustedSigningContext } from '../../src/crypto/signing-authority.js';
+import { verifyTypedJwt } from '../../src/crypto/jwt.js';
 import type { Database } from '../../src/db/types.js';
 import {
   disasterTransferCommitIntentDigest,
@@ -36,6 +39,7 @@ import {
   signDisasterTransferTicket,
 } from '../../src/receipts.js';
 import { createActivationCode, createLicense, getDbNow } from '../fixtures.js';
+import { publishAndRotateTo } from '../support/signing-rotation.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
 import {
@@ -101,9 +105,17 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
   let policyFile: string;
 
   async function verifyCenterJwt(token: string) {
-    return jwtVerify(token, runtime.config.signingPublicKey, {
-      algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce',
+    const context = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const header = decodeProtectedHeader(token);
+    const claims = decodeJwt(token);
+    const verified = await verifyTypedJwt(token, {
+      ...context,
+      typ: String(header['typ']),
+      audience: 'aikayun-commerce',
+      now: new Date(context.trustedTime * 1000),
+      requiredClaims: Object.keys(claims),
     });
+    return { payload: verified.claims, protectedHeader: verified.header };
   }
 
   async function activate(input: { instanceId?: string; licenseEnd?: Date } = {}): Promise<ActiveSource> {
@@ -336,6 +348,7 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     runtime = await createTestSigningRuntime();
     db = createDatabase(runtime.config.databaseUrl, 32);
     await migrateToLatest(db);
+    await runtime.initializeAuthority(db);
     server = await startAppServer(createApp({ config: runtime.config, db }));
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-disaster-'));
     await chmod(scratchDirectory, 0o700);
@@ -460,6 +473,126 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       .executeTakeFirstOrThrow()).disaster_result_jws).toBe(receiptToken);
     expect(await db.selectFrom('license_disaster_transfer_events').selectAll()
       .where('license_id', '=', active.licenseId).where('kind', '=', 'committed').execute()).toHaveLength(1);
+  });
+
+  it('commits an A-signed disaster ticket after B becomes authoritative and preserves the A ticket bytes', async () => {
+    const active = await activate();
+    const target = await createIdentity();
+    const approved = await approveDisaster(active, target);
+    const before = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const activationBefore = await db.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', active.licenseId).where('state', '=', 'active').executeTakeFirstOrThrow();
+    const prepared = await prepare(approved);
+    const prepareOperation = await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow();
+    expect(decodeProtectedHeader(prepared.ticket)['kid']).toBe(runtime.onlineKey.kid);
+
+    const b = await runtime.createOnlineKey();
+    const { context } = await publishAndRotateTo(db, runtime, b, '2');
+    const verificationTime = new Date(context.trustedTime * 1000);
+    const ticket = await verifyDisasterTransferTicket(prepared.ticket, context, verificationTime);
+    expect(ticket.expired).toBe(false);
+    expect(prepareOperation.response_jws).toBe(prepared.ticket);
+    const afterRotation = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const activationAfterRotation = await db.selectFrom('license_activations').selectAll()
+      .where('id', '=', activationBefore.id).executeTakeFirstOrThrow();
+    expect([afterRotation.current_generation, afterRotation.revision, afterRotation.entitlement_revision,
+      afterRotation.confirmed_subscription_end, activationAfterRotation.time_epoch]).toEqual([
+      before.current_generation, before.revision, before.entitlement_revision,
+      before.confirmed_subscription_end, activationBefore.time_epoch,
+    ]);
+
+    const committed = await commit(prepared);
+    expect(committed.response.status).toBe(200);
+    const receiptToken = committed.response.json['transfer_receipt'] as string;
+    expect(decodeProtectedHeader(receiptToken)['kid']).toBe(b.kid);
+    const resultContext = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const resultTime = new Date(resultContext.trustedTime * 1000);
+    const receipt = await verifyDisasterTransferReceipt(receiptToken, resultContext, resultTime);
+    const leaseToken = receipt['new_lease'] as string;
+    expect(decodeProtectedHeader(leaseToken)['kid']).toBe(b.kid);
+    const lease = await verifyLicenseLease(leaseToken, resultContext, resultTime);
+    expect(lease['activation_generation']).toBe('2');
+    expect(receipt['entitlement_revision']).toBe(before.entitlement_revision);
+    const plan = await db.selectFrom('license_disaster_transfer_plans').selectAll()
+      .where('plan_id', '=', decodeJwt(prepared.ticket)['plan_id'] as string).executeTakeFirstOrThrow();
+    expect(plan.ticket_jws).toBe(prepared.ticket);
+    expect(plan.disaster_result_jws).toBe(receiptToken);
+    const afterCommit = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    expect(afterCommit.current_generation).toBe('2');
+    expect(afterCommit.revision).toBe(plusOne(before.revision));
+    expect(afterCommit.entitlement_revision).toBe(before.entitlement_revision);
+    expect(afterCommit.confirmed_subscription_end).toEqual(before.confirmed_subscription_end);
+  });
+
+  it('invalidates and audits an unfinished A disaster ticket on emergency key revocation', async () => {
+    const previous = { db, server, runtime, admin, policyFile };
+    const isolatedRuntime = await createTestSigningRuntime();
+    const isolatedDb = createDatabase(isolatedRuntime.config.databaseUrl, 24);
+    await migrateToLatest(isolatedDb);
+    await isolatedRuntime.initializeAuthority(isolatedDb);
+    const isolatedServer = await startAppServer(createApp({ config: isolatedRuntime.config, db: isolatedDb }));
+    const isolatedPolicy = await writeAdminPolicy(isolatedRuntime.config.databaseUrl);
+    const isolatedAdmin = await createAdminService(isolatedPolicy);
+    db = isolatedDb;
+    server = isolatedServer;
+    runtime = isolatedRuntime;
+    admin = isolatedAdmin;
+    policyFile = isolatedPolicy;
+    try {
+    const active = await activate();
+    const target = await createIdentity();
+    const approved = await approveDisaster(active, target);
+    const prepared = await prepare(approved);
+    const prepareOperation = await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow();
+    const planId = decodeJwt(prepared.ticket)['plan_id'] as string;
+    const b = await runtime.createOnlineKey();
+    await publishAndRotateTo(db, runtime, b, '2');
+
+    const revokedAt = Math.floor((await getDbNow(db)).getTime() / 1000);
+    const revokedBundle = await runtime.createBundle('3', [
+      { ...runtime.onlineKey.record, revoked_at: revokedAt }, b.record,
+    ]);
+    const service = runtime.createAdminService(db);
+    const accept = {
+      operationId: randomUUID(), expectedSignerRevision: '2', bundleJws: revokedBundle,
+      reason: 'emergency revoke compromised A disaster signer',
+    };
+    const accepted = await service.acceptTrustBundle({
+      ...accept,
+      rolloutGate: 'isolated-development-confirmed',
+      confirmedRequestDigest: acceptSignerTrustBundleRequestDigest(accept),
+    });
+    expect(accepted.result['invalidated_prepared_plans']).toBe(1);
+    const plan = await db.selectFrom('license_disaster_transfer_plans').selectAll()
+      .where('plan_id', '=', planId).executeTakeFirstOrThrow();
+    expect(plan).toMatchObject({ state: 'invalidated', ticket_jws: prepared.ticket });
+    expect(prepareOperation.response_jws).toBe(prepared.ticket);
+    const events = await db.selectFrom('license_disaster_transfer_events').selectAll().where('plan_id', '=', planId).execute();
+    expect(events.map((event) => event.kind)).toEqual(['prepared', 'invalidated']);
+    expect(events[1]!.safe_details).toMatchObject({
+      reason: 'signing_key_revoked_or_retired', signer_kid: runtime.onlineKey.kid,
+    });
+
+    const lateCommit = await commit(prepared);
+    expect(lateCommit.response.status).toBe(401);
+    expect(lateCommit.response.json['error']).toEqual({ code: 'DISASTER_TICKET_INVALID' });
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId)
+      .executeTakeFirstOrThrow()).current_generation).toBe('1');
+    expect((await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', prepared.prepareOperationId).executeTakeFirstOrThrow()).response_jws).toBe(prepared.ticket);
+    } finally {
+      await isolatedAdmin.close();
+      await isolatedServer.stop();
+      await isolatedDb.destroy();
+      await isolatedRuntime.cleanup();
+      db = previous.db;
+      server = previous.server;
+      runtime = previous.runtime;
+      admin = previous.admin;
+      policyFile = previous.policyFile;
+    }
   });
 
   it('rejects missing, cross-license, stale, wrong-database and substituted-target approvals', async () => {
@@ -938,22 +1071,24 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     expect(expiredCommit.response.status).toBe(200);
     const expiredBinding = expiredCommit.response.json['binding_receipt'];
     if (typeof expiredBinding !== 'string') throw new Error('Expired binding receipt missing');
-    const expiredClaims = await verifyDisasterBindingReceipt(expiredBinding, runtime.config, new Date());
+    const expiredContext = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const expiredValidationNow = new Date(expiredContext.trustedTime * 1000);
+    const expiredClaims = await verifyDisasterBindingReceipt(expiredBinding, expiredContext, expiredValidationNow);
     expect((await verifyCenterJwt(expiredBinding)).protectedHeader['typ']).toBe('aikayun-license-disaster-binding+jwt');
     expect(expiredClaims).toMatchObject({ result_mode: 'binding_only', entitlement_state: 'expired', license_status: 'active',
       purpose: 'historical_obligations_identity_rebinding' });
     expect(expiredClaims['new_lease']).toBeUndefined();
     expect(expiredClaims['grants']).toBeUndefined();
-    await expect(verifyLicenseLease(expiredBinding, runtime.config, new Date())).rejects.toThrow();
+    await expect(verifyLicenseLease(expiredBinding, expiredContext, expiredValidationNow)).rejects.toThrow();
     const expiredClaimsRecord = expiredClaims as Record<string, unknown>;
     const bindingWithLease = await signTypedJwt(runtime.config, 'aikayun-license-disaster-binding+jwt', {
       ...expiredClaimsRecord, new_lease: 'forbidden',
     });
-    await expect(verifyDisasterBindingReceipt(bindingWithLease, runtime.config, new Date())).rejects.toThrow();
+    await expect(verifyDisasterBindingReceipt(bindingWithLease, expiredContext, expiredValidationNow)).rejects.toThrow();
     const bindingOverlong = await signTypedJwt(runtime.config, 'aikayun-license-disaster-binding+jwt', {
       ...expiredClaimsRecord, exp: Number(expiredClaimsRecord['iat']) + 601,
     });
-    await expect(verifyDisasterBindingReceipt(bindingOverlong, runtime.config, new Date())).rejects.toThrow();
+    await expect(verifyDisasterBindingReceipt(bindingOverlong, expiredContext, expiredValidationNow)).rejects.toThrow();
     const expiredRevision = await db.selectFrom('licenses').selectAll().where('id', '=', expired.licenseId).executeTakeFirstOrThrow();
     const renewal = { operationId: randomUUID(), licenseId: expired.licenseId, expectedRevision: expiredRevision.revision,
       businessReference: `verified-renewal-${randomUUID()}`, reason: '独立确认续费后恢复新订单权限' };
@@ -976,7 +1111,9 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     expect(revokedCommit.response.status).toBe(200);
     const revokedBinding = revokedCommit.response.json['binding_receipt'];
     if (typeof revokedBinding !== 'string') throw new Error('Revoked binding receipt missing');
-    const revokedClaims = await verifyDisasterBindingReceipt(revokedBinding, runtime.config, new Date());
+    const revokedContext = (await loadTrustedSigningContext(db, runtime.config)).context;
+    const revokedValidationNow = new Date(revokedContext.trustedTime * 1000);
+    const revokedClaims = await verifyDisasterBindingReceipt(revokedBinding, revokedContext, revokedValidationNow);
     expect((await verifyCenterJwt(revokedBinding)).protectedHeader['typ']).toBe('aikayun-license-disaster-binding+jwt');
     expect(revokedClaims).toMatchObject({ result_mode: 'binding_only', entitlement_state: 'revoked', license_status: 'revoked' });
     expect(revokedClaims['grants']).toBeUndefined();
@@ -1103,7 +1240,7 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const proxyServer = await startAppServer(createApp({ config: runtime.config, db: proxyDb }));
     try {
       const lost = await makeCommitAttempt(prepared2, { challengePort: server.port });
-      const ack = proxy.armNextCommitAckDrop();
+      const ack = proxy.armNextCommitAckDrop(1);
       expect((await sendCommit(lost.attempt, target2, proxyServer.port)).status).toBe(500);
       await ack;
       const saved = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', lost.operationId).executeTakeFirstOrThrow();
@@ -1154,14 +1291,14 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       await releaseBlocker.promise;
     });
     await blockerReady.promise;
-    const keyFile = join(scratchDirectory, `signing-${randomUUID()}.pem`);
-    await writeFile(keyFile, runtime.privatePem, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     let child: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     let restarted: Awaited<ReturnType<typeof startChildLicenseServer>> | undefined;
     const killedOperationId = randomUUID();
     try {
       child = await startChildLicenseServer({ databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer,
-        publicOrigin: runtime.config.publicOrigin, keyFile, tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile });
+        publicOrigin: runtime.config.publicOrigin, keyringFile: runtime.keyringFile,
+        offlineRootJwkFile: runtime.offlineRootJwkFile, minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
+        tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile });
       const attempt = await makeCommitAttempt(prepared2, { operationId: killedOperationId, challengePort: server.port });
       const response = sendCommit(attempt.attempt, target2, child.port).catch((error: unknown) => error);
       const [pid] = await waitForLicenseRowWaiterPids(db, 1);
@@ -1180,7 +1317,9 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       releaseBlocker.resolve();
       await blocker;
       restarted = await startChildLicenseServer({ databaseUrl: runtime.config.databaseUrl, issuer: runtime.config.issuer,
-        publicOrigin: runtime.config.publicOrigin, keyFile, tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile });
+        publicOrigin: runtime.config.publicOrigin, keyringFile: runtime.keyringFile,
+        offlineRootJwkFile: runtime.offlineRootJwkFile, minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
+        tlsKeyFile: runtime.config.tlsKeyFile, tlsCertFile: runtime.config.tlsCertFile });
       const retry = await makeCommitAttempt(prepared2, { operationId: killedOperationId, attemptNo: 2, challengePort: server.port });
       expect((await sendCommit(retry.attempt, target2, restarted.port)).status).toBe(200);
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', active2.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('2');
@@ -1520,7 +1659,6 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const historicalApprovalTime = new Date(base.getTime() - 59 * 60 * 1000 - 50 * 1000);
     const request = await disasterApprovalRequest(active, target, { expiresInHours: 1 });
     const historicalAdmin = await createAdminService(policyFile, { controlledTestNow: async () => historicalApprovalTime });
-    let expiryServer: RunningTestServer | undefined;
     try {
       const approval = await historicalAdmin.approveDisasterTransfer({ ...request,
         confirmedRequestDigest: approveDisasterTransferRequestDigest(request) });
@@ -1530,17 +1668,14 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       expect(approvalRow.expires_at.getTime()).toBe(base.getTime() + 10 * 1000);
       const approved: ApprovedDisaster = { active, target, request, approval };
       const prepared = await prepare(approved);
-      const commitTime = new Date(base.getTime() + 20 * 1000);
-      expiryServer = await startAppServer(createApp({ config: runtime.config, db, now: async () => commitTime }));
-      const rejectedCommit = await commit(prepared, { challengePort: expiryServer.port }, expiryServer.port);
+      await new Promise((resolve) => setTimeout(resolve, 15_000));
+      const rejectedCommit = await commit(prepared);
       expect(rejectedCommit.response.status).toBe(409);
       expect(typeof rejectedCommit.response.json['operation_receipt']).toBe('string');
       expect(rejectedCommit.response.json).not.toHaveProperty('transfer_receipt');
       expect(rejectedCommit.response.json).not.toHaveProperty('binding_receipt');
       expect(rejectedCommit.response.json).not.toHaveProperty('disaster_transfer_ticket');
-      const rejected = await jwtVerify(rejectedCommit.response.json['operation_receipt'] as string, runtime.config.signingPublicKey, {
-        algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce', currentDate: commitTime,
-      });
+      const rejected = await verifyCenterJwt(rejectedCommit.response.json['operation_receipt'] as string);
       expect(rejected.payload).toMatchObject({ state: 'rejected', outcome_code: 'DISASTER_APPROVAL_INVALID' });
       const plan = await db.selectFrom('license_disaster_transfer_plans').selectAll()
         .where('approval_id', '=', approval.operationId).executeTakeFirstOrThrow();
@@ -1551,7 +1686,6 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
         .where('identity_jkt', '=', target.jkt).execute()).toHaveLength(0);
     } finally {
-      await expiryServer?.stop();
       await historicalAdmin.close();
     }
   });

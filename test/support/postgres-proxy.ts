@@ -29,6 +29,7 @@ function parseRegularMessages(buffer: Buffer): { messages: Buffer[]; rest: Buffe
 export class CommitAckDropProxy {
   private server?: net.Server;
   private armed = false;
+  private commitsToPass = 0;
   private droppedResolve?: () => void;
   private droppedPromise?: Promise<void>;
   private readonly sockets = new Set<Socket>();
@@ -58,9 +59,11 @@ export class CommitAckDropProxy {
     this.port = (this.server.address() as net.AddressInfo).port;
   }
 
-  armNextCommitAckDrop(): Promise<void> {
+  armNextCommitAckDrop(commitsToPass = 0): Promise<void> {
     if (this.armed) throw new Error('Commit-ack fault already armed');
+    if (!Number.isSafeInteger(commitsToPass) || commitsToPass < 0) throw new Error('Invalid commit skip count');
     this.armed = true;
+    this.commitsToPass = commitsToPass;
     this.droppedPromise = new Promise<void>((resolve) => { this.droppedResolve = resolve; });
     return this.droppedPromise;
   }
@@ -91,8 +94,11 @@ export class CommitAckDropProxy {
       if (this.armed && type === 0x51) {
         const query = message.subarray(5).toString('utf8').replace(/\0+$/, '').trim();
         if (/^COMMIT\s*;?$/i.test(query)) {
-          this.armed = false;
-          state.droppingCommitReply = true;
+          if (this.commitsToPass > 0) this.commitsToPass -= 1;
+          else {
+            this.armed = false;
+            state.droppingCommitReply = true;
+          }
         }
       }
       state.upstream.write(message);

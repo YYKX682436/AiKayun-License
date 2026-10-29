@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import type { RuntimeConfig } from './config.js';
 import { signTypedJwt } from './crypto/jwt.js';
 import {
   assertExactClaims, assertIntegerClaim, assertStringClaim, verifyTypedJwt, verifyTypedJwtWithResolver,
 } from './crypto/jwt.js';
 import type { TrustedSigningKeyResolver, VerifiedJwt } from './crypto/jwt.js';
+import type { SigningContext, VerificationContext } from './crypto/signing-types.js';
 import type { BillingPlan } from './entitlements/calendar.js';
 
 export interface LeaseInput {
@@ -21,15 +21,15 @@ export interface LeaseInput {
   now: Date;
 }
 
-export async function signLicenseLease(config: RuntimeConfig, input: LeaseInput): Promise<{ token: string; exp: number; iat: number }> {
+export async function signLicenseLease(signer: SigningContext, input: LeaseInput): Promise<{ token: string; exp: number; iat: number }> {
   const iat = Math.floor(input.now.getTime() / 1000);
   const subscriptionEnd = Math.floor(input.subscriptionEnd.getTime() / 1000);
   const exp = Math.min(iat + 7 * 24 * 60 * 60, subscriptionEnd);
   if (exp <= iat) throw new Error('Cannot sign an expired lease');
   const renewAfter = Math.min(iat + 6 * 60 * 60, exp);
-  const token = await signTypedJwt(config, 'aikayun-license+jwt', {
+  const token = await signTypedJwt(signer, 'aikayun-license+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.licenseId,
     jti: randomUUID(),
@@ -51,7 +51,7 @@ export async function signLicenseLease(config: RuntimeConfig, input: LeaseInput)
   return { token, exp, iat };
 }
 
-export async function signStatusReceipt(config: RuntimeConfig, input: {
+export async function signStatusReceipt(signer: SigningContext, input: {
   licenseId: string;
   instanceId: string;
   identityJkt: string;
@@ -65,9 +65,9 @@ export async function signStatusReceipt(config: RuntimeConfig, input: {
   now: Date;
 }): Promise<string> {
   const iat = Math.floor(input.now.getTime() / 1000);
-  return signTypedJwt(config, 'aikayun-license-status+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-status+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.licenseId,
     jti: randomUUID(),
@@ -88,7 +88,7 @@ export async function signStatusReceipt(config: RuntimeConfig, input: {
 
 export type OperationState = 'not_found' | 'committed' | 'rejected' | 'cancelled';
 
-export async function signOperationReceipt(config: RuntimeConfig, input: {
+export async function signOperationReceipt(signer: SigningContext, input: {
   licenseId: string;
   identityJkt: string;
   operationId: string;
@@ -105,9 +105,9 @@ export async function signOperationReceipt(config: RuntimeConfig, input: {
   now: Date;
 }): Promise<string> {
   const iat = Math.floor(input.now.getTime() / 1000);
-  return signTypedJwt(config, 'aikayun-license-operation+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-operation+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.licenseId,
     jti: randomUUID(),
@@ -148,13 +148,13 @@ export interface TransferTicketClaims {
   entitlement_revision: string;
 }
 
-export async function signTransferTicket(config: RuntimeConfig, input: TransferTicketClaims & { now: Date }): Promise<string> {
+export async function signTransferTicket(signer: SigningContext, input: TransferTicketClaims & { now: Date }): Promise<string> {
   const iat = Math.floor(input.now.getTime() / 1000);
   const claims = { ...input } as Record<string, unknown>;
   delete claims['now'];
-  return signTypedJwt(config, 'aikayun-license-transfer-ticket+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-transfer-ticket+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.license_id,
     jti: input.plan_id,
@@ -167,7 +167,7 @@ export async function signTransferTicket(config: RuntimeConfig, input: TransferT
 
 export async function verifyTransferTicket(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   validationTime: Date,
 ): Promise<{ token: string; claims: Record<string, unknown>; expired: boolean }> {
   if (typeof token !== 'string') throw new Error('Invalid transfer ticket');
@@ -187,7 +187,7 @@ export async function verifyTransferTicket(
     'license_id', 'database_id', 'source_instance_id', 'source_identity_jkt', 'source_activation_generation',
     'target_instance_id', 'target_identity_jkt', 'expected_binding_revision', 'expected_revision', 'entitlement_revision',
   ];
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license-transfer-ticket+jwt', names, new Date(issuedAt * 1000));
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license-transfer-ticket+jwt', names, validationTime, true);
   assertExactClaims(verified.claims, names);
   if (assertIntegerClaim(verified.claims, 'v') !== 1 || assertStringClaim(verified.claims, 'sub', 36) !== assertStringClaim(verified.claims, 'license_id', 36) ||
     assertStringClaim(verified.claims, 'jti', 36) !== assertStringClaim(verified.claims, 'plan_id', 36) ||
@@ -211,7 +211,7 @@ export async function verifyTransferTicket(
   return { token, claims: verified.claims, expired: nowSeconds >= exp };
 }
 
-export async function signTransferReceipt(config: RuntimeConfig, input: {
+export async function signTransferReceipt(signer: SigningContext, input: {
   licenseId: string;
   databaseId: string;
   sourceInstanceId: string;
@@ -235,9 +235,9 @@ export async function signTransferReceipt(config: RuntimeConfig, input: {
   const iat = Math.floor(input.now.getTime() / 1000);
   const exp = Math.min(iat + 10 * 60, Math.floor(input.subscriptionEnd.getTime() / 1000));
   if (exp <= iat) throw new Error('Cannot sign an expired transfer receipt');
-  return signTypedJwt(config, 'aikayun-license-transfer+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-transfer+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.licenseId,
     jti: randomUUID(),
@@ -313,10 +313,10 @@ function assertDigest(claims: Record<string, unknown>, name: string): string {
 
 export async function verifyLicenseLease(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   now: Date,
 ): Promise<Record<string, unknown>> {
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license+jwt', [...leaseClaims], now);
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license+jwt', [...leaseClaims], now);
   return validateLicenseLeaseClaims(verified, now);
 }
 
@@ -361,10 +361,10 @@ function validateLicenseLeaseClaims(verified: VerifiedJwt, now: Date): Record<st
 
 export async function verifyTransferReceipt(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   now: Date,
 ): Promise<Record<string, unknown>> {
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license-transfer+jwt', [...transferReceiptClaims], now);
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license-transfer+jwt', [...transferReceiptClaims], now);
   assertExactClaims(verified.claims, transferReceiptClaims);
   const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);
   if (assertIntegerClaim(verified.claims, 'v') !== 1 || verified.claims['aud'] !== 'aikayun-commerce' ||
@@ -383,7 +383,7 @@ export async function verifyTransferReceipt(
   if (targetGeneration !== sourceGeneration + 1n || resultRevision !== expectedRevision + 1n ||
     verified.claims['source_identity_jkt'] === verified.claims['target_identity_jkt'] || subscriptionEnd <= iat ||
     exp !== Math.min(iat + 10 * 60, subscriptionEnd)) throw new Error('Invalid transfer receipt binding');
-  const nested = await verifyLicenseLease(verified.claims['new_lease'], config, now);
+  const nested = await verifyLicenseLease(verified.claims['new_lease'], context, now);
   if (nested['sub'] !== verified.claims['license_id'] || nested['database_id'] !== verified.claims['database_id'] ||
     nested['instance_id'] !== verified.claims['target_instance_id'] || nested['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
     nested['activation_generation'] !== verified.claims['target_activation_generation'] ||
@@ -424,15 +424,15 @@ const decimalClaim = /^(0|[1-9][0-9]{0,18})$/;
 const digestClaim = /^[A-Za-z0-9_-]{43}$/;
 
 export async function signDisasterTransferTicket(
-  config: RuntimeConfig,
+  signer: SigningContext,
   input: DisasterTransferTicketClaims & { now: Date },
 ): Promise<string> {
   const iat = Math.floor(input.now.getTime() / 1000);
   const claims = { ...input } as Record<string, unknown>;
   delete claims['now'];
-  return signTypedJwt(config, 'aikayun-license-disaster-transfer-ticket+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-disaster-transfer-ticket+jwt', {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.license_id,
     jti: input.plan_id,
@@ -445,7 +445,7 @@ export async function signDisasterTransferTicket(
 
 export async function verifyDisasterTransferTicket(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   validationTime: Date,
 ): Promise<{ token: string; claims: Record<string, unknown>; expired: boolean }> {
   if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > 16 * 1024) throw new Error('Invalid disaster transfer ticket');
@@ -466,7 +466,7 @@ export async function verifyDisasterTransferTicket(
     'source_instance_id', 'source_identity_jkt', 'source_activation_generation', 'target_instance_id',
     'target_identity_jkt', 'expected_binding_revision', 'expected_revision', 'entitlement_revision',
   ];
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-transfer-ticket+jwt', names, new Date(issuedAt * 1000));
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license-disaster-transfer-ticket+jwt', names, validationTime, true);
   assertExactClaims(verified.claims, names);
   if (assertIntegerClaim(verified.claims, 'v') !== 1 || assertStringClaim(verified.claims, 'sub', 36) !== assertStringClaim(verified.claims, 'license_id', 36) ||
     assertStringClaim(verified.claims, 'jti', 36) !== assertStringClaim(verified.claims, 'plan_id', 36) ||
@@ -492,7 +492,7 @@ export async function verifyDisasterTransferTicket(
   return { token, claims: verified.claims, expired: Math.floor(validationTime.getTime() / 1000) >= assertIntegerClaim(verified.claims, 'exp') };
 }
 
-export async function signDisasterTransferResult(config: RuntimeConfig, input: {
+export async function signDisasterTransferResult(signer: SigningContext, input: {
   mode: 'active_lease' | 'binding_only';
   licenseId: string;
   databaseId: string;
@@ -524,7 +524,7 @@ export async function signDisasterTransferResult(config: RuntimeConfig, input: {
   if (exp <= iat) throw new Error('Cannot sign an expired disaster transfer result');
   const binding = {
     v: 1,
-    iss: config.issuer,
+    iss: signer.issuer,
     aud: 'aikayun-commerce',
     sub: input.licenseId,
     jti: randomUUID(),
@@ -553,7 +553,7 @@ export async function signDisasterTransferResult(config: RuntimeConfig, input: {
   };
   if (input.mode === 'active_lease') {
     if (!input.lease || input.licenseStatus !== 'active') throw new Error('Active disaster result requires an active lease');
-    return signTypedJwt(config, 'aikayun-license-disaster-transfer+jwt', {
+    return signTypedJwt(signer, 'aikayun-license-disaster-transfer+jwt', {
       ...binding,
       result_mode: 'active_lease',
       license_status: 'active',
@@ -561,7 +561,7 @@ export async function signDisasterTransferResult(config: RuntimeConfig, input: {
     });
   }
   const entitlementState = input.licenseStatus === 'revoked' ? 'revoked' : 'expired';
-  return signTypedJwt(config, 'aikayun-license-disaster-binding+jwt', {
+  return signTypedJwt(signer, 'aikayun-license-disaster-binding+jwt', {
     ...binding,
     result_mode: 'binding_only',
     purpose: 'historical_obligations_identity_rebinding',
@@ -598,11 +598,11 @@ function validateDisasterResultBinding(claims: Record<string, unknown>): void {
 
 export async function verifyDisasterTransferReceipt(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   now: Date,
 ): Promise<Record<string, unknown>> {
   const claims = [...disasterResultClaims, 'result_mode', 'license_status', 'new_lease'];
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-transfer+jwt', claims, now);
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license-disaster-transfer+jwt', claims, now);
   assertExactClaims(verified.claims, claims);
   validateDisasterResultBinding(verified.claims);
   const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);
@@ -616,7 +616,7 @@ export async function verifyDisasterTransferReceipt(
   const subscriptionEnd = assertIntegerClaim(verified.claims, 'subscription_end', 1);
   if (targetGeneration !== sourceGeneration + 1n || resultRevision !== expectedRevision + 1n || subscriptionEnd <= iat ||
     exp !== Math.min(iat + 10 * 60, subscriptionEnd)) throw new Error('Invalid active disaster transfer lifetime or revision');
-  const nested = await verifyLicenseLease(verified.claims['new_lease'], config, now);
+  const nested = await verifyLicenseLease(verified.claims['new_lease'], context, now);
   if (nested['sub'] !== verified.claims['sub'] || nested['sub'] !== verified.claims['license_id'] ||
     nested['database_id'] !== verified.claims['database_id'] || nested['instance_id'] !== verified.claims['target_instance_id'] ||
     nested['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
@@ -632,11 +632,11 @@ export async function verifyDisasterTransferReceipt(
 
 export async function verifyDisasterBindingReceipt(
   token: unknown,
-  config: RuntimeConfig,
+  context: VerificationContext,
   now: Date,
 ): Promise<Record<string, unknown>> {
   const claims = [...disasterResultClaims, 'result_mode', 'purpose', 'entitlement_state', 'license_status'];
-  const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-binding+jwt', claims, now);
+  const verified = await verifyTypedJwt(token, context, 'aikayun-license-disaster-binding+jwt', claims, now);
   assertExactClaims(verified.claims, claims);
   validateDisasterResultBinding(verified.claims);
   const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);

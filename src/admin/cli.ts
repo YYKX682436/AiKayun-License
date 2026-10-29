@@ -5,6 +5,18 @@ import { AdminOperationError, createAdminService, createLicenseRequestDigest, is
   approveTimeResetRequestDigest, revokeTimeResetApprovalRequestDigest,
   type AdminOperationResult } from './service.js';
 import { AdminAccessError } from './policy.js';
+import { openAdminSession } from './policy.js';
+import {
+  acceptSignerTrustBundleRequestDigest,
+  createSignerAdminService,
+  initializeSignerRequestDigest,
+  rotateSignerRequestDigest,
+} from './signing-service.js';
+import type { AcceptSignerTrustBundleRequest, InitializeSignerRequest, RotateSignerRequest } from './signing-service.js';
+import { loadSignerRuntimeConfig } from '../config.js';
+import { constants as fsConstants } from 'node:fs';
+import { open } from 'node:fs/promises';
+import { trustBundleArtifactDigest } from '../trust/trust-bundle.js';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -30,6 +42,12 @@ const helpText = `艾卡云授权中心本机管理 CLI（仅隔离测试/受控
   license get --license-id UUID
   operation get --operation-id UUID
   audit list --license-id UUID [--limit 50]
+  signer get
+  signer operation --operation-id UUID
+  signer audit [--limit 50]
+  signer initialize --operation-id UUID --expected-revision 0 --active-kid JKT --bundle-file PATH --reason TEXT [--confirm-digest DIGEST]
+  signer accept-bundle --operation-id UUID --expected-revision N --bundle-file PATH --reason TEXT [--confirm-digest DIGEST]
+  signer rotate --operation-id UUID --expected-revision N --target-kid JKT --bundle-version N --artifact-sha256 DIGEST --reason TEXT [--confirm-digest DIGEST]
 
 CLI 不提供 actor 参数。执行身份来自 allowlisted OS UID 与已认证的独立 PostgreSQL session_user；reason 只是审计备注。
 `;
@@ -84,6 +102,152 @@ function writeReview(stream: OutputStream, action: string, requestDigest: string
 function withoutSecret(result: AdminOperationResult): Omit<AdminOperationResult, 'activationCode'> {
   const { activationCode: _activationCode, ...safe } = result;
   return safe;
+}
+
+async function readSignerBundleFile(path: string): Promise<string> {
+  if (!path.startsWith('/')) fail('SIGNER_BUNDLE_PATH_MUST_BE_ABSOLUTE');
+  let handle;
+  try {
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW;
+    handle = await open(path, fsConstants.O_RDONLY | noFollow);
+    const info = await handle.stat();
+    if (!info.isFile() || info.size < 1 || info.size > 16 * 1024 ||
+      (process.platform !== 'win32' && info.nlink !== 1)) fail('SIGNER_BUNDLE_FILE_INVALID');
+    const contents = await handle.readFile({ encoding: 'utf8' });
+    const token = contents.trim();
+    if (token.length < 1 || token.length > 16 * 1024 || /\s/.test(token)) fail('SIGNER_BUNDLE_FILE_INVALID');
+    return token;
+  } catch (error) {
+    if (error instanceof AdminOperationError) throw error;
+    throw new AdminOperationError('SIGNER_BUNDLE_FILE_INVALID');
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function withSignerAdminService<T>(callback: (service: ReturnType<typeof createSignerAdminService>) => Promise<T>): Promise<T> {
+  const session = await openAdminSession();
+  try {
+    const config = await loadSignerRuntimeConfig();
+    const service = createSignerAdminService(session, config);
+    return await callback(service);
+  } finally {
+    await session.close();
+  }
+}
+
+async function runSignerRead(argv: string[], stdout: OutputStream): Promise<number> {
+  const [domain, verb, ...flagArgs] = argv;
+  if (domain !== 'signer' || !verb) fail('ADMIN_COMMAND_INVALID');
+  const options = parseFlags(flagArgs);
+  const session = await openAdminSession();
+  try {
+    if (verb === 'operation') {
+      assertAllowedOptions(options, ['operation-id']);
+      const operationId = option(options, 'operation-id');
+      const operation = await session.db.selectFrom('license_signer_operations').selectAll()
+        .where('operation_id', '=', operationId).executeTakeFirst();
+      if (!operation) {
+        printJson(stdout, { found: false });
+        return 1;
+      }
+      const audit = await session.db.selectFrom('license_signer_audit_events').selectAll()
+        .where('operation_id', '=', operationId).executeTakeFirst();
+      printJson(stdout, { found: true, operation, audit: audit ?? null });
+      return 0;
+    }
+    if (verb === 'audit') {
+      assertAllowedOptions(options, ['limit']);
+      const limitText = optionalOption(options, 'limit');
+      const limit = limitText === undefined ? 50 : Number(limitText);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) fail('SIGNER_AUDIT_LIMIT_INVALID');
+      const events = await session.db.selectFrom('license_signer_audit_events').selectAll()
+        .orderBy('created_at', 'desc').limit(limit).execute();
+      printJson(stdout, events);
+      return 0;
+    }
+    if (verb !== 'get') fail('ADMIN_COMMAND_INVALID');
+    assertAllowedOptions(options, []);
+    const authority = await session.db.selectFrom('license_signer_authority').selectAll()
+      .where('singleton', '=', true).executeTakeFirst();
+    if (!authority) fail('SIGNER_AUTHORITY_ROW_MISSING');
+    printJson(stdout, {
+      activeSigningKid: authority.active_signing_kid,
+      signerRevision: authority.signer_revision.toString(),
+      bundleVersion: authority.bundle_version,
+      artifactSha256: authority.artifact_sha256,
+      previousSigningKid: authority.previous_signing_kid,
+      changedAt: authority.changed_at.toISOString(),
+    });
+    return 0;
+  } finally {
+    await session.close();
+  }
+}
+
+async function runSignerMutation(argv: string[], stdout: OutputStream): Promise<number> {
+  const [domain, verb, ...flagArgs] = argv;
+  if (domain !== 'signer' || !verb) fail('ADMIN_COMMAND_INVALID');
+  const options = parseFlags(flagArgs);
+  const confirm = optionalOption(options, 'confirm-digest');
+  let action = '';
+  let digest = '';
+  let fields: Record<string, unknown> = {};
+  let invoke: (service: ReturnType<typeof createSignerAdminService>) => ReturnType<ReturnType<typeof createSignerAdminService>['initialize']>;
+
+  if (verb === 'initialize') {
+    assertAllowedOptions(options, ['operation-id', 'expected-revision', 'active-kid', 'bundle-file', 'reason', 'confirm-digest']);
+    const request: Omit<InitializeSignerRequest, 'confirmedRequestDigest' | 'rolloutGate'> = {
+      operationId: option(options, 'operation-id'),
+      expectedSignerRevision: option(options, 'expected-revision'),
+      activeKid: option(options, 'active-kid'),
+      bundleJws: await readSignerBundleFile(option(options, 'bundle-file')),
+      reason: option(options, 'reason'),
+    };
+    action = 'signer_initialize';
+    digest = initializeSignerRequestDigest(request);
+    fields = { operationId: request.operationId, expectedSignerRevision: request.expectedSignerRevision,
+      activeKid: request.activeKid, bundleSha256: trustBundleArtifactDigest(request.bundleJws), reason: request.reason };
+    invoke = (service) => service.initialize({ ...request, rolloutGate: 'isolated-development-confirmed', confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'accept-bundle') {
+    assertAllowedOptions(options, ['operation-id', 'expected-revision', 'bundle-file', 'reason', 'confirm-digest']);
+    const request: Omit<AcceptSignerTrustBundleRequest, 'confirmedRequestDigest' | 'rolloutGate'> = {
+      operationId: option(options, 'operation-id'),
+      expectedSignerRevision: option(options, 'expected-revision'),
+      bundleJws: await readSignerBundleFile(option(options, 'bundle-file')),
+      reason: option(options, 'reason'),
+    };
+    action = 'signer_trust_bundle_accept';
+    digest = acceptSignerTrustBundleRequestDigest(request);
+    fields = { operationId: request.operationId, expectedSignerRevision: request.expectedSignerRevision,
+      bundleSha256: trustBundleArtifactDigest(request.bundleJws), reason: request.reason };
+    invoke = (service) => service.acceptTrustBundle({ ...request, rolloutGate: 'isolated-development-confirmed', confirmedRequestDigest: confirm ?? '' });
+  } else if (verb === 'rotate') {
+    assertAllowedOptions(options, ['operation-id', 'expected-revision', 'target-kid', 'bundle-version', 'artifact-sha256', 'reason', 'confirm-digest']);
+    const request: Omit<RotateSignerRequest, 'confirmedRequestDigest' | 'rolloutGate'> = {
+      operationId: option(options, 'operation-id'),
+      expectedSignerRevision: option(options, 'expected-revision'),
+      targetKid: option(options, 'target-kid'),
+      bundleVersion: option(options, 'bundle-version'),
+      artifactSha256: option(options, 'artifact-sha256'),
+      reason: option(options, 'reason'),
+    };
+    action = 'signer_key_rotate';
+    digest = rotateSignerRequestDigest(request);
+    fields = request;
+    invoke = (service) => service.rotate({ ...request, rolloutGate: 'isolated-development-confirmed', confirmedRequestDigest: confirm ?? '' });
+  } else {
+    fail('ADMIN_COMMAND_INVALID');
+  }
+
+  if (!confirm) {
+    writeReview(stdout, action, digest, fields);
+    return 0;
+  }
+  if (confirm !== digest) fail('ADMIN_CONFIRMATION_DIGEST_MISMATCH');
+  const result = await withSignerAdminService(invoke);
+  printJson(stdout, result);
+  return result.state === 'succeeded' ? 0 : 2;
 }
 
 async function runMutation(argv: string[], stdout: OutputStream): Promise<number> {
@@ -349,6 +513,10 @@ export async function runAdminCli(
     return 0;
   }
   try {
+    if (argv[0] === 'signer') {
+      if (argv[1] === 'get' || argv[1] === 'operation' || argv[1] === 'audit') return await runSignerRead(argv, stdout);
+      return await runSignerMutation(argv, stdout);
+    }
     if (['create', 'issue-code', 'renew', 'revoke', 'restore', 'approve-transfer', 'revoke-transfer-approval',
       'approve-disaster-transfer', 'revoke-disaster-transfer-approval', 'approve-time-reset',
       'revoke-time-reset-approval'].includes(argv[1] ?? '') && argv[0] === 'license') {

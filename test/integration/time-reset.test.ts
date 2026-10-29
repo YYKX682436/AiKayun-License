@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
-import { decodeJwt } from 'jose';
+import { decodeJwt, decodeProtectedHeader } from 'jose';
 import { sql, type Kysely } from 'kysely';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
@@ -17,6 +17,7 @@ import {
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
 import type { Database } from '../../src/db/types.js';
 import { verifyTimeAnchor, verifyTimeResetReceipt } from '../../src/crypto/time-reset.js';
+import { loadTrustedSigningContext } from '../../src/crypto/signing-authority.js';
 import { activationIntentDigest, timeResetIntentDigest } from '../../src/intent.js';
 import { createActivationCode, createLicense } from '../fixtures.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
@@ -32,6 +33,7 @@ import {
   type RunningTestServer,
 } from '../support/http.js';
 import { createIdentity, createTestSigningRuntime, newClientNonce, type TestIdentity, type TestSigningRuntime } from '../support/runtime.js';
+import { publishAndRotateTo } from '../support/signing-rotation.js';
 
 interface ActiveLicense {
   licenseId: string;
@@ -280,6 +282,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     runtime = await createTestSigningRuntime();
     db = createDatabase(runtime.config.databaseUrl, 24);
     await migrateToLatest(db);
+    await runtime.initializeAuthority(db);
     server = await startAppServer(createApp({ config: runtime.config, db }));
     scratchDirectory = await mkdtemp(join(tmpdir(), 'aikayun-license-time-reset-'));
     await chmod(scratchDirectory, 0o700);
@@ -420,9 +423,8 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     expect(typeof token).toBe('string');
     const confirmationAnchor = await requestAnchor(server.port, runtime);
     const claims = await verifyTimeResetReceipt(token, {
-      publicKey: runtime.config.signingPublicKey,
+      resolver: runtime.config.resolver,
       issuer: runtime.config.issuer,
-      keyId: runtime.config.signingKeyId,
       trustedServerTime: confirmationAnchor.serverTime,
       expected: {
         license_id: active.licenseId,
@@ -468,7 +470,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', approval.resetOperationId).execute()).toHaveLength(2);
     expect(await db.selectFrom('license_time_reset_events').selectAll().where('operation_id', '=', approval.resetOperationId).where('kind', '=', 'committed').execute()).toHaveLength(1);
     await expect(verifyTimeResetReceipt(token, {
-      publicKey: runtime.config.signingPublicKey, issuer: runtime.config.issuer, keyId: runtime.config.signingKeyId,
+      resolver: runtime.config.resolver, issuer: runtime.config.issuer,
       trustedServerTime: confirmationAnchor.serverTime,
       expected: {
         license_id: active.licenseId, database_id: active.databaseId, instance_id: active.instanceId,
@@ -490,8 +492,8 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     const secondReceipt = secondReset.response.json['time_reset_receipt'];
     const finalAnchor = await requestAnchor(server.port, runtime);
     const verifiedSecondReceipt = await verifyTimeResetReceipt(secondReceipt, {
-      publicKey: runtime.config.signingPublicKey, issuer: runtime.config.issuer,
-      keyId: runtime.config.signingKeyId, trustedServerTime: finalAnchor.serverTime,
+      resolver: runtime.config.resolver, issuer: runtime.config.issuer,
+      trustedServerTime: finalAnchor.serverTime,
       expected: {
         license_id: active.licenseId, database_id: active.databaseId, instance_id: active.instanceId,
         identity_jkt: active.identity.jkt, activation_generation: secondApproval.generation,
@@ -509,6 +511,58 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     expect(afterSecondReset.revision).toBe(beforeLicense.revision);
     expect(afterSecondReset.entitlement_revision).toBe(beforeLicense.entitlement_revision);
     expect(afterSecondReset.confirmed_subscription_end).toEqual(beforeLicense.confirmed_subscription_end);
+  });
+
+  it('keeps an A-signed time-reset result immutable and prevents a second epoch after B takes over', async () => {
+    const active = await activate();
+    const approval = await approveReset(active);
+    const anchor = await requestAnchor(server.port, runtime);
+    const committed = await sendApprovedReset(approval, 1, { created: anchorCreatedAt(anchor) });
+    expect(committed.response.status).toBe(200);
+    const originalReceipt = committed.response.json['time_reset_receipt'] as string;
+    expect(decodeProtectedHeader(originalReceipt)['kid']).toBe(runtime.onlineKey.kid);
+    expect((await db.selectFrom('license_activations').select('time_epoch').where('id', '=', active.activationId)
+      .executeTakeFirstOrThrow()).time_epoch).toBe('1');
+
+    const b = await runtime.createOnlineKey();
+    const { context } = await publishAndRotateTo(db, runtime, b, '2');
+    const replay = await sendApprovedReset(approval, 2);
+    expect(replay.response.status).toBe(200);
+    expect(replay.response.json['time_reset_receipt']).toBe(originalReceipt);
+    expect(decodeProtectedHeader(replay.response.json['time_reset_receipt'] as string)['kid']).toBe(runtime.onlineKey.kid);
+    const trusted = await loadTrustedSigningContext(db, runtime.config);
+    const validated = await verifyTimeResetReceipt(originalReceipt, {
+      resolver: trusted.context.resolver!,
+      issuer: runtime.config.issuer,
+      trustedServerTime: trusted.context.trustedTime,
+      expected: {
+        license_id: active.licenseId,
+        database_id: active.databaseId,
+        instance_id: active.instanceId,
+        identity_jkt: active.identity.jkt,
+        activation_generation: approval.generation,
+        management_revision: approval.revision,
+        entitlement_revision: approval.entitlementRevision,
+        old_time_epoch: '0',
+        new_time_epoch: '1',
+        old_watermark_digest: approval.oldWatermarkDigest,
+        operation_id: approval.resetOperationId,
+        intent_digest: approval.intentDigest,
+        request_nonce: committed.attempt.serverNonce,
+        client_nonce: committed.attempt.clientNonce,
+        request_digest: sha256(JSON.stringify(committed.attempt.body)),
+        admin_approval_id: approval.approvalId,
+        admin_operation_id: approval.adminOperationId,
+        admin_approval_digest: approval.requestDigest,
+      },
+    });
+    expect(validated.new_time_epoch).toBe('1');
+    expect((await db.selectFrom('license_signer_authority').select('signer_revision')
+      .where('singleton', '=', true).executeTakeFirstOrThrow()).signer_revision).toBe('2');
+    expect((await db.selectFrom('license_activations').select('time_epoch').where('id', '=', active.activationId)
+      .executeTakeFirstOrThrow()).time_epoch).toBe('1');
+    expect(await db.selectFrom('license_time_reset_events').selectAll()
+      .where('operation_id', '=', approval.resetOperationId).where('kind', '=', 'committed').execute()).toHaveLength(1);
   });
 
   it('refuses revoked approvals and stale management revisions without consuming the challenge or changing epoch', async () => {
@@ -664,7 +718,7 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
     const proxiedServer = await startAppServer(createApp({ config: runtime.config, db: proxiedDb }));
     try {
       const attempt = await makeResetAttempt(approval, 1, { port: proxiedServer.port });
-      const dropped = proxy.armNextCommitAckDrop();
+      const dropped = proxy.armNextCommitAckDrop(1);
       let response: HttpResponse | undefined;
       let requestError: unknown;
       try {
@@ -732,14 +786,13 @@ describe('trusted center time bootstrap and audited time reset over HTTPS/Postgr
   it('leaves no partial reset after SIGKILL during its PostgreSQL transaction and accepts the same operation on retry', async () => {
     const active = await activate();
     const approval = await approveReset(active);
-    const keyFile = join(scratchDirectory, `test-signing-${randomUUID()}.pem`);
-    await writeFile(keyFile, runtime.privatePem, { mode: 0o600 });
-    await chmod(keyFile, 0o600);
     const child = await startChildLicenseServer({
       databaseUrl: runtime.config.databaseUrl,
       issuer: runtime.config.issuer,
       publicOrigin: runtime.config.publicOrigin,
-      keyFile,
+      keyringFile: runtime.keyringFile,
+      offlineRootJwkFile: runtime.offlineRootJwkFile,
+      minimumTrustBundleVersion: runtime.config.minimumTrustBundleVersion,
       tlsKeyFile: runtime.config.tlsKeyFile,
       tlsCertFile: runtime.config.tlsCertFile,
     });
