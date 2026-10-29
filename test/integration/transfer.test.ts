@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createPrivateKey, randomBytes, randomUUID, sign as cryptoSign } from 'node:crypto';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { userInfo, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +18,8 @@ import {
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
 import type { Database } from '../../src/db/types.js';
 import { activationIntentDigest, renewalIntentDigest, transferCommitIntentDigest, transferPrepareIntentDigest } from '../../src/intent.js';
-import { signTransferTicket } from '../../src/receipts.js';
+import { signTypedJwt } from '../../src/crypto/jwt.js';
+import { signTransferTicket, verifyLicenseLease, verifyTransferReceipt } from '../../src/receipts.js';
 import { createActivationCode, createLicense, getDbNow } from '../fixtures.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
@@ -65,6 +66,14 @@ function sha256(value: string | Buffer): string {
 
 function decimalPlusOne(value: string): string {
   return (BigInt(value) + 1n).toString();
+}
+
+function signRawToken(runtime: TestSigningRuntime, typ: string, claimsJson: string, alg = 'Ed25519'): string {
+  const header = Buffer.from(JSON.stringify({ alg, kid: runtime.config.signingKeyId, typ })).toString('base64url');
+  const payload = Buffer.from(claimsJson).toString('base64url');
+  const content = `${header}.${payload}`;
+  const signature = cryptoSign(null, Buffer.from(content), createPrivateKey(runtime.privatePem)).toString('base64url');
+  return `${content}.${signature}`;
 }
 
 describe('normal license transfer over real PostgreSQL and HTTPS', () => {
@@ -203,22 +212,23 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     const operationId = input.operationId ?? randomUUID();
     const targetIdentity = input.targetIdentity ?? prepared.target;
     const ticket = input.ticket ?? prepared.ticket;
+    const targetInstanceId = prepared.active.instanceId;
     const approvalId = input.approvalId ?? prepared.approvalId;
     const prepareOperationId = input.prepareOperationId ?? prepared.prepareOperationId;
     const intentDigest = transferCommitIntentDigest({
       licenseId: prepared.active.licenseId, databaseId: prepared.active.databaseId,
-      instanceId: prepared.active.instanceId, targetIdentityJkt: targetIdentity.jkt,
+      instanceId: targetInstanceId, targetIdentityJkt: targetIdentity.jkt,
       approvalId, prepareOperationId, ticketDigest: sha256(ticket),
     });
     const requestServer = input.requestServer ?? server;
     const challenge = await requestChallenge({
       port: requestServer.port, config: runtime.config, identity: targetIdentity,
-      operation: 'transfer_commit', operationId, intentDigest, instanceId: prepared.active.instanceId,
+      operation: 'transfer_commit', operationId, intentDigest, instanceId: targetInstanceId,
     });
     const body = {
       ...buildChallengeBoundBody({
         challenge: challenge.token, operationId, intentDigest, attemptNo: input.attemptNo ?? 1,
-        instanceId: prepared.active.instanceId, identity: targetIdentity,
+        instanceId: targetInstanceId, identity: targetIdentity,
         licenseId: prepared.active.licenseId, databaseId: prepared.active.databaseId,
       }),
       approval_id: approvalId,
@@ -255,13 +265,14 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
   }
 
   async function queryOperation(prepared: PreparedTransfer, operationId: string, intentDigest: string, attemptNo: number) {
+    const targetInstanceId = prepared.active.instanceId;
     const challenge = await requestChallenge({
       port: server.port, config: runtime.config, identity: prepared.target, operation: 'query',
-      operationId, intentDigest, instanceId: prepared.active.instanceId,
+      operationId, intentDigest, instanceId: targetInstanceId,
     });
     const body = buildChallengeBoundBody({
       challenge: challenge.token, operationId, intentDigest, attemptNo,
-      instanceId: prepared.active.instanceId, identity: prepared.target,
+      instanceId: targetInstanceId, identity: prepared.target,
       licenseId: prepared.active.licenseId, databaseId: prepared.active.databaseId,
     });
     return signPost({
@@ -365,10 +376,19 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     const approval = await approve(active, target);
     const missing = await makePrepareAttempt(active, target, randomUUID());
     const missingResponse = await sendPrepare(missing.attempt, active.source);
-    expect(missingResponse.status).toBe(409);
-    expect((await verifyCenterJwt(missingResponse.json['operation_receipt'] as string)).payload['outcome_code'])
-      .toBe('TRANSFER_APPROVAL_INVALID');
+    expect(missingResponse.status).toBe(403);
+    expect(missingResponse.json['error']).toEqual({ code: 'TRANSFER_PREPARE_FORBIDDEN' });
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', missing.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', missing.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', missing.operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_transfer_plans').selectAll().where('license_id', '=', active.licenseId).execute()).toHaveLength(0);
+
+    const rogue = await createIdentity();
+    const wrongSource = await makePrepareAttempt(active, target, approval.operationId, { sourceIdentity: rogue });
+    expect((await sendPrepare(wrongSource.attempt, rogue)).status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', wrongSource.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', wrongSource.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', wrongSource.operationId).execute()).toHaveLength(0);
 
     const forged = await makePrepareAttempt(active, target, approval.operationId, {
       targetPublicJwk: (await createIdentity()).publicJwk,
@@ -376,6 +396,11 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     expect((await sendPrepare(forged.attempt, active.source)).status).toBe(409);
     const reusedKey = await makePrepareAttempt(active, active.source, approval.operationId);
     expect((await sendPrepare(reusedKey.attempt, active.source)).status).toBe(409);
+    for (const operationId of [forged.operationId, reusedKey.operationId]) {
+      expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+    }
     expect(await db.selectFrom('license_transfer_plans').selectAll().where('license_id', '=', active.licenseId).execute()).toHaveLength(0);
 
     const { attempt: validAttempt, operationId: validOperationId, intentDigest: validIntent } =
@@ -449,6 +474,60 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
     });
     expect(lease.payload['exp']).toBe(Math.min(Number(lease.payload['iat']) + 7 * 24 * 60 * 60,
       Math.floor(before.confirmed_subscription_end.getTime() / 1000)));
+    const validationNow = new Date();
+    const strictReceipt = await verifyTransferReceipt(receiptToken, runtime.config, validationNow);
+    const strictLease = await verifyLicenseLease(leaseToken, runtime.config, validationNow);
+    expect(strictReceipt['subscription_end']).toBe(strictLease['subscription_end']);
+    expect(strictReceipt['database_id']).toBe(strictLease['database_id']);
+    expect(strictReceipt['entitlement_revision']).toBe(strictLease['entitlement_revision']);
+    await expect(verifyLicenseLease(receiptToken, runtime.config, validationNow)).rejects.toThrow();
+    await expect(verifyTransferReceipt(leaseToken, runtime.config, validationNow)).rejects.toThrow();
+
+    const outerClaims = receipt.payload as Record<string, unknown>;
+    const innerClaims = lease.payload as Record<string, unknown>;
+    const rejectedOuter = async (claims: Record<string, unknown>) => {
+      const forged = await signTypedJwt(runtime.config, 'aikayun-license-transfer+jwt', claims);
+      await expect(verifyTransferReceipt(forged, runtime.config, validationNow)).rejects.toThrow();
+    };
+    for (const [field, value] of [
+      ['sub', randomUUID()],
+      ['license_id', randomUUID()],
+      ['database_id', randomUUID()],
+      ['entitlement_revision', decimalPlusOne(String(outerClaims['entitlement_revision']))],
+      ['subscription_end', Number(outerClaims['subscription_end']) + 3600],
+    ] as const) {
+      await rejectedOuter({ ...outerClaims, [field]: value });
+    }
+    const nestedMismatches: Array<[string, unknown]> = [
+      ['sub', randomUUID()], ['database_id', randomUUID()], ['instance_id', randomUUID()],
+      ['identity_jkt', sha256(randomUUID())], ['activation_generation', '3'],
+      ['entitlement_revision', decimalPlusOne(String(innerClaims['entitlement_revision']))],
+      ['subscription_end', Number(innerClaims['subscription_end']) + 3600],
+      ['request_nonce', sha256(randomUUID())], ['request_digest', sha256(randomUUID())],
+    ];
+    for (const [field, value] of nestedMismatches) {
+      const nestedToken = await signTypedJwt(runtime.config, 'aikayun-license+jwt', { ...innerClaims, [field]: value });
+      await rejectedOuter({ ...outerClaims, new_lease: nestedToken });
+    }
+    const nestedUnknownClaim = await signTypedJwt(runtime.config, 'aikayun-license+jwt', {
+      ...innerClaims, unexpected_claim: true,
+    });
+    await rejectedOuter({ ...outerClaims, new_lease: nestedUnknownClaim });
+    const iat = Number(outerClaims['iat']);
+    await rejectedOuter({ ...outerClaims, unexpected_claim: true });
+    await rejectedOuter({ ...outerClaims, iss: 'https://wrong.example.test' });
+    await rejectedOuter({ ...outerClaims, aud: 'different-commerce' });
+    await rejectedOuter({ ...outerClaims, exp: iat + 601 });
+    await rejectedOuter({ ...outerClaims, nbf: iat - 1 });
+    await rejectedOuter({ ...outerClaims, iat: iat + 600, nbf: iat + 600, exp: iat + 1200 });
+    const wrongType = await signTypedJwt(runtime.config, 'aikayun-license-disaster-transfer+jwt', outerClaims);
+    await expect(verifyTransferReceipt(wrongType, runtime.config, validationNow)).rejects.toThrow();
+    const duplicateClaim = JSON.stringify(outerClaims).replace('"v":1', '"v":1,"v":1');
+    expect(duplicateClaim).not.toBe(JSON.stringify(outerClaims));
+    const duplicateToken = signRawToken(runtime, 'aikayun-license-transfer+jwt', duplicateClaim);
+    await expect(verifyTransferReceipt(duplicateToken, runtime.config, validationNow)).rejects.toThrow();
+    const wrongAlgorithm = signRawToken(runtime, 'aikayun-license-transfer+jwt', JSON.stringify(outerClaims), 'EdDSA');
+    await expect(verifyTransferReceipt(wrongAlgorithm, runtime.config, validationNow)).rejects.toThrow();
     const after = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
     expect(after.current_generation).toBe('2');
     expect(after.revision).toBe(decimalPlusOne(before.revision));
@@ -775,7 +854,10 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       return { ...prepared, response: await sendPrepare(prepared.attempt, active.source) };
     }));
     expect(attempts[winnerIndex]!.response.status).toBe(200);
-    expect(attempts[loserIndex]!.response.status).toBe(409);
+    expect(attempts[loserIndex]!.response.status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', attempts[loserIndex]!.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', attempts[loserIndex]!.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', attempts[loserIndex]!.operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_transfer_plans').selectAll().where('license_id', '=', active.licenseId).execute()).toHaveLength(1);
     const winnerTicket = attempts[winnerIndex]!.response.json['transfer_ticket'];
     if (typeof winnerTicket !== 'string') throw new Error('Winning transfer ticket missing');
@@ -1026,8 +1108,10 @@ describe('normal license transfer over real PostgreSQL and HTTPS', () => {
       licenseId: sourceB.licenseId, databaseId: sourceB.databaseId,
     });
     const response = await sendPrepare(crossLicense.attempt, sourceA.source);
-    expect(response.status).toBe(409);
-    expect((await verifyCenterJwt(response.json['operation_receipt'] as string)).payload['outcome_code']).toBe('TRANSFER_APPROVAL_INVALID');
+    expect(response.status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', crossLicense.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', crossLicense.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', crossLicense.operationId).execute()).toHaveLength(0);
     expect((await db.selectFrom('licenses').selectAll().where('id', '=', sourceB.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('1');
 
     const thirdLicense = await createLicense(db);

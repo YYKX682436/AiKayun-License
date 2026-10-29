@@ -268,11 +268,13 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
     }).execute()).rejects.toMatchObject({ code: '23505' });
 
     const revokedAttempt = await activate(created.licenseId, firstCode);
-    expect(revokedAttempt.response.status).toBe(409);
-    const rejectedOperation = await jwtVerify(revokedAttempt.response.json['operation_receipt'] as string, runtime.config.signingPublicKey, {
-      algorithms: ['Ed25519'], issuer: runtime.config.issuer, audience: 'aikayun-commerce',
-    });
-    expect(rejectedOperation.payload['outcome_code']).toBe('ACTIVATION_CODE_INVALID');
+    expect(revokedAttempt.response.status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', revokedAttempt.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll()
+      .where('operation_id', '=', revokedAttempt.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll()
+      .where('license_id', '=', created.licenseId).where('operation_id', '=', revokedAttempt.operationId).execute()).toHaveLength(0);
 
     const successfulActivation = await activate(created.licenseId, replacement.activationCode!);
     expect(successfulActivation.response.status).toBe(200);
@@ -296,7 +298,13 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
       expires_at: new Date(now.getTime() - 1000), consumed_at: null, revoked_at: null, created_at: now,
     }).execute();
     const rejected = await activate(created.licenseId, expiredCode);
-    expect(rejected.response.status).toBe(409);
+    expect(rejected.response.status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', rejected.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll()
+      .where('operation_id', '=', rejected.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll()
+      .where('license_id', '=', created.licenseId).where('operation_id', '=', rejected.operationId).execute()).toHaveLength(0);
     expect((await db.selectFrom('license_activations').selectAll().where('license_id', '=', created.licenseId).execute())).toHaveLength(0);
     const codeIssue = await service.issueActivationCode(makeIssueRequest(created.licenseId, '1'));
     expect(codeIssue.state).toBe('succeeded');

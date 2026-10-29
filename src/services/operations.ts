@@ -545,6 +545,12 @@ export async function processActivation(
     await acquireInstanceLock(trx, input.instance_id);
     const activeActivation = await lockActiveForActivation(trx, input.license_id);
     const now = await databaseNow(trx);
+    const codeHash = sha256Base64url(input.activation_code);
+    const code = await trx.selectFrom('activation_codes').selectAll()
+      .where('token_hash', '=', codeHash).forUpdate().executeTakeFirst();
+    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.revoked_at !== null || code.expires_at.getTime() <= now.getTime()) {
+      throw new LicenseApiError(403, 'ACTIVATION_AUTHORIZATION_INVALID');
+    }
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
     if (license.status !== 'active') {
@@ -561,22 +567,21 @@ export async function processActivation(
       }, now);
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'SUBSCRIPTION_EXPIRED' };
     }
+    const activeInstance = await trx.selectFrom('license_activations').select('license_id')
+      .where('instance_id', '=', input.instance_id).where('state', '=', 'active').executeTakeFirst();
+    if (activeInstance && activeInstance.license_id !== input.license_id) {
+      const token = await terminalOperationReceipt(trx, config, auth, {
+        kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
+        outcomeCode: 'ACTIVATION_INSTANCE_ALREADY_ACTIVE', responseType: 'operation',
+      }, now);
+      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_INSTANCE_ALREADY_ACTIVE' };
+    }
     if (activeActivation || big(license.current_generation) !== 0n) {
       const token = await terminalOperationReceipt(trx, config, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
         outcomeCode: 'ACTIVATION_CONFLICT', responseType: 'operation',
       }, now);
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_CONFLICT' };
-    }
-    const codeHash = sha256Base64url(input.activation_code);
-    const code = await trx.selectFrom('activation_codes').selectAll()
-      .where('token_hash', '=', codeHash).forUpdate().executeTakeFirst();
-    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.revoked_at !== null || code.expires_at.getTime() <= now.getTime()) {
-      const token = await terminalOperationReceipt(trx, config, auth, {
-        kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
-        outcomeCode: 'ACTIVATION_CODE_INVALID', responseType: 'operation',
-      }, now);
-      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_CODE_INVALID' };
     }
     const token = await insertSuccessfulActivation(trx, config, auth, license, input, code, now);
     return { kind: 'response', responseType: 'license', token, state: 'committed', outcomeCode: 'ACTIVATED' };
@@ -720,14 +725,87 @@ export async function queryOperation(
   return db.transaction().execute(async (trx) => {
     await acquireOperationLock(trx, input.operation_id);
     const license = await lockLicense(trx, input.license_id);
-    const existing = await findOperation(trx, input.operation_id);
-    if (existing && existing.actor_jkt !== auth.signature.identityJkt) throw new LicenseApiError(403, 'OPERATION_ACTOR_MISMATCH');
-    if (existing && (existing.intent_digest !== input.intent_digest || existing.license_id !== input.license_id || existing.database_id !== input.database_id)) {
-      throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
-    }
     const activation = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
     if (activation && activation.database_id !== input.database_id) throw new LicenseApiError(409, 'DATABASE_BINDING_MISMATCH');
     const now = await databaseNow(trx);
+    const normalTarget = !activation && license.status === 'active' && license.confirmed_subscription_end.getTime() > now.getTime()
+      ? await sql<{ associated: boolean }>`
+        SELECT EXISTS (
+          SELECT 1
+          FROM license_transfer_approvals AS approval
+          JOIN license_admin_operations AS admin
+            ON admin.operation_id = approval.approval_id
+          JOIN license_activations AS source
+            ON source.license_id = approval.license_id
+            AND source.database_id = approval.database_id
+            AND source.instance_id = approval.source_instance_id
+            AND source.identity_jkt = approval.source_identity_jkt
+            AND source.generation = approval.source_generation
+            AND source.state = 'active'
+          WHERE approval.license_id = ${license.id}
+            AND approval.database_id = ${input.database_id}
+            AND approval.target_instance_id = ${input.instance_id}
+            AND approval.target_identity_jkt = ${auth.signature.identityJkt}
+            AND approval.expected_revision = ${license.revision}
+            AND approval.source_generation = ${license.current_generation}
+            AND approval.expires_at > ${now}
+            AND admin.action = 'transfer_approve'
+            AND admin.state = 'succeeded'
+            AND admin.request_digest = approval.request_digest
+            AND NOT EXISTS (
+              SELECT 1 FROM license_transfer_revocations AS revocation
+              WHERE revocation.approval_id = approval.approval_id
+            )
+        ) AS associated
+      `.execute(trx)
+      : undefined;
+    const normalAssociated = normalTarget?.rows[0]?.associated === true;
+    const disasterTarget = !activation && !normalAssociated
+      ? await sql<{ associated: boolean }>`
+        SELECT EXISTS (
+          SELECT 1
+          FROM license_disaster_transfer_approvals AS approval
+          JOIN license_admin_operations AS admin
+            ON admin.operation_id = approval.approval_id
+          JOIN license_disaster_recovery_requests AS recovery
+            ON recovery.request_id = approval.request_id
+          JOIN license_activations AS source
+            ON source.id = approval.source_activation_id
+            AND source.license_id = approval.license_id
+            AND source.database_id = approval.database_id
+            AND source.instance_id = approval.source_instance_id
+            AND source.identity_jkt = approval.source_identity_jkt
+            AND source.generation = approval.source_generation
+            AND source.state = 'active'
+          WHERE approval.license_id = ${license.id}
+            AND approval.account_reference = ${license.account_id}
+            AND approval.database_id = ${input.database_id}
+            AND approval.target_instance_id = ${input.instance_id}
+            AND approval.target_identity_jkt = ${auth.signature.identityJkt}
+            AND approval.expected_revision = ${license.revision}
+            AND approval.source_generation = ${license.current_generation}
+            AND approval.entitlement_revision = ${license.entitlement_revision}
+            AND approval.expires_at > ${now}
+            AND admin.action = 'disaster_transfer_approve'
+            AND admin.state = 'succeeded'
+            AND admin.request_digest = approval.request_digest
+            AND recovery.request_digest = approval.request_digest
+            AND recovery.license_id = approval.license_id
+            AND recovery.account_reference = approval.account_reference
+            AND recovery.source_activation_id = approval.source_activation_id
+            AND recovery.database_id = approval.database_id
+            AND recovery.source_instance_id = approval.source_instance_id
+            AND recovery.source_identity_jkt = approval.source_identity_jkt
+            AND recovery.target_instance_id = approval.target_instance_id
+            AND recovery.target_identity_jkt = approval.target_identity_jkt
+            AND NOT EXISTS (
+              SELECT 1 FROM license_disaster_transfer_revocations AS revocation
+              WHERE revocation.approval_id = approval.approval_id
+            )
+        ) AS associated
+      `.execute(trx)
+      : undefined;
+    const associated = activation !== undefined || normalAssociated || disasterTarget?.rows[0]?.associated === true;
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     const result = async (state: OperationState, outcomeCode: string | null, resultJws: string | null,
       attempt: { attemptNo: number; nonceHash: string; requestDigest: string } | undefined) => signOperationReceipt(config, {
@@ -746,6 +824,15 @@ export async function queryOperation(
       resultJws,
       now,
     });
+    if (!associated) {
+      if (!nonce.valid) return { retryable: 'CHALLENGE_EXPIRED_OR_REPLAYED' };
+      return result('not_found', 'OPERATION_NOT_FOUND', null, undefined);
+    }
+    const existing = await findOperation(trx, input.operation_id);
+    if (existing && existing.actor_jkt !== auth.signature.identityJkt) throw new LicenseApiError(403, 'OPERATION_ACTOR_MISMATCH');
+    if (existing && (existing.intent_digest !== input.intent_digest || existing.license_id !== input.license_id || existing.database_id !== input.database_id)) {
+      throw new LicenseApiError(409, 'OPERATION_INTENT_CONFLICT');
+    }
     if (!nonce.valid) {
       await appendAttempt(trx, auth, {
         operationId: input.operation_id, attemptNo: input.attempt_no, intentDigest: input.intent_digest,
@@ -880,9 +967,6 @@ export async function processTransferPrepare(
     }
     await acquireInstanceLock(trx, input.instance_id);
     const now = await databaseNow(trx);
-    const nonce = await loadAndConsumeNonce(trx, auth, now);
-    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
-
     const approval = await trx.selectFrom('license_transfer_approvals').selectAll()
       .where('approval_id', '=', input.approval_id).executeTakeFirst();
     const adminApproval = await trx.selectFrom('license_admin_operations').select(['operation_id', 'action', 'state', 'request_digest'])
@@ -892,21 +976,18 @@ export async function processTransferPrepare(
     const targetWasUsed = await trx.selectFrom('license_activations').select('id')
       .where('license_id', '=', input.license_id).where('identity_jkt', '=', targetIdentity.jkt).executeTakeFirst();
     const source = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
-    if (!approval || approvalRevoked || targetWasUsed || !adminApproval || adminApproval.action !== 'transfer_approve' || adminApproval.state !== 'succeeded' ||
-      adminApproval.request_digest !== approval.request_digest || !approvalMatchesPrepare(approval, input, auth.signature.identityJkt, targetIdentity.jkt, license, now) ||
-      !source || source.state !== 'active' || source.database_id !== input.database_id ||
-      source.generation.toString() !== input.source_generation || source.identity_jkt !== auth.signature.identityJkt ||
-      source.identity_jwk_public['kty'] !== auth.signature.identityJwk.kty ||
-      source.identity_jwk_public['crv'] !== auth.signature.identityJwk.crv ||
-      source.identity_jwk_public['x'] !== auth.signature.identityJwk.x) {
-      const code = license.status !== 'active' ? 'LICENSE_REVOKED' :
-        license.confirmed_subscription_end.getTime() <= now.getTime() ? 'SUBSCRIPTION_EXPIRED' : 'TRANSFER_APPROVAL_INVALID';
-      const token = await terminalOperationReceipt(trx, config, auth, {
-        kind: 'transfer_prepare', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
-        outcomeCode: code, responseType: 'operation',
-      }, now);
-      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: code };
-    }
+    const validSource = source !== undefined && source.state === 'active' && source.database_id === input.database_id &&
+      source.generation.toString() === input.source_generation && source.identity_jkt === auth.signature.identityJkt &&
+      source.identity_jwk_public['kty'] === auth.signature.identityJwk.kty &&
+      source.identity_jwk_public['crv'] === auth.signature.identityJwk.crv &&
+      source.identity_jwk_public['x'] === auth.signature.identityJwk.x;
+    const validApproval = approval !== undefined && !approvalRevoked && targetWasUsed === undefined &&
+      adminApproval?.action === 'transfer_approve' && adminApproval.state === 'succeeded' &&
+      adminApproval.request_digest === approval.request_digest &&
+      approvalMatchesPrepare(approval, input, auth.signature.identityJkt, targetIdentity.jkt, license, now);
+    if (!validSource || !validApproval) throw new LicenseApiError(403, 'TRANSFER_PREPARE_FORBIDDEN');
+    const nonce = await loadAndConsumeNonce(trx, auth, now);
+    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
 
     const disasterApprovalConflict = await sql<{ present: boolean }>`
       SELECT EXISTS (
@@ -1320,9 +1401,6 @@ export async function processDisasterTransferPrepare(
     }
     await acquireInstanceLock(trx, input.instance_id);
     const now = await databaseNow(trx);
-    const nonce = await loadAndConsumeNonce(trx, auth, now);
-    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
-
     const approval = await trx.selectFrom('license_disaster_transfer_approvals').selectAll()
       .where('approval_id', '=', input.approval_id).forUpdate().executeTakeFirst();
     const recoveryRequest = await trx.selectFrom('license_disaster_recovery_requests').selectAll()
@@ -1353,7 +1431,9 @@ export async function processDisasterTransferPrepare(
       });
       return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: code };
     };
-    if (!approvalValid) return reject(revoked ? 'DISASTER_APPROVAL_REVOKED' : 'DISASTER_APPROVAL_INVALID');
+    if (!approvalValid) throw new LicenseApiError(403, 'DISASTER_PREPARE_FORBIDDEN');
+    const nonce = await loadAndConsumeNonce(trx, auth, now);
+    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
     if (license.revision.toString() !== approval.expected_revision.toString() ||
       license.current_generation.toString() !== approval.source_generation.toString() ||
       license.entitlement_revision.toString() !== approval.entitlement_revision.toString()) return reject('DISASTER_REVISION_CONFLICT');

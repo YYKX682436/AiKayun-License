@@ -62,7 +62,7 @@ Commit 使用既有 operation advisory lock 后锁定 license 权威行，再按
 2. 插入同 license、同原 database、新 target identity/new generation 的唯一 active activation。
 3. generation 与管理 revision 各加1；保留 entitlement revision、套餐、订阅截止及 revoked/active 状态。
 4. 若权益当前 active 且订阅未过期，签发正常 `aikayun-license+jwt` lease 并嵌入正式迁移回执。
-5. 若订阅过期或 license revoked，只签 `typ=aikayun-license-disaster-binding+jwt` 身份恢复证据；无 `grants`、无 `new_lease`，并写明 `purpose=historical_obligations_only` 和当前状态。
+5. 若订阅过期或 license revoked，只签 `typ=aikayun-license-disaster-binding+jwt` 身份恢复证据；无 `grants`、无 `new_lease`，并写明 `purpose=historical_obligations_identity_rebinding` 和当前状态。
 6. 同事务写入 commit operation墓碑/结果、ticket消费（plan从`prepared`单向转`committed`）、request attempt、管理审计/授权审计和迁移事件，然后提交。只有数据库事务成功提交后才返回。
 
 若事务触发器失败或进程被强杀，来源退休、目标插入、license revision、operation、ticket消费、attempt与审计全部回滚。若 PostgreSQL COMMIT确认或 HTTP 响应丢失，同一 commit operation ID + intent 重放返回保存的原签名结果，不再次增加 generation。结果已未知时不得另建 commit operation。

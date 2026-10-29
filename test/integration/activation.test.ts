@@ -383,7 +383,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       .toEqual(['accepted', 'committed_replay']);
   });
 
-  it('rejects a different actor querying a known operation without changing its attempts', async () => {
+  it('does not reveal another identity’s operation result or write business history', async () => {
     const prepared = await prepareActivation();
     const activated = await sendActivation(prepared, await activationAttempt(prepared, 1));
     expect(activated.status).toBe(200);
@@ -394,7 +394,10 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       licenseId: prepared.licenseId, databaseId: prepared.databaseId,
       instanceId: prepared.instanceId, identity: rogue, attemptNo: 2,
     });
-    expect(rejected.status).toBe(403);
+    expect(rejected.status).toBe(200);
+    const receipt = await verifyCenterJwt(rejected.json['operation_receipt'] as string, runtime);
+    expect(receipt.payload['state']).toBe('not_found');
+    expect(receipt.payload['result_jws']).toBeNull();
     const after = await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).execute();
     expect(after).toEqual(before);
     const operation = await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).executeTakeFirstOrThrow();
@@ -420,7 +423,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       await waitForLicenseRowWaiters(db, 2);
       blocker.release();
       const responses = await Promise.all(results);
-      expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 403]);
     } finally {
       blocker.release();
       await blocker.done;
@@ -433,7 +436,62 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect(codeRow.consumed_at).toBeInstanceOf(Date);
     const operations = await db.selectFrom('license_operations').selectAll()
       .where('operation_id', 'in', [first.operationId, second.operationId]).execute();
-    expect(operations.map((row) => row.state).sort()).toEqual(['committed', 'rejected']);
+    expect(operations).toHaveLength(1);
+    expect(operations[0]!.state).toBe('committed');
+    const loserOperationId = operations[0]!.operation_id === first.operationId ? second.operationId : first.operationId;
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', loserOperationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', loserOperationId).execute()).toHaveLength(0);
+  });
+
+  it('serializes different licenses competing for one active instance', async () => {
+    const licenseA = await createLicense(db);
+    const licenseB = await createLicense(db);
+    const codeA = await createActivationCode(db, licenseA.id);
+    const codeB = await createActivationCode(db, licenseB.id);
+    const identityA = await createIdentity();
+    const identityB = await createIdentity();
+    const sharedInstanceId = randomUUID();
+    const first = await prepareActivationWithExisting(licenseA.id, codeA.code, codeA.tokenHash, identityA, sharedInstanceId);
+    const second = await prepareActivationWithExisting(licenseB.id, codeB.code, codeB.tokenHash, identityB, sharedInstanceId);
+    const firstAttempt = await activationAttempt(first, 1);
+    const secondAttempt = await activationAttempt(second, 1);
+    let acquired!: () => void;
+    let release!: () => void;
+    const acquiredPromise = new Promise<void>((resolve) => { acquired = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const blocker = db.transaction().execute(async (trx) => {
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'activation-instance:' + sharedInstanceId}, 0))`.execute(trx);
+      acquired();
+      await releasePromise;
+    });
+    await acquiredPromise;
+    try {
+      const firstRequest = sendActivation(first, firstAttempt);
+      await waitForAdvisoryLockWaiters(db, 1);
+      const secondRequest = sendActivation(second, secondAttempt);
+      await waitForAdvisoryLockWaiters(db, 2);
+      release();
+      const [firstResponse, secondResponse] = await Promise.all([firstRequest, secondRequest]);
+      expect(firstResponse.status).toBe(200);
+      expect(secondResponse.status).toBe(409);
+      expect((await verifyCenterJwt(secondResponse.json['operation_receipt'] as string, runtime)).payload['outcome_code'])
+        .toBe('ACTIVATION_INSTANCE_ALREADY_ACTIVE');
+    } finally {
+      release();
+      await blocker;
+    }
+
+    const activeRows = await db.selectFrom('license_activations').selectAll()
+      .where('instance_id', '=', sharedInstanceId).where('state', '=', 'active').execute();
+    expect(activeRows).toHaveLength(1);
+    expect(activeRows[0]!.license_id).toBe(licenseA.id);
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', licenseA.id).executeTakeFirstOrThrow()).current_generation).toBe('1');
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', licenseB.id).executeTakeFirstOrThrow()).current_generation).toBe('0');
+    expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', first.operationId).executeTakeFirstOrThrow()).state)
+      .toBe('committed');
+    expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', second.operationId).executeTakeFirstOrThrow()).state)
+      .toBe('rejected');
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', second.operationId).execute()).toHaveLength(1);
   });
 
   it('serializes concurrent retries of one operation and produces exactly one business result', async () => {
@@ -469,6 +527,9 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect(queryReceipt.protectedHeader['typ']).toBe('aikayun-license-operation+jwt');
     expect(queryReceipt.payload['state']).toBe('not_found');
     expect(queryReceipt.payload['outcome_code']).toBe('OPERATION_NOT_FOUND');
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
 
     const continued = await sendContinue(prepared, 2);
     expect(continued.status).toBe(200);
@@ -481,7 +542,42 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
     expect(originalLease.protectedHeader['typ']).toBe('aikayun-license+jwt');
     expect(originalLease.payload['activation_generation']).toBe('1');
     const attempts = await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).orderBy('attempt_no').execute();
-    expect(attempts.map((row) => row.outcome)).toEqual(['retryable_reject', 'accepted']);
+    expect(attempts.map((row) => row.outcome)).toEqual(['accepted']);
+  });
+
+  it('does not let an unrecognized activation code create a victim operation or audit event', async () => {
+    const victim = await prepareActivation();
+    const attacker = await createIdentity();
+    const activationCode = createHash('sha256').update(randomUUID()).digest('base64url');
+    const instanceId = randomUUID();
+    const databaseId = randomUUID();
+    const operationId = randomUUID();
+    const origin = 'https://shop.example.test';
+    const intentDigest = activationIntentDigest({
+      licenseId: victim.licenseId, activationCode, instanceId, databaseId,
+      identityJkt: attacker.jkt, origin,
+    });
+    const challenge = await requestChallenge({
+      port: server.port, config: runtime.config, identity: attacker, operation: 'activation',
+      operationId, intentDigest, instanceId,
+    });
+    const body = {
+      ...buildChallengeBoundBody({
+        challenge: challenge.token, operationId, intentDigest, attemptNo: 1, instanceId,
+        identity: attacker, licenseId: victim.licenseId, databaseId,
+      }),
+      activation_code: activationCode,
+      origin,
+    };
+    const response = await signPost({
+      port: server.port, origin: runtime.config.publicOrigin, path: '/v1/activations', body,
+      identity: attacker, nonce: nonceFromChallenge(challenge.token),
+    });
+    expect(response.status).toBe(403);
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', victim.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('0');
   });
 
   it('rejects an expired nonce that arrives after continuation already committed', async () => {
@@ -817,8 +913,8 @@ async function prepareActivationWithExisting(
   code: string,
   tokenHash: string,
   identity: TestIdentity,
+  instanceId = randomUUID(),
 ): Promise<PreparedActivation> {
-  const instanceId = randomUUID();
   const databaseId = randomUUID();
   const operationId = randomUUID();
   const origin = 'https://shop.example.test';

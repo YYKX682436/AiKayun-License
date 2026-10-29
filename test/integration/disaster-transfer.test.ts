@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { userInfo, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import {
   type ApproveTransferRequest,
 } from '../../src/admin/service.js';
 import { createDatabase, migrateToLatest } from '../../src/db/database.js';
+import { signTypedJwt } from '../../src/crypto/jwt.js';
 import type { Database } from '../../src/db/types.js';
 import {
   disasterTransferCommitIntentDigest,
@@ -31,11 +32,19 @@ import {
   verifyDisasterBindingReceipt,
   verifyDisasterTransferReceipt,
   verifyDisasterTransferTicket,
+  verifyLicenseLease,
+  signDisasterTransferTicket,
 } from '../../src/receipts.js';
 import { createActivationCode, createLicense, getDbNow } from '../fixtures.js';
 import { CommitAckDropProxy } from '../support/postgres-proxy.js';
 import { HttpResponseDropProxy } from '../support/http-response-proxy.js';
-import { terminatePostgresBackend, waitForLicenseRowWaiterPids, waitForLicenseRowWaiters, waitForNoLockWaiters } from '../support/pg-waits.js';
+import {
+  terminatePostgresBackend,
+  waitForAdvisoryLockWaiters,
+  waitForLicenseRowWaiterPids,
+  waitForLicenseRowWaiters,
+  waitForNoLockWaiters,
+} from '../support/pg-waits.js';
 import { startChildLicenseServer } from '../support/child-server.js';
 import {
   buildChallengeBoundBody, requestChallenge, signPost, startAppServer, type HttpResponse, type RunningTestServer,
@@ -286,6 +295,28 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     return { attempt, operationId, intentDigest, response: await sendCommit(attempt, overrides.signer ?? prepared.target, port) };
   }
 
+  async function queryOperation(input: {
+    licenseId: string;
+    databaseId: string;
+    instanceId: string;
+    identity: TestIdentity;
+    operationId: string;
+    intentDigest: string;
+    attemptNo: number;
+  }): Promise<HttpResponse> {
+    const challenge = await requestChallenge({
+      port: server.port, config: runtime.config, identity: input.identity, operation: 'query',
+      operationId: input.operationId, intentDigest: input.intentDigest, instanceId: input.instanceId,
+    });
+    const body = buildChallengeBoundBody({
+      challenge: challenge.token, operationId: input.operationId, intentDigest: input.intentDigest,
+      attemptNo: input.attemptNo, instanceId: input.instanceId, identity: input.identity,
+      licenseId: input.licenseId, databaseId: input.databaseId,
+    });
+    return signPost({ port: server.port, origin: runtime.config.publicOrigin, path: '/v1/operations/query',
+      body, identity: input.identity, nonce: nonceFromChallenge(challenge.token) });
+  }
+
   async function writeAdminPolicy(url: string): Promise<string> {
     const credentialFile = join(scratchDirectory, `database-${randomUUID()}.url`);
     const policyPath = join(scratchDirectory, `policy-${randomUUID()}.json`);
@@ -376,6 +407,43 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     expect(lease.payload).toMatchObject({ sub: active.licenseId, instance_id: active.instanceId,
       database_id: active.databaseId, identity_jkt: target.jkt, activation_generation: '2',
       entitlement_revision: before.entitlement_revision, grants: ['create_order', 'create_top_up'] });
+    const validationNow = new Date();
+    const strictReceipt = await verifyDisasterTransferReceipt(receiptToken, runtime.config, validationNow);
+    const strictLease = await verifyLicenseLease(leaseToken, runtime.config, validationNow);
+    expect(strictReceipt['database_id']).toBe(strictLease['database_id']);
+    expect(strictReceipt['entitlement_revision']).toBe(strictLease['entitlement_revision']);
+    expect(strictReceipt['subscription_end']).toBe(strictLease['subscription_end']);
+    const outerClaims = receipt as Record<string, unknown>;
+    const innerClaims = lease.payload as Record<string, unknown>;
+    const rejectedOuter = async (claims: Record<string, unknown>) => {
+      const forged = await signTypedJwt(runtime.config, 'aikayun-license-disaster-transfer+jwt', claims);
+      await expect(verifyDisasterTransferReceipt(forged, runtime.config, validationNow)).rejects.toThrow();
+    };
+    for (const [field, value] of [
+      ['sub', randomUUID()],
+      ['license_id', randomUUID()],
+      ['database_id', randomUUID()],
+      ['entitlement_revision', plusOne(String(outerClaims['entitlement_revision']))],
+      ['subscription_end', Number(outerClaims['subscription_end']) + 3600],
+    ] as const) {
+      await rejectedOuter({ ...outerClaims, [field]: value });
+    }
+    const nestedMismatches: Array<[string, unknown]> = [
+      ['sub', randomUUID()], ['database_id', randomUUID()], ['instance_id', randomUUID()],
+      ['identity_jkt', sha256(randomUUID())], ['activation_generation', '3'],
+      ['entitlement_revision', plusOne(String(innerClaims['entitlement_revision']))],
+      ['subscription_end', Number(innerClaims['subscription_end']) + 3600],
+      ['request_nonce', sha256(randomUUID())], ['request_digest', sha256(randomUUID())],
+    ];
+    for (const [field, value] of nestedMismatches) {
+      const nestedToken = await signTypedJwt(runtime.config, 'aikayun-license+jwt', { ...innerClaims, [field]: value });
+      await rejectedOuter({ ...outerClaims, new_lease: nestedToken });
+    }
+    const iat = Number(outerClaims['iat']);
+    await rejectedOuter({ ...outerClaims, unexpected_claim: true });
+    await rejectedOuter({ ...outerClaims, exp: iat + 601 });
+    await rejectedOuter({ ...outerClaims, nbf: iat - 1 });
+    await expect(verifyDisasterTransferReceipt(leaseToken, runtime.config, validationNow)).rejects.toThrow();
 
     const after = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
     expect(after.current_generation).toBe('2');
@@ -399,30 +467,39 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const target = await createIdentity();
     const approved = await approveDisaster(active, target);
     expect(approved.approval.state).toBe('succeeded');
+    const unauthorizedOperationIds: string[] = [];
 
     const noApproval = await makePrepareAttempt(approved, { approvalId: randomUUID(), requestId: randomUUID() });
     const noApprovalResponse = await sendPrepare(noApproval.attempt, target);
-    expect(noApprovalResponse.status).toBe(409);
-    expect((await verifyCenterJwt(noApprovalResponse.json['operation_receipt'] as string)).payload['outcome_code']).toBe('DISASTER_APPROVAL_INVALID');
+    expect(noApprovalResponse.status).toBe(403);
+    expect(noApprovalResponse.json['error']).toEqual({ code: 'DISASTER_PREPARE_FORBIDDEN' });
+    unauthorizedOperationIds.push(noApproval.operationId);
 
     const otherLicense = await activate();
     const otherTarget = await createIdentity();
     const otherApproved = await approveDisaster(otherLicense, otherTarget);
     const crossLicense = await makePrepareAttempt(approved, { approvalId: otherApproved.approval.operationId,
       requestId: otherApproved.approval.operationId });
-    expect((await sendPrepare(crossLicense.attempt, target)).status).toBe(409);
+    expect((await sendPrepare(crossLicense.attempt, target)).status).toBe(403);
+    unauthorizedOperationIds.push(crossLicense.operationId);
 
     const wrongDatabase = await makePrepareAttempt(approved, { databaseId: randomUUID() });
     const wrongDatabaseResponse = await sendPrepare(wrongDatabase.attempt, target);
-    expect(wrongDatabaseResponse.status).toBe(409);
-    expect((await verifyCenterJwt(wrongDatabaseResponse.json['operation_receipt'] as string)).payload['outcome_code'])
-      .toMatch(/DISASTER_APPROVAL_INVALID|DISASTER_DATABASE_BINDING_MISMATCH/);
+    expect(wrongDatabaseResponse.status).toBe(403);
+    unauthorizedOperationIds.push(wrongDatabase.operationId);
 
     const staleRevision = await makePrepareAttempt(approved, { expectedRevision: '1' });
-    expect((await sendPrepare(staleRevision.attempt, target)).status).toBe(409);
+    expect((await sendPrepare(staleRevision.attempt, target)).status).toBe(403);
+    unauthorizedOperationIds.push(staleRevision.operationId);
 
     const wrongTargetJkt = await makePrepareAttempt(approved, { targetIdentityJkt: (await createIdentity()).jkt });
     expect((await sendPrepare(wrongTargetJkt.attempt, target)).status).toBe(409);
+    unauthorizedOperationIds.push(wrongTargetJkt.operationId);
+    for (const operationId of unauthorizedOperationIds) {
+      expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
+    }
     expect(await db.selectFrom('license_disaster_transfer_plans').selectAll().where('license_id', '=', active.licenseId).execute())
       .toHaveLength(0);
     const badAdminSnapshot = await approveDisaster(active, await createIdentity(), { databaseId: randomUUID() });
@@ -509,6 +586,251 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       .where('approval_id', '=', approved.approval.operationId).execute()).rejects.toMatchObject({ code: '55000' });
   });
 
+  it('serializes normal and disaster approval competition on the license row in both orders', async () => {
+    async function race(disasterFirst: boolean) {
+      const active = await activate();
+      const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const normalTarget = await createIdentity();
+      const disasterTarget = await createIdentity();
+      const normalRequest: Omit<ApproveTransferRequest, 'confirmedRequestDigest'> = {
+        operationId: randomUUID(), licenseId: active.licenseId, expectedRevision: license.revision.toString(),
+        reason: '并发审批竞争中的正常迁移目标', databaseId: active.databaseId,
+        sourceInstanceId: active.instanceId, sourceIdentityJkt: active.source.jkt,
+        targetInstanceId: active.instanceId, targetIdentityJkt: normalTarget.jkt,
+        sourceGeneration: license.current_generation.toString(), expectedBindingRevision: '7',
+      };
+      const disasterRequest = await disasterApprovalRequest(active, disasterTarget);
+      let locked!: () => void;
+      let release!: () => void;
+      const lockedPromise = new Promise<void>((resolve) => { locked = resolve; });
+      const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('licenses').select('id').where('id', '=', active.licenseId).forUpdate().executeTakeFirstOrThrow();
+        locked();
+        await releasePromise;
+      });
+      await lockedPromise;
+      let normalPromise: ReturnType<typeof admin.approveTransfer>;
+      let disasterPromise: ReturnType<typeof admin.approveDisasterTransfer>;
+      try {
+        if (disasterFirst) {
+          disasterPromise = admin.approveDisasterTransfer({ ...disasterRequest,
+            confirmedRequestDigest: approveDisasterTransferRequestDigest(disasterRequest) });
+          await waitForLicenseRowWaiters(db, 1);
+          normalPromise = admin.approveTransfer({ ...normalRequest,
+            confirmedRequestDigest: approveTransferRequestDigest(normalRequest) });
+        } else {
+          normalPromise = admin.approveTransfer({ ...normalRequest,
+            confirmedRequestDigest: approveTransferRequestDigest(normalRequest) });
+          await waitForLicenseRowWaiters(db, 1);
+          disasterPromise = admin.approveDisasterTransfer({ ...disasterRequest,
+            confirmedRequestDigest: approveDisasterTransferRequestDigest(disasterRequest) });
+        }
+        await waitForLicenseRowWaiters(db, 2);
+        release();
+        await blocker;
+      } finally {
+        release();
+        await blocker.catch(() => undefined);
+      }
+      const [normalResult, disasterResult] = await Promise.all([normalPromise!, disasterPromise!]);
+      if (disasterFirst) {
+        expect(disasterResult.state).toBe('succeeded');
+        expect(normalResult.state).toBe('rejected');
+        expect(normalResult.outcomeCode).toBe('DISASTER_TRANSFER_REQUIRES_EXPLICIT_REVOCATION');
+      } else {
+        expect(normalResult.state).toBe('succeeded');
+        expect(disasterResult.state).toBe('rejected');
+        expect(disasterResult.outcomeCode).toBe('NORMAL_TRANSFER_REQUIRES_EXPLICIT_REVOCATION');
+      }
+      expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow())
+        .revision).toBe(license.revision);
+      expect((await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').executeTakeFirstOrThrow()).identity_jkt).toBe(active.source.jkt);
+      expect(await db.selectFrom('license_transfer_approvals').selectAll().where('license_id', '=', active.licenseId).execute())
+        .toHaveLength(disasterFirst ? 0 : 1);
+      expect(await db.selectFrom('license_disaster_transfer_approvals').selectAll().where('license_id', '=', active.licenseId).execute())
+        .toHaveLength(disasterFirst ? 1 : 0);
+    }
+    await race(false);
+    await race(true);
+  });
+
+  it('serializes normal prepare against disaster approval on the license row in both orders', async () => {
+    async function race(disasterApprovalFirst: boolean) {
+      const active = await activate();
+      const normalTarget = await createIdentity();
+      const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const approvalRequest: Omit<ApproveTransferRequest, 'confirmedRequestDigest'> = {
+        operationId: randomUUID(), licenseId: active.licenseId, expectedRevision: license.revision.toString(),
+        reason: '并发Prepare与灾难审批的正常目标', databaseId: active.databaseId,
+        sourceInstanceId: active.instanceId, sourceIdentityJkt: active.source.jkt,
+        targetInstanceId: active.instanceId, targetIdentityJkt: normalTarget.jkt,
+        sourceGeneration: license.current_generation.toString(), expectedBindingRevision: '7',
+      };
+      const normalApproval = await admin.approveTransfer({ ...approvalRequest,
+        confirmedRequestDigest: approveTransferRequestDigest(approvalRequest) });
+      expect(normalApproval.state).toBe('succeeded');
+
+      const prepareOperationId = randomUUID();
+      const prepareIntent = transferPrepareIntentDigest({
+        licenseId: active.licenseId, databaseId: active.databaseId, instanceId: active.instanceId,
+        sourceIdentityJkt: active.source.jkt, targetInstanceId: active.instanceId,
+        targetIdentityJkt: normalTarget.jkt, approvalId: normalApproval.operationId,
+        sourceGeneration: license.current_generation.toString(), expectedBindingRevision: '7',
+        expectedRevision: license.revision.toString(),
+      });
+      const challenge = await requestChallenge({ port: server.port, config: runtime.config, identity: active.source,
+        operation: 'transfer_prepare', operationId: prepareOperationId, intentDigest: prepareIntent, instanceId: active.instanceId });
+      const prepareBody = {
+        ...buildChallengeBoundBody({ challenge: challenge.token, operationId: prepareOperationId, intentDigest: prepareIntent,
+          attemptNo: 1, instanceId: active.instanceId, identity: active.source,
+          licenseId: active.licenseId, databaseId: active.databaseId }),
+        approval_id: normalApproval.operationId, target_instance_id: active.instanceId,
+        target_identity_jkt: normalTarget.jkt, target_public_jwk: normalTarget.publicJwk,
+        source_generation: license.current_generation.toString(), expected_binding_revision: '7',
+        expected_revision: license.revision.toString(),
+      };
+      const disasterRequest = await disasterApprovalRequest(active, await createIdentity());
+
+      let locked!: () => void;
+      let release!: () => void;
+      const lockedPromise = new Promise<void>((resolve) => { locked = resolve; });
+      const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('licenses').select('id').where('id', '=', active.licenseId).forUpdate().executeTakeFirstOrThrow();
+        locked();
+        await releasePromise;
+      });
+      await lockedPromise;
+      let preparePromise: Promise<HttpResponse>;
+      let disasterPromise: ReturnType<typeof admin.approveDisasterTransfer>;
+      try {
+        if (disasterApprovalFirst) {
+          disasterPromise = admin.approveDisasterTransfer({ ...disasterRequest,
+            confirmedRequestDigest: approveDisasterTransferRequestDigest(disasterRequest) });
+          await waitForLicenseRowWaiters(db, 1);
+          preparePromise = signPost({ port: server.port, origin: runtime.config.publicOrigin, path: '/v1/transfers/prepare',
+            body: prepareBody, identity: active.source, nonce: nonceFromChallenge(challenge.token) });
+        } else {
+          preparePromise = signPost({ port: server.port, origin: runtime.config.publicOrigin, path: '/v1/transfers/prepare',
+            body: prepareBody, identity: active.source, nonce: nonceFromChallenge(challenge.token) });
+          await waitForLicenseRowWaiters(db, 1);
+          disasterPromise = admin.approveDisasterTransfer({ ...disasterRequest,
+            confirmedRequestDigest: approveDisasterTransferRequestDigest(disasterRequest) });
+        }
+        await waitForLicenseRowWaiters(db, 2);
+        release();
+        await blocker;
+      } finally {
+        release();
+        await blocker.catch(() => undefined);
+      }
+      const [prepared, disasterApproval] = await Promise.all([preparePromise!, disasterPromise!]);
+      expect(prepared.status).toBe(200);
+      expect(disasterApproval.state).toBe('rejected');
+      expect(disasterApproval.outcomeCode).toBe('NORMAL_TRANSFER_REQUIRES_EXPLICIT_REVOCATION');
+      expect(await db.selectFrom('license_disaster_transfer_approvals').selectAll()
+        .where('license_id', '=', active.licenseId).execute()).toHaveLength(0);
+      expect(await db.selectFrom('license_transfer_plans').selectAll()
+        .where('license_id', '=', active.licenseId).where('state', '=', 'prepared').execute()).toHaveLength(1);
+      expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow())
+        .current_generation).toBe('1');
+      expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').execute()).toMatchObject([expect.objectContaining({ identity_jkt: active.source.jkt })]);
+      expect(await db.selectFrom('license_operation_attempts').selectAll()
+        .where('operation_id', '=', prepareOperationId).execute()).toMatchObject([expect.objectContaining({ outcome: 'accepted' })]);
+    }
+    await race(false);
+    await race(true);
+  });
+
+  it('serializes disaster approval revocation and commit in both PostgreSQL lock orders', async () => {
+    async function race(revokeFirst: boolean) {
+      const active = await activate();
+      const target = await createIdentity();
+      const approved = await approveDisaster(active, target);
+      const prepared = await prepare(approved);
+      const before = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const revokeRequest = { operationId: randomUUID(), licenseId: active.licenseId,
+        approvalId: approved.approval.operationId, expectedRevision: before.revision.toString(),
+        reason: '并发测试中撤销灾难迁移审批' };
+      const commitAttempt = await makeCommitAttempt(prepared);
+      let locked!: () => void;
+      let release!: () => void;
+      const lockedPromise = new Promise<void>((resolve) => { locked = resolve; });
+      const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('licenses').select('id').where('id', '=', active.licenseId).forUpdate().executeTakeFirstOrThrow();
+        locked();
+        await releasePromise;
+      });
+      await lockedPromise;
+      let revokePromise: ReturnType<typeof admin.revokeDisasterTransferApproval>;
+      let commitPromise: Promise<HttpResponse>;
+      try {
+        if (revokeFirst) {
+          revokePromise = admin.revokeDisasterTransferApproval({ ...revokeRequest,
+            confirmedRequestDigest: revokeDisasterTransferApprovalRequestDigest(revokeRequest) });
+          await waitForLicenseRowWaiters(db, 1);
+          commitPromise = sendCommit(commitAttempt.attempt, target);
+        } else {
+          commitPromise = sendCommit(commitAttempt.attempt, target);
+          await waitForLicenseRowWaiters(db, 1);
+          revokePromise = admin.revokeDisasterTransferApproval({ ...revokeRequest,
+            confirmedRequestDigest: revokeDisasterTransferApprovalRequestDigest(revokeRequest) });
+        }
+        await waitForLicenseRowWaiters(db, 2);
+        release();
+        await blocker;
+      } finally {
+        release();
+        await blocker.catch(() => undefined);
+      }
+      const [revoked, committed] = await Promise.all([revokePromise!, commitPromise!]);
+      const finalLicense = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+      const plan = await db.selectFrom('license_disaster_transfer_plans').selectAll()
+        .where('approval_id', '=', approved.approval.operationId).executeTakeFirstOrThrow();
+      const activeRows = await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').execute();
+      if (revokeFirst) {
+        expect(revoked.state).toBe('succeeded');
+        expect(committed.status).toBe(409);
+        expect((await verifyCenterJwt(committed.json['operation_receipt'] as string)).payload['outcome_code'])
+          .toBe('DISASTER_TICKET_CONSUMED');
+        expect(plan.state).toBe('invalidated');
+        expect(finalLicense.current_generation).toBe('1');
+        expect(finalLicense.revision).toBe(before.revision);
+        expect(activeRows).toMatchObject([expect.objectContaining({ identity_jkt: active.source.jkt })]);
+        expect(await db.selectFrom('license_disaster_transfer_revocations').selectAll()
+          .where('approval_id', '=', approved.approval.operationId).execute()).toHaveLength(1);
+        expect(await db.selectFrom('license_disaster_transfer_events').selectAll()
+          .where('approval_id', '=', approved.approval.operationId).where('kind', '=', 'approval_revoked').execute()).toHaveLength(1);
+      } else {
+        expect(committed.status).toBe(200);
+        expect(revoked.state).toBe('rejected');
+        expect(revoked.outcomeCode).toBe('EXPECTED_REVISION_MISMATCH');
+        expect(plan.state).toBe('committed');
+        expect(finalLicense.current_generation).toBe('2');
+        expect(finalLicense.revision).toBe(plusOne(before.revision));
+        expect(finalLicense.entitlement_revision).toBe(before.entitlement_revision);
+        expect(activeRows).toMatchObject([expect.objectContaining({ identity_jkt: target.jkt, generation: '2' })]);
+        expect(await db.selectFrom('license_disaster_transfer_revocations').selectAll()
+          .where('approval_id', '=', approved.approval.operationId).execute()).toHaveLength(0);
+        expect(await db.selectFrom('license_disaster_transfer_events').selectAll()
+          .where('approval_id', '=', approved.approval.operationId).where('kind', '=', 'committed').execute()).toHaveLength(1);
+        const replay = await makeCommitAttempt(prepared, { operationId: commitAttempt.operationId, attemptNo: 2 });
+        expect((await sendCommit(replay.attempt, target)).json['transfer_receipt']).toBe(committed.json['transfer_receipt']);
+        expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow()).current_generation)
+          .toBe('2');
+      }
+      expect(activeRows).toHaveLength(1);
+      expect(finalLicense.current_generation).toBe(revokeFirst ? '1' : '2');
+    }
+    await race(true);
+    await race(false);
+  });
+
   it('supports a newly approved logical instance id while retaining the original database id', async () => {
     const active = await activate();
     const target = await createIdentity();
@@ -521,6 +843,89 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const current = await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
       .where('state', '=', 'active').executeTakeFirstOrThrow();
     expect(current).toMatchObject({ instance_id: targetInstanceId, database_id: active.databaseId, identity_jkt: target.jkt, generation: '2' });
+  });
+
+  it('serializes disaster replacements from different licenses to the same target instance', async () => {
+    const activeA = await activate();
+    const activeB = await activate();
+    const targetInstanceId = randomUUID();
+    const targetA = await createIdentity();
+    const targetB = await createIdentity();
+    const preparedA = await prepare(await approveDisaster(activeA, targetA, {
+      targetInstanceMode: 'replace', targetInstanceId,
+    }));
+    const preparedB = await prepare(await approveDisaster(activeB, targetB, {
+      targetInstanceMode: 'replace', targetInstanceId,
+    }));
+    const attemptA = await makeCommitAttempt(preparedA);
+    const attemptB = await makeCommitAttempt(preparedB);
+    let acquired!: () => void;
+    let release!: () => void;
+    const acquiredPromise = new Promise<void>((resolve) => { acquired = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const blocker = db.transaction().execute(async (trx) => {
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'activation-instance:' + targetInstanceId}, 0))`.execute(trx);
+      acquired();
+      await releasePromise;
+    });
+    await acquiredPromise;
+    try {
+      const first = sendCommit(attemptA.attempt, targetA);
+      await waitForAdvisoryLockWaiters(db, 1);
+      const second = sendCommit(attemptB.attempt, targetB);
+      await waitForAdvisoryLockWaiters(db, 2);
+      release();
+      const [responseA, responseB] = await Promise.all([first, second]);
+      expect(responseA.status).toBe(200);
+      expect(responseB.status).toBe(409);
+      expect((await verifyCenterJwt(responseB.json['operation_receipt'] as string)).payload['outcome_code'])
+        .toBe('DISASTER_TARGET_INSTANCE_ALREADY_ACTIVE');
+    } finally {
+      release();
+      await blocker;
+    }
+    const activeAtTarget = await db.selectFrom('license_activations').selectAll()
+      .where('instance_id', '=', targetInstanceId).where('state', '=', 'active').execute();
+    expect(activeAtTarget).toHaveLength(1);
+    expect(activeAtTarget[0]!.license_id).toBe(activeA.licenseId);
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', activeA.licenseId).executeTakeFirstOrThrow()).current_generation)
+      .toBe('2');
+    expect((await db.selectFrom('licenses').selectAll().where('id', '=', activeB.licenseId).executeTakeFirstOrThrow()).current_generation)
+      .toBe('1');
+    expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', attemptA.operationId).executeTakeFirstOrThrow()).state)
+      .toBe('committed');
+    expect((await db.selectFrom('license_operations').selectAll().where('operation_id', '=', attemptB.operationId).executeTakeFirstOrThrow()).state)
+      .toBe('rejected');
+  });
+
+  it('does not authorize a revoked disaster target to append business history for an unknown operation', async () => {
+    const active = await activate();
+    const target = await createIdentity();
+    const approved = await approveDisaster(active, target);
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const revokeRequest = {
+      operationId: randomUUID(), licenseId: active.licenseId, approvalId: approved.approval.operationId,
+      expectedRevision: license.revision.toString(), reason: '撤销后目标不再是当前有效审批身份',
+    };
+    const revoked = await admin.revokeDisasterTransferApproval({ ...revokeRequest,
+      confirmedRequestDigest: revokeDisasterTransferApprovalRequestDigest(revokeRequest) });
+    expect(revoked.state).toBe('succeeded');
+
+    const unknownOperationId = randomUUID();
+    const unknownIntentDigest = sha256(randomUUID());
+    const response = await queryOperation({
+      licenseId: active.licenseId, databaseId: active.databaseId,
+      instanceId: approved.request.targetInstanceId, identity: target,
+      operationId: unknownOperationId, intentDigest: unknownIntentDigest, attemptNo: 1,
+    });
+    expect(response.status).toBe(200);
+    expect((await verifyCenterJwt(response.json['operation_receipt'] as string)).payload['state']).toBe('not_found');
+    expect(await db.selectFrom('license_operations').selectAll()
+      .where('operation_id', '=', unknownOperationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll()
+      .where('operation_id', '=', unknownOperationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll()
+      .where('license_id', '=', active.licenseId).where('operation_id', '=', unknownOperationId).execute()).toHaveLength(0);
   });
 
   it('expired and revoked licenses get only the strict historical binding JWT, then require a new entitlement lease', async () => {
@@ -539,6 +944,16 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       purpose: 'historical_obligations_identity_rebinding' });
     expect(expiredClaims['new_lease']).toBeUndefined();
     expect(expiredClaims['grants']).toBeUndefined();
+    await expect(verifyLicenseLease(expiredBinding, runtime.config, new Date())).rejects.toThrow();
+    const expiredClaimsRecord = expiredClaims as Record<string, unknown>;
+    const bindingWithLease = await signTypedJwt(runtime.config, 'aikayun-license-disaster-binding+jwt', {
+      ...expiredClaimsRecord, new_lease: 'forbidden',
+    });
+    await expect(verifyDisasterBindingReceipt(bindingWithLease, runtime.config, new Date())).rejects.toThrow();
+    const bindingOverlong = await signTypedJwt(runtime.config, 'aikayun-license-disaster-binding+jwt', {
+      ...expiredClaimsRecord, exp: Number(expiredClaimsRecord['iat']) + 601,
+    });
+    await expect(verifyDisasterBindingReceipt(bindingOverlong, runtime.config, new Date())).rejects.toThrow();
     const expiredRevision = await db.selectFrom('licenses').selectAll().where('id', '=', expired.licenseId).executeTakeFirstOrThrow();
     const renewal = { operationId: randomUUID(), licenseId: expired.licenseId, expectedRevision: expiredRevision.revision,
       businessReference: `verified-renewal-${randomUUID()}`, reason: '独立确认续费后恢复新订单权限' };
@@ -631,7 +1046,16 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       await firstPrepare;
       const durablePrepare = await db.selectFrom('license_operations').selectAll()
         .where('operation_id', '=', lostPrepare.operationId).executeTakeFirstOrThrow();
-      const retryPrepare = await makePrepareAttempt(approved, { operationId: lostPrepare.operationId, attemptNo: 2 });
+      const prepareQuery = await queryOperation({ licenseId: active.licenseId, databaseId: active.databaseId,
+        instanceId: approved.request.targetInstanceId, identity: target, operationId: lostPrepare.operationId,
+        intentDigest: lostPrepare.intentDigest, attemptNo: 2 });
+      expect(prepareQuery.status).toBe(200);
+      const prepareQueryReceipt = await verifyCenterJwt(prepareQuery.json['operation_receipt'] as string);
+      expect(prepareQueryReceipt.payload['state']).toBe('committed');
+      expect(prepareQueryReceipt.payload['result_jws']).toBe(durablePrepare.response_jws);
+      expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+        .where('state', '=', 'active').executeTakeFirstOrThrow()).toMatchObject({ identity_jkt: active.source.jkt });
+      const retryPrepare = await makePrepareAttempt(approved, { operationId: lostPrepare.operationId, attemptNo: 3 });
       expect(retryPrepare.intentDigest).toBe(lostPrepare.intentDigest);
       const replayPrepare = await sendPrepare(retryPrepare.attempt, target);
       expect(replayPrepare.status).toBe(200);
@@ -646,7 +1070,16 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
       await firstCommit;
       const durableCommit = await db.selectFrom('license_operations').selectAll()
         .where('operation_id', '=', lostCommit.operationId).executeTakeFirstOrThrow();
-      const replayCommit = await commit(prepared, { operationId: lostCommit.operationId, attemptNo: 2 });
+      const commitQuery = await queryOperation({ licenseId: active.licenseId, databaseId: active.databaseId,
+        instanceId: approved.request.targetInstanceId, identity: target, operationId: lostCommit.operationId,
+        intentDigest: lostCommit.intentDigest, attemptNo: 2 });
+      expect(commitQuery.status).toBe(200);
+      const commitQueryReceipt = await verifyCenterJwt(commitQuery.json['operation_receipt'] as string);
+      expect(commitQueryReceipt.payload['state']).toBe('committed');
+      expect(commitQueryReceipt.payload['result_jws']).toBe(durableCommit.response_jws);
+      expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow()).current_generation)
+        .toBe('2');
+      const replayCommit = await commit(prepared, { operationId: lostCommit.operationId, attemptNo: 3 });
       expect(replayCommit.response.status).toBe(200);
       expect(replayCommit.response.json['transfer_receipt']).toBe(durableCommit.response_jws);
       expect((await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('2');
@@ -791,6 +1224,80 @@ describe('disaster license transfer over real PostgreSQL and HTTPS', () => {
     const wrongPurpose = await makeCommitAttempt(forgedDisaster);
     expect((await sendCommit(wrongPurpose.attempt, prepared.target)).status).toBe(401);
     expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', wrongPurpose.operationId).execute()).toHaveLength(0);
+  });
+
+  it('rejects an expired disaster ticket at the real HTTPS commit boundary without changing the source', async () => {
+    const active = await activate();
+    const target = await createIdentity();
+    const approved = await approveDisaster(active, target);
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    const source = await db.selectFrom('license_activations').selectAll()
+      .where('license_id', '=', active.licenseId).where('state', '=', 'active').executeTakeFirstOrThrow();
+    const prepareOperationId = randomUUID();
+    const prepareIntentDigest = disasterTransferPrepareIntentDigest({
+      licenseId: active.licenseId, accountReference: approved.request.accountReference, databaseId: active.databaseId,
+      approvalId: approved.approval.operationId, requestId: approved.request.operationId,
+      sourceActivationId: source.id, sourceInstanceId: active.instanceId, sourceIdentityJkt: active.source.jkt,
+      targetInstanceId: approved.request.targetInstanceId, targetIdentityJkt: target.jkt,
+      sourceGeneration: license.current_generation.toString(), expectedBindingRevision: approved.request.expectedBindingRevision,
+      expectedRevision: license.revision.toString(),
+    });
+    const prepareRequestNonce = randomBytes(32).toString('base64url');
+    const prepareRequestDigest = sha256(randomUUID());
+    const issuedAt = Math.floor((await getDbNow(db)).getTime() / 1000) - 20 * 60;
+    const planId = randomUUID();
+    const ticket = await signDisasterTransferTicket(runtime.config, {
+      plan_id: planId, request_id: approved.request.operationId, approval_id: approved.approval.operationId,
+      approval_request_digest: approved.approval.requestDigest, prepare_operation_id: prepareOperationId,
+      prepare_intent_digest: prepareIntentDigest, prepare_request_nonce: prepareRequestNonce,
+      prepare_request_digest: prepareRequestDigest, license_id: active.licenseId,
+      account_reference: approved.request.accountReference, database_id: active.databaseId,
+      source_activation_id: source.id, source_instance_id: active.instanceId, source_identity_jkt: active.source.jkt,
+      source_activation_generation: license.current_generation.toString(),
+      target_instance_id: approved.request.targetInstanceId, target_identity_jkt: target.jkt,
+      expected_binding_revision: approved.request.expectedBindingRevision, expected_revision: license.revision.toString(),
+      entitlement_revision: license.entitlement_revision.toString(), now: new Date(issuedAt * 1000),
+    });
+    const expiresAt = new Date((issuedAt + 600) * 1000);
+    await db.insertInto('license_operations').values({
+      operation_id: prepareOperationId, actor_jkt: target.jkt, intent_digest: prepareIntentDigest,
+      kind: 'disaster_transfer_prepare', license_id: active.licenseId, database_id: active.databaseId,
+      state: 'committed', outcome_code: 'DISASTER_TRANSFER_PREPARED', response_type: 'disaster_ticket',
+      result_generation: license.current_generation.toString(), result_revision: license.entitlement_revision.toString(),
+      response_jws: ticket, result_digest: sha256(ticket), created_at: new Date(issuedAt * 1000),
+      finalized_at: new Date(issuedAt * 1000),
+    }).execute();
+    await db.insertInto('license_operation_attempts').values({
+      attempt_id: randomUUID(), operation_id: prepareOperationId, attempt_no: 1,
+      intent_digest: prepareIntentDigest, body_digest: prepareRequestDigest,
+      client_nonce_hash: sha256(randomUUID()), server_nonce_hash: sha256(prepareRequestNonce), identity_jkt: target.jkt,
+      signature_created_at: new Date(issuedAt * 1000), received_at: new Date(issuedAt * 1000),
+      outcome: 'accepted', error_code: null,
+    }).execute();
+    await db.insertInto('license_disaster_transfer_plans').values({
+      plan_id: planId, request_id: approved.request.operationId, approval_id: approved.approval.operationId,
+      license_id: active.licenseId, prepare_operation_id: prepareOperationId, prepare_intent_digest: prepareIntentDigest,
+      source_activation_id: source.id, database_id: active.databaseId, source_instance_id: active.instanceId,
+      source_identity_jkt: active.source.jkt, target_instance_id: approved.request.targetInstanceId,
+      target_identity_jkt: target.jkt, target_identity_jwk_public: target.publicJwk,
+      source_generation: license.current_generation.toString(), expected_binding_revision: approved.request.expectedBindingRevision,
+      expected_revision: license.revision.toString(), entitlement_revision: license.entitlement_revision.toString(),
+      ticket_jws: ticket, ticket_digest: sha256(ticket), state: 'prepared', expires_at: expiresAt,
+      created_at: new Date(issuedAt * 1000), committed_at: null, commit_operation_id: null,
+      committed_generation: null, result_mode: null, disaster_result_jws: null,
+    }).execute();
+
+    const result = await commit({ ...approved, prepareOperationId, prepareIntentDigest, ticket });
+    expect(result.response.status).toBe(409);
+    expect((await verifyCenterJwt(result.response.json['operation_receipt'] as string)).payload['outcome_code'])
+      .toBe('DISASTER_TICKET_EXPIRED');
+    expect((await db.selectFrom('license_disaster_transfer_plans').selectAll()
+      .where('plan_id', '=', planId).executeTakeFirstOrThrow()).state).toBe('expired');
+    const after = await db.selectFrom('licenses').selectAll().where('id', '=', active.licenseId).executeTakeFirstOrThrow();
+    expect(after.current_generation).toBe(license.current_generation);
+    expect(after.revision).toBe(license.revision);
+    expect(await db.selectFrom('license_activations').selectAll().where('license_id', '=', active.licenseId)
+      .where('state', '=', 'active').execute()).toMatchObject([expect.objectContaining({ identity_jkt: active.source.jkt })]);
   });
 
   async function prepareNormal(active: ActiveSource, target: TestIdentity) {

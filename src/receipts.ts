@@ -257,8 +257,120 @@ export async function signTransferReceipt(config: RuntimeConfig, input: {
     expected_revision: input.expectedRevision,
     result_revision: input.resultRevision,
     entitlement_revision: input.entitlementRevision,
+    subscription_end: Math.floor(input.subscriptionEnd.getTime() / 1000),
     new_lease: input.newLease,
   });
+}
+
+const leaseClaims = [
+  'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'instance_id', 'database_id', 'identity_jkt',
+  'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
+  'request_nonce', 'request_digest',
+] as const;
+
+const transferReceiptClaims = [
+  'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'operation_id', 'intent_digest', 'request_nonce',
+  'request_digest', 'license_id', 'database_id', 'source_instance_id', 'source_identity_jkt',
+  'source_activation_generation', 'target_instance_id', 'target_identity_jkt', 'target_activation_generation',
+  'expected_binding_revision', 'expected_revision', 'result_revision', 'entitlement_revision', 'subscription_end',
+  'new_lease',
+] as const;
+
+function validateBoundedTimes(claims: Record<string, unknown>, now: Date, maxLifetime: number): {
+  iat: number; nbf: number; exp: number;
+} {
+  const iat = assertIntegerClaim(claims, 'iat', 1);
+  const nbf = assertIntegerClaim(claims, 'nbf', 1);
+  const exp = assertIntegerClaim(claims, 'exp', 1);
+  if (nbf !== iat || exp <= iat || exp - iat > maxLifetime || iat > Math.floor(now.getTime() / 1000)) {
+    throw new Error('Invalid signed token lifetime');
+  }
+  return { iat, nbf, exp };
+}
+
+function decimalValue(claims: Record<string, unknown>, name: string, minimum = 0): bigint {
+  const value = assertStringClaim(claims, name, 19);
+  if (!decimalClaim.test(value)) throw new Error('Invalid signed decimal claim');
+  const parsed = BigInt(value);
+  if (parsed < BigInt(minimum)) throw new Error('Invalid signed decimal claim');
+  return parsed;
+}
+
+function assertUuid(claims: Record<string, unknown>, name: string): string {
+  const value = assertStringClaim(claims, name, 36);
+  if (!uuidClaim.test(value)) throw new Error('Invalid signed identifier');
+  return value;
+}
+
+function assertDigest(claims: Record<string, unknown>, name: string): string {
+  const value = assertStringClaim(claims, name, 64);
+  if (!digestClaim.test(value)) throw new Error('Invalid signed digest');
+  return value;
+}
+
+export async function verifyLicenseLease(
+  token: unknown,
+  config: RuntimeConfig,
+  now: Date,
+): Promise<Record<string, unknown>> {
+  const verified = await verifyTypedJwt(token, config, 'aikayun-license+jwt', [...leaseClaims], now);
+  assertExactClaims(verified.claims, leaseClaims);
+  const { iat, exp } = validateBoundedTimes(verified.claims, now, 7 * 24 * 60 * 60);
+  if (assertIntegerClaim(verified.claims, 'v') !== 1 || verified.claims['aud'] !== 'aikayun-commerce' ||
+    !['monthly', 'yearly'].includes(String(verified.claims['plan']))) throw new Error('Invalid license lease');
+  assertUuid(verified.claims, 'sub');
+  assertUuid(verified.claims, 'jti');
+  assertUuid(verified.claims, 'instance_id');
+  assertUuid(verified.claims, 'database_id');
+  assertDigest(verified.claims, 'identity_jkt');
+  assertDigest(verified.claims, 'request_nonce');
+  assertDigest(verified.claims, 'request_digest');
+  decimalValue(verified.claims, 'activation_generation', 1);
+  decimalValue(verified.claims, 'entitlement_revision', 1);
+  const subscriptionEnd = assertIntegerClaim(verified.claims, 'subscription_end', 1);
+  const renewAfter = assertIntegerClaim(verified.claims, 'renew_after', 1);
+  if (subscriptionEnd <= iat || exp !== Math.min(iat + 7 * 24 * 60 * 60, subscriptionEnd) ||
+    renewAfter !== Math.min(iat + 6 * 60 * 60, exp) || !Array.isArray(verified.claims['grants']) ||
+    verified.claims['grants'].length !== 2 || verified.claims['grants'][0] !== 'create_order' ||
+    verified.claims['grants'][1] !== 'create_top_up') throw new Error('Invalid license lease claims');
+  return verified.claims;
+}
+
+export async function verifyTransferReceipt(
+  token: unknown,
+  config: RuntimeConfig,
+  now: Date,
+): Promise<Record<string, unknown>> {
+  const verified = await verifyTypedJwt(token, config, 'aikayun-license-transfer+jwt', [...transferReceiptClaims], now);
+  assertExactClaims(verified.claims, transferReceiptClaims);
+  const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);
+  if (assertIntegerClaim(verified.claims, 'v') !== 1 || verified.claims['aud'] !== 'aikayun-commerce' ||
+    assertUuid(verified.claims, 'sub') !== assertUuid(verified.claims, 'license_id')) throw new Error('Invalid transfer receipt');
+  assertUuid(verified.claims, 'jti');
+  assertUuid(verified.claims, 'operation_id');
+  for (const name of ['database_id', 'source_instance_id', 'target_instance_id']) assertUuid(verified.claims, name);
+  for (const name of ['intent_digest', 'request_nonce', 'request_digest', 'source_identity_jkt', 'target_identity_jkt']) assertDigest(verified.claims, name);
+  const sourceGeneration = decimalValue(verified.claims, 'source_activation_generation', 1);
+  const targetGeneration = decimalValue(verified.claims, 'target_activation_generation', 1);
+  const expectedRevision = decimalValue(verified.claims, 'expected_revision', 1);
+  const resultRevision = decimalValue(verified.claims, 'result_revision', 1);
+  decimalValue(verified.claims, 'expected_binding_revision');
+  const entitlementRevision = decimalValue(verified.claims, 'entitlement_revision', 1);
+  const subscriptionEnd = assertIntegerClaim(verified.claims, 'subscription_end', 1);
+  if (targetGeneration !== sourceGeneration + 1n || resultRevision !== expectedRevision + 1n ||
+    verified.claims['source_identity_jkt'] === verified.claims['target_identity_jkt'] || subscriptionEnd <= iat ||
+    exp !== Math.min(iat + 10 * 60, subscriptionEnd)) throw new Error('Invalid transfer receipt binding');
+  const nested = await verifyLicenseLease(verified.claims['new_lease'], config, now);
+  if (nested['sub'] !== verified.claims['license_id'] || nested['database_id'] !== verified.claims['database_id'] ||
+    nested['instance_id'] !== verified.claims['target_instance_id'] || nested['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
+    nested['activation_generation'] !== verified.claims['target_activation_generation'] ||
+    nested['entitlement_revision'] !== verified.claims['entitlement_revision'] ||
+    nested['subscription_end'] !== verified.claims['subscription_end'] || nested['request_nonce'] !== verified.claims['request_nonce'] ||
+    nested['request_digest'] !== verified.claims['request_digest'] || nested['iat'] !== iat ||
+    BigInt(String(nested['entitlement_revision'])) !== entitlementRevision) {
+    throw new Error('Nested transfer lease does not match its receipt');
+  }
+  return verified.claims;
 }
 
 export interface DisasterTransferTicketClaims {
@@ -470,27 +582,28 @@ export async function verifyDisasterTransferReceipt(
   const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-transfer+jwt', claims, now);
   assertExactClaims(verified.claims, claims);
   validateDisasterResultBinding(verified.claims);
+  const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);
   if (verified.claims['result_mode'] !== 'active_lease' || verified.claims['license_status'] !== 'active') {
     throw new Error('Invalid active disaster transfer receipt');
   }
-  const nested = await verifyTypedJwt(verified.claims['new_lease'], config, 'aikayun-license+jwt', [
-    'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'instance_id', 'database_id', 'identity_jkt',
-    'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
-    'request_nonce', 'request_digest',
-  ], now);
-  if (nested.claims['sub'] !== verified.claims['license_id'] || nested.claims['instance_id'] !== verified.claims['target_instance_id'] ||
-    nested.claims['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
-    nested.claims['activation_generation'] !== verified.claims['target_activation_generation'] ||
-    nested.claims['request_nonce'] !== verified.claims['request_nonce'] || nested.claims['request_digest'] !== verified.claims['request_digest'] ||
-    nested.claims['grants'] instanceof Array === false ||
-    (nested.claims['grants'] as unknown[]).join(',') !== 'create_order,create_top_up') {
+  const sourceGeneration = decimalValue(verified.claims, 'source_activation_generation', 1);
+  const targetGeneration = decimalValue(verified.claims, 'target_activation_generation', 1);
+  const expectedRevision = decimalValue(verified.claims, 'expected_revision', 1);
+  const resultRevision = decimalValue(verified.claims, 'result_revision', 1);
+  const subscriptionEnd = assertIntegerClaim(verified.claims, 'subscription_end', 1);
+  if (targetGeneration !== sourceGeneration + 1n || resultRevision !== expectedRevision + 1n || subscriptionEnd <= iat ||
+    exp !== Math.min(iat + 10 * 60, subscriptionEnd)) throw new Error('Invalid active disaster transfer lifetime or revision');
+  const nested = await verifyLicenseLease(verified.claims['new_lease'], config, now);
+  if (nested['sub'] !== verified.claims['sub'] || nested['sub'] !== verified.claims['license_id'] ||
+    nested['database_id'] !== verified.claims['database_id'] || nested['instance_id'] !== verified.claims['target_instance_id'] ||
+    nested['identity_jkt'] !== verified.claims['target_identity_jkt'] ||
+    nested['activation_generation'] !== verified.claims['target_activation_generation'] ||
+    nested['entitlement_revision'] !== verified.claims['entitlement_revision'] ||
+    nested['subscription_end'] !== verified.claims['subscription_end'] ||
+    nested['request_nonce'] !== verified.claims['request_nonce'] || nested['request_digest'] !== verified.claims['request_digest'] ||
+    nested['iat'] !== iat) {
     throw new Error('Nested disaster transfer lease does not match its receipt');
   }
-  assertExactClaims(nested.claims, [
-    'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'instance_id', 'database_id', 'identity_jkt',
-    'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
-    'request_nonce', 'request_digest',
-  ]);
   return verified.claims;
 }
 
@@ -503,14 +616,24 @@ export async function verifyDisasterBindingReceipt(
   const verified = await verifyTypedJwt(token, config, 'aikayun-license-disaster-binding+jwt', claims, now);
   assertExactClaims(verified.claims, claims);
   validateDisasterResultBinding(verified.claims);
+  const { iat, exp } = validateBoundedTimes(verified.claims, now, 10 * 60);
+  const sourceGeneration = decimalValue(verified.claims, 'source_activation_generation', 1);
+  const targetGeneration = decimalValue(verified.claims, 'target_activation_generation', 1);
+  const expectedRevision = decimalValue(verified.claims, 'expected_revision', 1);
+  const resultRevision = decimalValue(verified.claims, 'result_revision', 1);
+  const subscriptionEnd = assertIntegerClaim(verified.claims, 'subscription_end');
   if (verified.claims['result_mode'] !== 'binding_only' ||
     verified.claims['purpose'] !== 'historical_obligations_identity_rebinding' ||
     !['expired', 'revoked'].includes(String(verified.claims['entitlement_state'])) ||
-    !['active', 'revoked'].includes(String(verified.claims['license_status']))) {
+    !['active', 'revoked'].includes(String(verified.claims['license_status'])) || exp !== iat + 10 * 60 ||
+    targetGeneration !== sourceGeneration + 1n || resultRevision !== expectedRevision + 1n) {
     throw new Error('Invalid disaster binding receipt');
   }
   if ((verified.claims['entitlement_state'] === 'revoked') !== (verified.claims['license_status'] === 'revoked')) {
     throw new Error('Disaster binding receipt entitlement state does not match license status');
+  }
+  if (verified.claims['entitlement_state'] === 'expired' && subscriptionEnd > iat) {
+    throw new Error('Disaster binding receipt does not prove expired entitlement');
   }
   return verified.claims;
 }
