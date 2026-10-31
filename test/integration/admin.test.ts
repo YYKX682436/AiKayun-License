@@ -269,7 +269,7 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
     }).execute()).rejects.toMatchObject({ code: '23505' });
 
     const revokedAttempt = await activate(created.licenseId, firstCode);
-    expect(revokedAttempt.response.status).toBe(403);
+    expect(revokedAttempt.response.status).toBe(409);
     expect(await db.selectFrom('license_operations').selectAll()
       .where('operation_id', '=', revokedAttempt.operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_operation_attempts').selectAll()
@@ -299,7 +299,7 @@ describe('local admin operations on PostgreSQL and the real HTTPS protocol', () 
       expires_at: new Date(now.getTime() - 1000), consumed_at: null, revoked_at: null, created_at: now,
     }).execute();
     const rejected = await activate(created.licenseId, expiredCode);
-    expect(rejected.response.status).toBe(403);
+    expect(rejected.response.status).toBe(409);
     expect(await db.selectFrom('license_operations').selectAll()
       .where('operation_id', '=', rejected.operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_operation_attempts').selectAll()

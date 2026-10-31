@@ -162,7 +162,7 @@ export interface TimeResetInput {
 export type MutationResponseType = 'license' | 'status' | 'operation' | 'disaster_ticket' | 'disaster_active' | 'disaster_binding' | 'time_reset';
 export type MutationResult =
   | { kind: 'retryable'; code: string }
-  | { kind: 'response'; responseType: MutationResponseType; token: string; state: 'committed' | 'rejected' | 'cancelled'; outcomeCode: string };
+  | { kind: 'response'; responseType: MutationResponseType; token: string; state: 'committed' | 'rejected' | 'cancelled'; outcomeCode: string; unrecorded?: true };
 
 type TransactionDatabase = Transaction<Database>;
 
@@ -574,11 +574,25 @@ export async function processActivation(
     const codeHash = sha256Base64url(input.activation_code);
     const code = await trx.selectFrom('activation_codes').selectAll()
       .where('token_hash', '=', codeHash).forUpdate().executeTakeFirst();
-    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.revoked_at !== null || code.expires_at.getTime() <= now.getTime()) {
-      throw new LicenseApiError(403, 'ACTIVATION_AUTHORIZATION_INVALID');
-    }
     const nonce = await loadAndConsumeNonce(trx, auth, now);
-    if (!nonce.valid) return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
+    if (!nonce.valid) {
+      if (code && code.license_id === input.license_id && code.consumed_at === null && code.revoked_at === null && code.expires_at.getTime() > now.getTime()) {
+        return recordRetryable(trx, auth, input.operation_id, input.intent_digest, 'CHALLENGE_EXPIRED_OR_REPLAYED', nonce.row, now);
+      }
+      return { kind: 'retryable', code: 'CHALLENGE_EXPIRED_OR_REPLAYED' };
+    }
+    if (!code || code.license_id !== input.license_id || code.consumed_at !== null || code.revoked_at !== null || code.expires_at.getTime() <= now.getTime()) {
+      if (code && code.license_id === input.license_id && code.consumed_at === null && code.revoked_at === null && code.expires_at.getTime() <= now.getTime()) {
+        await trx.updateTable('activation_codes').set({ revoked_at: now }).where('id', '=', code.id).execute();
+      }
+      const token = await signOperationReceipt(signer, {
+        licenseId: input.license_id, identityJkt: auth.signature.identityJkt,
+        operationId: input.operation_id, intentDigest: input.intent_digest, state: 'rejected',
+        outcomeCode: 'ACTIVATION_AUTHORIZATION_INVALID', attemptNo: input.attempt_no,
+        requestNonceHash: auth.challenge.nonceHash, requestDigest: auth.requestDigest, now,
+      });
+      return { kind: 'response', responseType: 'operation', token, state: 'rejected', outcomeCode: 'ACTIVATION_AUTHORIZATION_INVALID', unrecorded: true };
+    }
     if (license.status !== 'active') {
       const token = await terminalOperationReceipt(trx, signer, auth, {
         kind: 'activation', licenseId: input.license_id, databaseId: input.database_id, state: 'rejected',
@@ -916,6 +930,18 @@ export async function queryOperation(
     const signer = signingAuthority.signer;
     await assertChallengeCurrent(signer, auth, signingAuthority.now);
     await acquireOperationLock(trx, input.operation_id);
+    const visibleOperation = await findOperation(trx, input.operation_id);
+    if (!visibleOperation || visibleOperation.actor_jkt !== auth.signature.identityJkt) {
+      const now = await databaseNow(trx);
+      const nonce = await loadAndConsumeNonce(trx, auth, now);
+      if (!nonce.valid) return { retryable: 'CHALLENGE_EXPIRED_OR_REPLAYED' };
+      return signOperationReceipt(signer, {
+        licenseId: input.license_id, identityJkt: auth.signature.identityJkt,
+        operationId: input.operation_id, intentDigest: input.intent_digest, state: 'not_found',
+        outcomeCode: 'OPERATION_NOT_FOUND', attemptNo: input.attempt_no,
+        requestNonceHash: auth.challenge.nonceHash, requestDigest: auth.requestDigest, now,
+      });
+    }
     const license = await lockLicense(trx, input.license_id);
     const activation = await lockActorActivation(trx, input.license_id, auth.signature.identityJkt, input.instance_id);
     if (activation && activation.database_id !== input.database_id) throw new LicenseApiError(409, 'DATABASE_BINDING_MISMATCH');
@@ -997,7 +1023,7 @@ export async function queryOperation(
         ) AS associated
       `.execute(trx)
       : undefined;
-    const associated = activation !== undefined || normalAssociated || disasterTarget?.rows[0]?.associated === true;
+    const associated = visibleOperation.actor_jkt === auth.signature.identityJkt || activation !== undefined || normalAssociated || disasterTarget?.rows[0]?.associated === true;
     const nonce = await loadAndConsumeNonce(trx, auth, now);
     const result = async (state: OperationState, outcomeCode: string | null, resultJws: string | null,
       attempt: { attemptNo: number; nonceHash: string; requestDigest: string } | undefined) => signOperationReceipt(signer, {
@@ -1069,6 +1095,7 @@ export async function continueOperation(
     ? await processActivation(db, config, auth, input as ActivationInput)
     : await processRenewal(db, config, auth, input as RenewalInput);
   if (direct.kind === 'retryable') throw new LicenseApiError(409, direct.code);
+  if (direct.unrecorded) return direct.token;
   return db.transaction().execute(async (trx) => {
     const signingAuthority = await lockSigningAuthorityForSigning(trx, config);
     const signer = signingAuthority.signer;

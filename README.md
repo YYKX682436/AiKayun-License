@@ -80,6 +80,8 @@ CLI 可创建月/年许可证、签发或轮换一次性激活码、办理人工
 
 `leases/renew` 只为数据库中已确认且仍有效的权益签发新 lease，也可为原绑定实例恢复最新权益 revision。它不接受客户端申报付款，不修改订阅截止时间。测试夹具会直接在隔离数据库准备许可证、激活码和确认权益事件；服务没有可在生产调用的测试放行或权益发放接口。
 
+无效、过期、撤销、已消费或属于其他许可证的激活码，在通过请求签名、Challenge 和新鲜 nonce 校验后返回 HTTP 409 签名 `rejected`；continue 使用 HTTP 200 返回同一格式的新鲜拒绝。此类拒绝不写业务 operation、attempt 或 audit；过期且尚未终结的目标许可证激活码在同一事务中永久撤销。query 无法恢复未持久化拒绝，应以原 intent 和新 Challenge 重新 continue。完全不存在的码依赖现有 256 位随机发码的密码学假设，数据库没有不存在码的黑名单；不要将此保证扩展为抵御管理员自行插入指定 hash 或全量数据回滚。全局 operation ID 约束保持不变。
+
 操作 `intent_digest` 使用 RFC 8785 JCS 对固定业务意图字段规范化后计算 SHA-256/base64url。激活意图只包含激活码摘要，不把明文码写入 operation 或审计。原始请求 `request_digest` 则严格按收到的 body bytes 计算，不能以 JSON 重排替代。
 
 ## 目录边界

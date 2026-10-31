@@ -424,7 +424,7 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       await waitForLicenseRowWaiters(db, 2);
       blocker.release();
       const responses = await Promise.all(results);
-      expect(responses.map((response) => response.status).sort()).toEqual([200, 403]);
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
     } finally {
       blocker.release();
       await blocker.done;
@@ -574,11 +574,163 @@ describe('real PostgreSQL HTTP activation and recovery', () => {
       port: server.port, origin: runtime.config.publicOrigin, path: '/v1/activations', body,
       identity: attacker, nonce: nonceFromChallenge(challenge.token),
     });
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(409);
+    expect((await verifyCenterJwt(response.json['operation_receipt'] as string, runtime)).payload).toMatchObject({ state: 'rejected', outcome_code: 'ACTIVATION_AUTHORIZATION_INVALID' });
     expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
     expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', operationId).execute()).toHaveLength(0);
     expect((await db.selectFrom('licenses').selectAll().where('id', '=', victim.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('0');
+  });
+
+  it.each(['missing', 'expired', 'revoked', 'consumed', 'other-license'])('signs an isolated %s code rejection and recovers via continue', async (variant) => {
+    const prepared = await prepareActivation();
+    if (variant === 'missing' || variant === 'other-license') {
+      const foreign = variant === 'other-license' ? await prepareActivation() : undefined;
+      prepared.code = foreign?.code ?? createHash('sha256').update(randomUUID()).digest('base64url');
+      prepared.intentDigest = activationIntentDigest({ licenseId: prepared.licenseId, activationCode: prepared.code,
+        instanceId: prepared.instanceId, databaseId: prepared.databaseId, identityJkt: prepared.identity.jkt, origin: prepared.origin });
+    } else if (variant === 'expired') {
+      const old = createHash('sha256').update(randomUUID()).digest('base64url');
+      prepared.code = old;
+      prepared.tokenHash = createHash('sha256').update(old).digest('base64url');
+      const now = await getDbNow(db);
+      // An expired historical code can coexist with the current live code only after retirement.
+      await db.updateTable('activation_codes').set({ revoked_at: now }).where('license_id', '=', prepared.licenseId).execute();
+      await db.insertInto('activation_codes').values({ id: randomUUID(), license_id: prepared.licenseId, token_hash: prepared.tokenHash,
+        created_at: new Date(now.getTime() - 120000), expires_at: new Date(now.getTime() - 60000), consumed_at: null, revoked_at: null }).execute();
+      prepared.intentDigest = activationIntentDigest({ licenseId: prepared.licenseId, activationCode: old,
+        instanceId: prepared.instanceId, databaseId: prepared.databaseId, identityJkt: prepared.identity.jkt, origin: prepared.origin });
+    } else {
+      const now = await getDbNow(db);
+      await db.updateTable('activation_codes').set(variant === 'revoked' ? { revoked_at: now } : { consumed_at: now })
+        .where('token_hash', '=', prepared.tokenHash).execute();
+    }
+    const late = await activationAttempt(prepared, 1);
+    const results = await Promise.all([sendActivation(prepared, late), sendContinue(prepared, 2)]);
+    expect(results.map(r => r.status).sort()).toEqual([200, 409]);
+    for (const response of results) {
+      const receipt = await verifyCenterJwt(response.json['operation_receipt'] as string, runtime);
+      expect(receipt.payload).toMatchObject({ state: 'rejected', outcome_code: 'ACTIVATION_AUTHORIZATION_INVALID',
+        actor_jkt: prepared.identity.jkt, operation_id: prepared.operationId, intent_digest: prepared.intentDigest });
+    }
+    const direct = results.find(r => r.status === 409)!;
+    const directClaims = (await verifyCenterJwt(direct.json['operation_receipt'] as string, runtime)).payload;
+    expect(directClaims['attempt_no']).toBe(1);
+    expect(directClaims['request_nonce_hash']).toBe(createHash('sha256').update(late.serverNonce).digest('base64url'));
+    expect(directClaims['request_digest']).toBe(createHash('sha256').update(JSON.stringify(late.body)).digest('base64url'));
+    expect((await sendContinue(prepared, 3)).status).toBe(200);
+    expect((await sendActivation(prepared, late)).json['error']).toEqual({ code: 'CHALLENGE_EXPIRED_OR_REPLAYED' });
+    expect(await db.selectFrom('license_operations').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
+    expect(await db.selectFrom('license_audit_events').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(0);
+    if (variant === 'expired') expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).revoked_at).toBeInstanceOf(Date);
+  });
+
+  it('lets the original inactive actor query a persisted rejection without exposing it to another actor', async () => {
+    const prepared = await prepareActivation();
+    const now = await getDbNow(db);
+    await db.updateTable('licenses').set({ status: 'revoked', updated_at: now }).where('id', '=', prepared.licenseId).execute();
+    const rejected = await sendActivation(prepared, await activationAttempt(prepared, 1));
+    expect(rejected.status).toBe(409);
+    const original = rejected.json['operation_receipt'];
+    const query = await sendQuery({ ...prepared, attemptNo: 2 });
+    expect((await verifyCenterJwt(query.json['operation_receipt'] as string, runtime)).payload)
+      .toMatchObject({ state: 'rejected', result_jws: original, outcome_code: 'LICENSE_REVOKED' });
+    const rogue = await createIdentity();
+    const hidden = await sendQuery({ ...prepared, identity: rogue, attemptNo: 3 });
+    expect((await verifyCenterJwt(hidden.json['operation_receipt'] as string, runtime)).payload)
+      .toMatchObject({ state: 'not_found', result_jws: null });
+    expect(await db.selectFrom('license_operation_attempts').selectAll().where('operation_id', '=', prepared.operationId).execute()).toHaveLength(2);
+  });
+
+  it('keeps an expired code revoked when database time rolls back before a late original request', async () => {
+    const prepared = await prepareActivation();
+    const now = await getDbNow(db);
+    await db.updateTable('activation_codes').set({ revoked_at: now }).where('token_hash', '=', prepared.tokenHash).execute();
+    prepared.code = createHash('sha256').update(randomUUID()).digest('base64url');
+    prepared.tokenHash = createHash('sha256').update(prepared.code).digest('base64url');
+    await db.insertInto('activation_codes').values({ id: randomUUID(), license_id: prepared.licenseId, token_hash: prepared.tokenHash,
+      created_at: now, expires_at: new Date(now.getTime() + 10000), consumed_at: null, revoked_at: null }).execute();
+    prepared.intentDigest = activationIntentDigest({ licenseId: prepared.licenseId, activationCode: prepared.code,
+      instanceId: prepared.instanceId, databaseId: prepared.databaseId, identityJkt: prepared.identity.jkt, origin: prepared.origin });
+    await sql`CREATE TABLE public.test_clock_offset (seconds integer NOT NULL); INSERT INTO public.test_clock_offset VALUES (0);
+      CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE AS
+      'SELECT pg_catalog.clock_timestamp() + (seconds * interval ''1 second'') FROM public.test_clock_offset'`.execute(db);
+    const url = new URL(runtime.config.databaseUrl);
+    url.searchParams.set('options', '-csearch_path=public,pg_catalog');
+    const clockDb = createDatabase(url.toString(), 4);
+    const clockServer = await startAppServer(createApp({ config: runtime.config, db: clockDb }), runtime.config);
+    try {
+      const original = await activationAttempt(prepared, 1, 'activation', clockServer);
+      await sql`UPDATE public.test_clock_offset SET seconds = 20`.execute(db);
+      expect((await getDbNow(clockDb)).getTime() - (await getDbNow(db)).getTime()).toBeGreaterThan(19000);
+      const rejected = await sendContinue(prepared, 2, clockServer);
+      expect(rejected.status).toBe(200);
+      expect((await verifyCenterJwt(rejected.json['operation_receipt'] as string, runtime, new Date(Date.now() + 20000))).payload['state']).toBe('rejected');
+      await sql`UPDATE public.test_clock_offset SET seconds = 0`.execute(db);
+      const late = await signPost({ port: clockServer.port, origin: runtime.config.publicOrigin, path: '/v1/activations',
+        body: original.body, identity: prepared.identity, nonce: original.serverNonce });
+      expect(late.status).toBe(409);
+      expect((await verifyCenterJwt(late.json['operation_receipt'] as string, runtime)).payload['state']).toBe('rejected');
+      const code = await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow();
+      expect(code.revoked_at).toBeInstanceOf(Date);
+      expect(code.consumed_at).toBeNull();
+      expect((await db.selectFrom('licenses').select('current_generation').where('id', '=', prepared.licenseId).executeTakeFirstOrThrow()).current_generation).toBe('0');
+    } finally {
+      await clockServer.stop();
+      await clockDb.destroy();
+      await sql`DROP FUNCTION public.clock_timestamp(); DROP TABLE public.test_clock_offset`.execute(db);
+    }
+  });
+
+  it('does not consume a nonce or retire an expired code when signing authority is unavailable', async () => {
+    const prepared = await prepareActivation();
+    const now = await getDbNow(db);
+    await db.updateTable('activation_codes').set({ revoked_at: now }).where('token_hash', '=', prepared.tokenHash).execute();
+    prepared.code = createHash('sha256').update(randomUUID()).digest('base64url');
+    prepared.tokenHash = createHash('sha256').update(prepared.code).digest('base64url');
+    await db.insertInto('activation_codes').values({ id: randomUUID(), license_id: prepared.licenseId, token_hash: prepared.tokenHash,
+      created_at: new Date(now.getTime() - 120000), expires_at: new Date(now.getTime() - 60000), consumed_at: null, revoked_at: null }).execute();
+    prepared.intentDigest = activationIntentDigest({ licenseId: prepared.licenseId, activationCode: prepared.code,
+      instanceId: prepared.instanceId, databaseId: prepared.databaseId, identityJkt: prepared.identity.jkt, origin: prepared.origin });
+    const attempt = await activationAttempt(prepared, 1);
+    const badServer = await startAppServer(createApp({ config: { ...runtime.config, signingKeyring: new Map() }, db }), runtime.config);
+    try {
+      const failed = await signPost({ port: badServer.port, origin: runtime.config.publicOrigin, path: '/v1/activations',
+        body: attempt.body, identity: prepared.identity, nonce: attempt.serverNonce });
+      expect(failed.status).toBe(503);
+      expect(failed.json['operation_receipt']).toBeUndefined();
+      expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).revoked_at).toBeNull();
+      const recovered = await sendActivation(prepared, attempt);
+      expect(recovered.status).toBe(409);
+      expect((await verifyCenterJwt(recovered.json['operation_receipt'] as string, runtime)).payload['state']).toBe('rejected');
+    } finally { await badServer.stop(); }
+  });
+
+  it('rolls back expired-code retirement and nonce consumption on a database error', async () => {
+    const prepared = await prepareActivation();
+    const now = await getDbNow(db);
+    await db.updateTable('activation_codes').set({ revoked_at: now }).where('token_hash', '=', prepared.tokenHash).execute();
+    prepared.code = createHash('sha256').update(randomUUID()).digest('base64url');
+    prepared.tokenHash = createHash('sha256').update(prepared.code).digest('base64url');
+    await db.insertInto('activation_codes').values({ id: randomUUID(), license_id: prepared.licenseId, token_hash: prepared.tokenHash,
+      created_at: new Date(now.getTime() - 120000), expires_at: new Date(now.getTime() - 60000), consumed_at: null, revoked_at: null }).execute();
+    prepared.intentDigest = activationIntentDigest({ licenseId: prepared.licenseId, activationCode: prepared.code,
+      instanceId: prepared.instanceId, databaseId: prepared.databaseId, identityJkt: prepared.identity.jkt, origin: prepared.origin });
+    const attempt = await activationAttempt(prepared, 1);
+    await sql`CREATE FUNCTION public.test_fail_code_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$;
+      CREATE TRIGGER test_fail_code_update AFTER UPDATE ON activation_codes FOR EACH ROW EXECUTE FUNCTION public.test_fail_code_update()`.execute(db);
+    try {
+      const failed = await sendActivation(prepared, attempt);
+      expect(failed.status).toBe(500);
+      expect(failed.json['operation_receipt']).toBeUndefined();
+      expect((await db.selectFrom('activation_codes').selectAll().where('token_hash', '=', prepared.tokenHash).executeTakeFirstOrThrow()).revoked_at).toBeNull();
+    } finally {
+      await sql`DROP TRIGGER test_fail_code_update ON activation_codes; DROP FUNCTION public.test_fail_code_update()`.execute(db);
+    }
+    const recovered = await sendActivation(prepared, attempt);
+    expect(recovered.status).toBe(409);
+    expect((await verifyCenterJwt(recovered.json['operation_receipt'] as string, runtime)).payload['state']).toBe('rejected');
   });
 
   it('rejects an expired nonce that arrives after continuation already committed', async () => {
